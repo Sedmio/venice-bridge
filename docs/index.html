@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>venice-bridge: Venice web subscription for OpenCode, with tool calls</title>
+<meta name="description" content="venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.">
+<meta name="keywords" content="venice-bridge, venice.ai, venice, opencode, openai-compatible, local proxy, tool calling, coding agent, macos, opencode-venice-web alternative">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://nsozturk.github.io/venice-bridge/">
+
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://nsozturk.github.io/venice-bridge/">
+<meta property="og:site_name" content="venice-bridge documentation">
+<meta property="og:title" content="venice-bridge: use a venice.ai web subscription from OpenCode, with tool calls">
+<meta property="og:description" content="venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.">
+<meta property="og:image" content="https://nsozturk.github.io/venice-bridge/assets/banner.png">
+<meta property="og:image:width" content="2560">
+<meta property="og:image:height" content="720">
+
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:url" content="https://nsozturk.github.io/venice-bridge/">
+<meta name="twitter:title" content="venice-bridge: use a venice.ai web subscription from OpenCode, with tool calls">
+<meta name="twitter:description" content="venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.">
+<meta name="twitter:image" content="https://nsozturk.github.io/venice-bridge/assets/banner.png">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "venice-bridge",
+  "description": "venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.",
+  "operatingSystem": "macOS",
+  "applicationCategory": "DeveloperApplication",
+  "softwareVersion": "0.1.0",
+  "license": "https://opensource.org/licenses/MIT",
+  "codeRepository": "https://github.com/nsozturk/venice-bridge",
+  "downloadUrl": "https://github.com/nsozturk/venice-bridge",
+  "url": "https://nsozturk.github.io/venice-bridge/",
+  "programmingLanguage": "Python",
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Does it need a Venice API key?",
+      "acceptedAnswer": {"@type": "Answer", "text": "No. venice-bridge does not use the paid Venice API. It talks to the backend of the venice.ai web app with your own browser login (the __client cookie of clerk.venice.ai). The apiKey value in the OpenCode config is a placeholder that the bridge does not check."}
+    },
+    {
+      "@type": "Question",
+      "name": "Does it work on a free Venice account?",
+      "acceptedAnswer": {"@type": "Answer", "text": "No. The web route the bridge uses needs a paid Venice web plan (Pro). On a free account Venice answers 403 creator_access_required."}
+    },
+    {
+      "@type": "Question",
+      "name": "Does it work with Claude Code or Codex?",
+      "acceptedAnswer": {"@type": "Answer", "text": "Not directly. The bridge speaks OpenAI Chat Completions (/v1/chat/completions) only. It does not implement the Anthropic Messages API (/v1/messages) or the OpenAI Responses API (/v1/responses), which Claude Code and Codex CLI use."}
+    },
+    {
+      "@type": "Question",
+      "name": "Does it work on Linux or Windows?",
+      "acceptedAnswer": {"@type": "Answer", "text": "Untested. The bridge streams through the system curl of macOS, which passes Cloudflare. Linux and Windows have not been tried."}
+    },
+    {
+      "@type": "Question",
+      "name": "Is this allowed by Venice?",
+      "acceptedAnswer": {"@type": "Answer", "text": "venice-bridge is unofficial and not affiliated with, endorsed by, or supported by Venice.ai. It automates your own logged-in web session through undocumented endpoints, which may be against Venice's terms of service. Use it at your own risk, with your own account only, and never share cookies or accounts."}
+    },
+    {
+      "@type": "Question",
+      "name": "Where do my chats go?",
+      "acceptedAnswer": {"@type": "Answer", "text": "From your client to the bridge on 127.0.0.1, then to the venice.ai web backend under your own account (clerk.venice.ai for login, outerface.venice.ai for inference), as with the web app. When the judge is on, a short excerpt of the turn is sent to Venice as a second request. The bridge keeps no conversation history: each request body sits in a private temporary folder (mode 0700) only while its upstream call runs and is deleted afterwards. Its log records sizes, timings and outcomes and can include short excerpts of unreadable replies or swallowed tool calls."}
+    },
+    {
+      "@type": "Question",
+      "name": "Is it an alternative to opencode-venice-web?",
+      "acceptedAnswer": {"@type": "Answer", "text": "Yes, it is an independent Python implementation of the same idea. opencode-venice-web (Node) is the most mature Venice web proxy and sends the full schema of every tool; venice-bridge is one Python file that sends a tiered tool list within a fixed budget. Its tolerant tool-call parser is a port of the opencode-venice-web parser (MIT)."}
+    }
+  ]
+}
+</script>
+
+<style>
+:root {
+  --bg: #090d16;
+  --card-bg: #0f172a;
+  --sidebar-bg: #0b111d;
+  --accent: #8b5cf6;
+  --accent-soft: rgba(139, 92, 246, 0.14);
+  --border: #1e293b;
+  --text: #e5e7eb;
+  --text-strong: #ffffff;
+  --muted: #94a3b8;
+  --code-bg: #050811;
+  --warn-bg: rgba(245, 158, 11, 0.08);
+  --warn: #f59e0b;
+  --ok: #22c55e;
+  --nav-h: 60px;
+  --sidebar-w: 270px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; scroll-padding-top: calc(var(--nav-h) + 16px); }
+body { font-family: var(--font); background: var(--bg); color: var(--text); line-height: 1.65; overflow-x: hidden; }
+a { color: #a78bfa; }
+a:hover { color: #c4b5fd; }
+img { max-width: 100%; height: auto; display: block; }
+
+/* Navbar */
+.navbar {
+  position: sticky; top: 0; z-index: 50; height: var(--nav-h);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 0 20px; background: rgba(9, 13, 22, 0.88); backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px); border-bottom: 1px solid var(--border);
+}
+.brand { display: flex; align-items: center; gap: 10px; color: var(--text-strong); text-decoration: none; font-weight: 800; font-size: 1.15rem; font-family: var(--mono); }
+.brand:hover { color: var(--text-strong); }
+.badge { font-family: var(--font); font-size: 0.72rem; font-weight: 600; color: #c4b5fd; background: var(--accent-soft); border: 1px solid var(--accent); padding: 1px 8px; border-radius: 999px; }
+.nav-actions { display: flex; align-items: center; gap: 14px; }
+.nav-link { color: var(--muted); text-decoration: none; font-size: 0.9rem; font-weight: 500; }
+.nav-link:hover { color: var(--text-strong); }
+.btn-github { display: flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 8px; border: 1px solid #334155; background: #111a2e; color: var(--text-strong); font-size: 0.85rem; font-weight: 600; text-decoration: none; }
+.btn-github:hover { background: #1e293b; color: var(--text-strong); }
+.menu-btn { display: none; background: #111a2e; border: 1px solid #334155; color: var(--text-strong); border-radius: 8px; padding: 6px 10px; font-size: 0.85rem; cursor: pointer; }
+
+/* Layout */
+.layout { display: flex; max-width: 1400px; margin: 0 auto; }
+.sidebar {
+  width: var(--sidebar-w); flex-shrink: 0; position: sticky; top: var(--nav-h);
+  height: calc(100vh - var(--nav-h)); overflow-y: auto; padding: 20px 14px 40px;
+  background: var(--sidebar-bg); border-right: 1px solid var(--border);
+}
+.search input {
+  width: 100%; padding: 8px 12px; border-radius: 8px; border: 1px solid #334155;
+  background: #111a2e; color: var(--text-strong); font-size: 0.88rem; outline: none;
+}
+.search input:focus { border-color: var(--accent); }
+.search-status { font-size: 0.78rem; color: var(--muted); min-height: 1.2em; margin: 6px 4px 14px; }
+.nav-group { margin-bottom: 18px; }
+.nav-title { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 700; padding-left: 10px; margin-bottom: 6px; }
+.nav-item { display: block; padding: 6px 10px; margin-bottom: 1px; border-left: 3px solid transparent; border-radius: 6px; color: var(--muted); text-decoration: none; font-size: 0.89rem; }
+.nav-item.sub { padding-left: 24px; font-size: 0.84rem; }
+.nav-item:hover { color: var(--text-strong); background: rgba(148, 163, 184, 0.07); }
+.nav-item.active { color: var(--text-strong); background: var(--accent-soft); border-left-color: var(--accent); }
+.nav-item.hidden { display: none; }
+
+main.content { flex: 1; min-width: 0; padding: 36px 56px 60px; max-width: 980px; }
+.banner-hero { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; margin-bottom: 28px; background: var(--card-bg); }
+.banner-hero img { width: 100%; }
+
+section { margin-bottom: 12px; }
+section.hidden { display: none; }
+h1 { font-size: 2.2rem; line-height: 1.2; font-weight: 800; letter-spacing: -0.02em; color: var(--text-strong); margin-bottom: 14px; }
+h2 { font-size: 1.6rem; font-weight: 700; color: var(--text-strong); margin: 44px 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+h3 { font-size: 1.15rem; font-weight: 650; color: var(--text-strong); margin: 26px 0 10px; }
+p { margin-bottom: 14px; }
+ul, ol { margin: 0 0 16px 22px; }
+li { margin-bottom: 6px; }
+.lead { font-size: 1.08rem; color: #cbd5e1; }
+code { font-family: var(--mono); font-size: 0.86em; overflow-wrap: anywhere; }
+p code, li code, td code, h3 code { background: #172036; color: #e2e8f0; padding: 1px 6px; border-radius: 4px; }
+strong { color: var(--text-strong); }
+
+/* Code blocks */
+.code-wrap { position: relative; margin: 12px 0 22px; }
+pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px; padding: 16px 16px; padding-right: 76px; overflow-x: auto; line-height: 1.55; }
+pre code { font-size: 0.84rem; color: #e2e8f0; overflow-wrap: normal; white-space: pre; }
+.copy-btn { position: absolute; top: 9px; right: 9px; background: #172036; color: var(--muted); border: 1px solid #334155; border-radius: 6px; padding: 3px 9px; font-size: 0.74rem; cursor: pointer; }
+.copy-btn:hover { color: var(--text-strong); background: #1e293b; }
+.copy-btn.done { color: var(--ok); border-color: var(--ok); }
+.c { color: #64748b; }
+
+/* Tables */
+.table-wrap { overflow-x: auto; margin: 14px 0 24px; border: 1px solid var(--border); border-radius: 10px; }
+table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+th { background: var(--card-bg); color: var(--text-strong); font-weight: 600; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td.num { white-space: nowrap; }
+
+/* Callouts and cards */
+.callout { border: 1px solid var(--border); border-left: 4px solid var(--accent); background: var(--card-bg); border-radius: 10px; padding: 14px 18px; margin: 18px 0 22px; }
+.callout.warn { border-left-color: var(--warn); background: var(--warn-bg); }
+.callout-title { font-weight: 700; color: var(--text-strong); margin-bottom: 6px; }
+.callout ul { margin-bottom: 0; }
+.callout p:last-child { margin-bottom: 0; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin: 18px 0 24px; }
+.card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+.card h4 { color: var(--text-strong); font-size: 1rem; margin-bottom: 6px; }
+.card p { color: var(--muted); font-size: 0.89rem; margin: 0; }
+
+/* Screenshots */
+.shots { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; margin: 18px 0 24px; }
+.shots figure { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.shots a { display: block; }
+.shots figcaption { padding: 10px 14px; font-size: 0.86rem; color: var(--muted); border-top: 1px solid var(--border); }
+
+/* Flow diagram */
+.flow { display: flex; align-items: stretch; gap: 10px; margin: 20px 0 10px; }
+.flow-node { flex: 1; min-width: 0; background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+.flow-node.main { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-soft) inset; }
+.flow-node h4 { color: var(--text-strong); font-size: 0.98rem; margin-bottom: 4px; }
+.flow-node .where { font-family: var(--mono); font-size: 0.74rem; color: #c4b5fd; margin-bottom: 8px; overflow-wrap: anywhere; }
+.flow-node ul { margin: 0 0 0 16px; font-size: 0.84rem; color: #cbd5e1; }
+.flow-node li { margin-bottom: 3px; }
+.flow-arrow { display: flex; flex-direction: column; justify-content: center; align-items: center; color: var(--muted); font-size: 0.72rem; text-align: center; min-width: 74px; }
+.flow-arrow .arr { font-size: 1.4rem; color: var(--accent); line-height: 1; }
+.flow-arrow .arr-v { display: none; }
+.upstreams { display: flex; flex-direction: column; gap: 10px; flex: 1; min-width: 0; }
+.flow-caption { font-size: 0.84rem; color: var(--muted); margin-bottom: 22px; }
+
+details.faq { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; margin-bottom: 10px; }
+details.faq summary { cursor: pointer; font-weight: 650; color: var(--text-strong); }
+details.faq[open] summary { margin-bottom: 8px; }
+details.faq p { margin-bottom: 0; }
+
+.no-results { display: none; padding: 30px; text-align: center; color: var(--muted); border: 1px dashed var(--border); border-radius: 10px; margin-top: 20px; }
+footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border); font-size: 0.84rem; color: var(--muted); text-align: center; }
+
+@media (max-width: 900px) {
+  .menu-btn { display: inline-block; }
+  .nav-link { display: none; }
+  .sidebar {
+    position: fixed; top: var(--nav-h); left: 0; z-index: 40; width: min(86vw, 320px);
+    transform: translateX(-105%); transition: transform 0.2s ease; box-shadow: 8px 0 24px rgba(0, 0, 0, 0.5);
+  }
+  .sidebar.open { transform: none; }
+  main.content { padding: 22px 16px 48px; }
+  h1 { font-size: 1.7rem; }
+  h2 { font-size: 1.35rem; }
+  .flow { flex-direction: column; }
+  .flow-arrow { flex-direction: row; gap: 8px; min-width: 0; }
+  .flow-arrow .arr-h { display: none; }
+  .flow-arrow .arr-v { display: inline; }
+  .shots { grid-template-columns: 1fr; }
+  table { min-width: 620px; }
+}
+.nav-group.hidden { display: none; }
+@media (max-width: 420px) {
+  .navbar { padding: 0 12px; }
+  .btn-github span { display: none; }
+}
+</style>
+</head>
+<body>
+
+<header class="navbar">
+  <a href="#overview" class="brand">venice-bridge <span class="badge">v0.1.0</span></a>
+  <div class="nav-actions">
+    <a href="#quick-start" class="nav-link">Quick start</a>
+    <a href="#how-it-works" class="nav-link">How it works</a>
+    <a href="#api" class="nav-link">API</a>
+    <button class="menu-btn" id="menuBtn" type="button" aria-controls="sidebar" aria-expanded="false">Menu</button>
+    <a href="https://github.com/nsozturk/venice-bridge" target="_blank" rel="noopener" class="btn-github" aria-label="venice-bridge on GitHub">
+      <svg height="16" width="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
+      <span>GitHub</span>
+    </a>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="search">
+      <input type="search" id="docSearch" placeholder="Search the docs..." aria-label="Search the documentation" autocomplete="off">
+    </div>
+    <div class="search-status" id="searchStatus" aria-live="polite"></div>
+    <nav aria-label="Documentation sections">
+      <div class="nav-group">
+        <div class="nav-title">Getting started</div>
+        <a href="#overview" class="nav-item">Overview</a>
+        <a href="#screenshots" class="nav-item">Screenshots</a>
+        <a href="#requirements" class="nav-item">Requirements</a>
+        <a href="#quick-start" class="nav-item">Quick start</a>
+        <a href="#autostart" class="nav-item">Autostart (launchd)</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-title">Internals</div>
+        <a href="#how-it-works" class="nav-item">How it works</a>
+        <a href="#tool-emulation" class="nav-item sub" data-parent="how-it-works">Tool emulation</a>
+        <a href="#tolerant-parser" class="nav-item sub" data-parent="how-it-works">Tolerant parser</a>
+        <a href="#completion-check" class="nav-item sub" data-parent="how-it-works">Completion check</a>
+        <a href="#server-loop" class="nav-item sub" data-parent="how-it-works">Server-loop cut</a>
+        <a href="#retries" class="nav-item sub" data-parent="how-it-works">In-bridge retries</a>
+        <a href="#judge" class="nav-item sub" data-parent="how-it-works">Judge</a>
+        <a href="#stream-gate" class="nav-item sub" data-parent="how-it-works">Stream gate</a>
+        <a href="#error-mapping" class="nav-item sub" data-parent="how-it-works">Error mapping</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-title">Reference</div>
+        <a href="#configuration" class="nav-item">Configuration</a>
+        <a href="#api" class="nav-item">API reference</a>
+        <a href="#performance" class="nav-item">Measured performance</a>
+        <a href="#troubleshooting" class="nav-item">Troubleshooting</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-title">More</div>
+        <a href="#faq" class="nav-item">FAQ</a>
+        <a href="#alternatives" class="nav-item">Alternatives</a>
+        <a href="#ai-agents" class="nav-item">AI agent integration</a>
+        <a href="#license" class="nav-item">License and credits</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main class="content" id="content">
+    <div class="banner-hero">
+      <img src="assets/banner.png" onerror="this.src='../assets/banner.png'" alt="venice-bridge banner: a local bridge from OpenCode to a venice.ai web subscription" width="1280" height="360">
+    </div>
+
+    <section id="overview">
+      <h1>venice-bridge</h1>
+      <p class="lead">venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.</p>
+      <p>It is one Python file (<code>venice_bridge.py</code>, about 1,500 lines) plus <code>tolerant_parser.py</code>. It runs an HTTP server on <code>127.0.0.1:18891</code> that speaks OpenAI Chat Completions, and forwards each request to the backend of the venice.ai <strong>web app</strong>, authenticated with your own browser login. It does not use the paid Venice API and needs no API key.</p>
+
+      <div class="callout warn" role="note">
+        <div class="callout-title">Disclaimer: unofficial, read before use</div>
+        <ul>
+          <li><strong>Unofficial.</strong> Not affiliated with, endorsed by, or supported by Venice.ai.</li>
+          <li><strong>Undocumented endpoints.</strong> It talks to the web app's own backend, which can change or break at any time.</li>
+          <li><strong>Terms-of-service risk.</strong> It automates your own logged-in web session; that may be against Venice's terms of service. You use it at your own risk.</li>
+          <li><strong>Your own account only.</strong> Do not share cookies or accounts. The cookie is a live credential for your Venice account: never commit it, never share it.</li>
+        </ul>
+      </div>
+
+      <div class="grid">
+        <div class="card"><h4>OpenAI-compatible</h4><p><code>POST /v1/chat/completions</code> (streaming and non-streaming), <code>GET /v1/models</code>, <code>GET /health</code>, <code>POST /reload</code>.</p></div>
+        <div class="card"><h4>Working tool calls</h4><p>Venice's web routes hide client tools from the model, so the bridge emulates them in text and returns real OpenAI <code>tool_calls</code>.</p></div>
+        <div class="card"><h4>Web subscription, no API key</h4><p>Uses the <code>__client</code> cookie of <code>clerk.venice.ai</code>. Needs a paid Venice web plan (Pro).</p></div>
+        <div class="card"><h4>Honest limits</h4><p>macOS only so far. No Anthropic Messages or OpenAI Responses API. No images. Open models sometimes need a retry.</p></div>
+      </div>
+    </section>
+
+    <section id="screenshots">
+      <h2>Screenshots</h2>
+      <div class="shots">
+        <figure>
+          <a href="assets/screenshots/01-health-and-chat.png"><img src="assets/screenshots/01-health-and-chat.png" alt="Terminal: the offline self-check prints cookie file ok, session ok, ok, end to end ok; GET /health returns ok true with the remaining chat quota; a chat completion answers PONG" width="1600" height="1000" loading="lazy"></a>
+          <figcaption>Self-check, health check with the remaining chat quota, and a first chat completion.</figcaption>
+        </figure>
+        <figure>
+          <a href="assets/screenshots/02-opencode-tool-run.png"><img src="assets/screenshots/02-opencode-tool-run.png" alt="Terminal: a request that declares a read tool; the model's plain-text JSON reply comes back from the bridge as an OpenAI tool_calls message with finish_reason tool_calls" width="1600" height="1000" loading="lazy"></a>
+          <figcaption>A model's plain-text reply becomes a real OpenAI <code>tool_calls</code> message.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="requirements">
+      <h2>Requirements</h2>
+      <ul>
+        <li><strong>macOS.</strong> The bridge streams through the system <code>curl</code>, which passes Cloudflare. Linux and Windows are untested.</li>
+        <li><strong>Python 3.10+</strong> and <code>curl_cffi</code> (<code>pip install curl_cffi</code>).</li>
+        <li><strong>A paid Venice web plan (Pro).</strong> On a free account the route answers <code>403 creator_access_required</code>.</li>
+        <li><strong>OpenCode</strong>, or any client that speaks OpenAI Chat Completions.</li>
+      </ul>
+      <p>Not supported: the Anthropic Messages API (<code>/v1/messages</code>) and the OpenAI Responses API (<code>/v1/responses</code>), so Claude Code and Codex CLI do not work with it directly.</p>
+    </section>
+
+    <section id="quick-start">
+      <h2>Quick start</h2>
+
+      <h3>1. Get the code and the dependency</h3>
+      <pre><code>git clone https://github.com/nsozturk/venice-bridge.git
+cd venice-bridge
+pip install curl_cffi</code></pre>
+
+      <h3>2. Save your login cookie (the only setup step)</h3>
+      <p>The bridge needs the value of the <code>__client</code> cookie of <code>clerk.venice.ai</code>, a long-lived Clerk cookie. From it the bridge mints a session JWT of about 60 seconds and a client attestation for every request window.</p>
+      <ol>
+        <li>Log in on venice.ai in Chrome.</li>
+        <li>Open DevTools, then <strong>Application → Cookies → <code>https://clerk.venice.ai</code></strong>.</li>
+        <li>Copy the <strong>Value</strong> of <code>__client</code>, then run:</li>
+      </ol>
+      <pre><code>mkdir -p ~/.config/venice-bridge &amp;&amp; pbpaste &gt; ~/.config/venice-bridge/client-cookie.txt &amp;&amp; chmod 600 ~/.config/venice-bridge/client-cookie.txt</code></pre>
+      <p>The file may hold the bare value or a pasted <code>__client=...;</code> string. Override its path with <code>VENICE_BRIDGE_COOKIE_FILE</code>. Clerk rotates the cookie while it is used; the bridge saves the rotated value to <code>~/.config/venice-bridge/rotated-client.json</code> (mode 0600, override with <code>VENICE_BRIDGE_CLIENT_FILE</code>).</p>
+      <p>Optional second source: a local session daemon. Set <code>VENICE_BRIDGE_SESSION_DIR</code> to a folder containing a <code>client.py</code> that exposes <code>get_session(domain)</code> returning <code>{"timestamp": &lt;ms&gt;, "tokens": {"clerk_client": "&lt;value&gt;"}}</code>. The cookie file wins when both are present.</p>
+
+      <h3>3. Run the bridge</h3>
+      <pre><code>python3 venice_bridge.py                 <span class="c"># default 127.0.0.1:18891</span>
+python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
+      <p>It prints <code>[+] Venice AI Bridge listening on http://127.0.0.1:18891/v1</code>. Logs go to stderr.</p>
+
+      <h3>4. Check it</h3>
+      <pre><code>curl -s http://127.0.0.1:18891/health</code></pre>
+      <p>A working login answers <code>{"ok": true, "venice_session": "active", "chat_quota": {...}}</code> with the remaining web chat quota. An offline self-check needs no network:</p>
+      <pre><code>python3 test_venice_bridge.py   <span class="c"># prints: cookie file ok, session ok, ok, end to end ok</span></code></pre>
+
+      <h3>5. Add the provider to OpenCode</h3>
+      <p>Copy the provider block from <a href="https://github.com/nsozturk/venice-bridge/blob/main/examples/opencode.json"><code>examples/opencode.json</code></a> into <code>~/.config/opencode/opencode.json</code> (or a project <code>opencode.json</code>). Shortened to one model it looks like this:</p>
+      <pre><code>{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "venice-bridge": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Venice Web (local bridge)",
+      "options": {
+        "baseURL": "http://127.0.0.1:18891/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "deepseek-v4-1-flash-uncensored": {
+          "name": "DeepSeek V4.1 Flash Uncensored (Venice Web)",
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "limit": { "context": 524288, "output": 131072 }
+        }
+      }
+    }
+  }
+}</code></pre>
+      <p>The example config lists <code>deepseek-v4-1-flash-uncensored</code>, <code>deepseek-v4-1-flash</code>, <code>z-ai-glm-5-3-flash</code>, <code>kimi-k2-5</code>, <code>default</code>, <code>qwen3-coder-480b-a35b-instruct-turbo</code>, <code>qwen3-6-27b</code>, <code>zai-org-glm-5.2</code> and <code>venice-uncensored-1-2</code>. <code>GET /v1/models</code> lists whatever your account's web catalogue offers without credits.</p>
+
+      <h3>6. First run</h3>
+      <pre><code>opencode -m venice-bridge/deepseek-v4-1-flash-uncensored</code></pre>
+    </section>
+
+    <section id="autostart">
+      <h2>Autostart (launchd)</h2>
+      <p><a href="https://github.com/nsozturk/venice-bridge/blob/main/examples/com.example.venice-bridge.plist"><code>examples/com.example.venice-bridge.plist</code></a> is a launchd template. It starts the bridge at login (<code>RunAtLoad</code>), restarts it when it exits (<code>KeepAlive</code>, at most once per 60 s via <code>ThrottleInterval</code>) and writes stdout and stderr to <code>venice_bridge.log</code> in the repository folder.</p>
+      <ol>
+        <li>Replace every <code>/PATH/TO</code> in the file with real absolute paths (your <code>python3</code> and the repository folder).</li>
+        <li>Copy it to <code>~/Library/LaunchAgents/</code>.</li>
+        <li>Load it:</li>
+      </ol>
+      <pre><code>launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.venice-bridge.plist</code></pre>
+    </section>
+
+    <section id="how-it-works">
+      <h2>How it works</h2>
+      <div class="flow" role="img" aria-label="Request flow: the client sends OpenAI Chat Completions to the bridge on 127.0.0.1:18891; the bridge gets a session JWT from clerk.venice.ai, mints a client attestation and streams the reply from outerface.venice.ai, then returns an OpenAI response with tool_calls.">
+        <div class="flow-node">
+          <h4>Your client</h4>
+          <div class="where">OpenCode or any OpenAI client</div>
+          <ul><li>Sends messages and declared tools</li><li>Runs the returned <code>tool_calls</code></li></ul>
+        </div>
+        <div class="flow-arrow"><span class="arr arr-h">&#8644;</span><span class="arr arr-v">&#8645;</span>Chat Completions</div>
+        <div class="flow-node main">
+          <h4>venice-bridge</h4>
+          <div class="where">127.0.0.1:18891</div>
+          <ul><li>Tool list into the system prompt</li><li>Tolerant reply parser</li><li>Retries, judge, stream gate</li><li>Error mapping</li></ul>
+        </div>
+        <div class="flow-arrow"><span class="arr arr-h">&#8644;</span><span class="arr arr-v">&#8645;</span>your login</div>
+        <div class="upstreams">
+          <div class="flow-node">
+            <h4>Clerk</h4>
+            <div class="where">clerk.venice.ai</div>
+            <ul><li><code>__client</code> → session (~60 s JWT)</li></ul>
+          </div>
+          <div class="flow-node">
+            <h4>Venice web backend</h4>
+            <div class="where">outerface.venice.ai</div>
+            <ul><li>Client attestation</li><li><code>/api/inference/chat/agents/ad-hoc</code> (SSE)</li></ul>
+          </div>
+        </div>
+      </div>
+      <p class="flow-caption">Request flow. The inference route is the one the venice.ai web app itself uses; it needs a paid plan.</p>
+      <p>The bridge reads the <code>__client</code> cookie, finds the active Clerk session, mints a short-lived session JWT and a client attestation, and streams the reply from Venice's <code>/agents/ad-hoc</code> route. A 401 from Venice is retried once with a fresh JWT and attestation.</p>
+
+      <h3 id="tool-emulation">Tool emulation and the tiered tool list</h3>
+      <p>Venice's web routes do not expose client-declared tools to the model (measured: a declared <code>bash</code> client tool is invisible to the model on both <code>/agents/ad-hoc</code> and <code>/agents/venice</code>). So tools are emulated in text:</p>
+      <ul>
+        <li>The tool list goes into the system prompt. Built-in tools and tools already used in the conversation get a compact full JSON schema (tier A); the rest are one-liners (tier B). The whole block has a budget of 78,000 characters; over budget, tier B degrades from the end to shorter descriptions, then to names only. Tier A is never cut.</li>
+        <li>For scale: a real OpenCode request measured 411 tools and about 441,000 characters of system prompt.</li>
+        <li>The model replies <code>{"tool_calls":[{"name":"...","arguments":{...}}]}</code>. A format reminder with one example is appended as the last user message.</li>
+      </ul>
+
+      <h3 id="tolerant-parser">Tolerant parser</h3>
+      <p><code>tolerant_parser.py</code>, a port of the opencode-venice-web parser (MIT), reads calls that are bare, fenced, after prose, in several envelopes, or structurally broken (8 of 8 real malformed replies in the fixtures). A second reader handles <code>&lt;tool_calls&gt;{"name":...,"arguments":...}&lt;/tool_calls&gt;</code> with unescaped quotes in file content. Calls to tools the client did not declare are dropped.</p>
+
+      <h3 id="completion-check">Completion check</h3>
+      <p>A reply counts only after Venice sends <code>response.completed</code>. A cut stream never becomes a half-written file.</p>
+
+      <h3 id="server-loop">Server-loop cut</h3>
+      <p>Venice sometimes takes a model's native tool call for one of its own server tools and answers the model "Tool not found" in a loop. The bridge tolerates 3 such steps, then cuts the response and retries with a corrective reminder.</p>
+
+      <h3 id="retries">In-bridge retries</h3>
+      <p>In tools mode the bridge retries by itself, with a budget of 2 (<code>VENICE_BRIDGE_FORMAT_RETRIES</code>), for: a server loop, an unreadable call, an empty reply, and a broken stream (resent once, unchanged). Each retry adds a targeted reminder and is a full upstream request; a retry never replaces a better reply. A reply that was already streamed live (see the stream gate) is neither retried nor judged.</p>
+
+      <h3 id="judge">Judge</h3>
+      <p>When a reply ends the turn right after a tool result without calling a tool, a small judge model (<code>qwen3-5-35b-a3b</code>) checks it for an early stop, an ignored failure or a missing result, and can trigger one more attempt (<code>VENICE_BRIDGE_JUDGE_RETRIES</code>, default 1). It only sees the latest user request, the last two tool results and the reply, as tails. Any judge failure keeps the reply. Disable it with <code>VENICE_BRIDGE_JUDGE=0</code>.</p>
+
+      <h3 id="stream-gate">Stream gate</h3>
+      <p>With tools, a prose reply longer than 200 characters is streamed while it is written; anything that may still become a tool call is held back. Failures before the status line are returned as HTTP 502, because OpenCode retries a 502 but not an error inside a started stream (measured). Without tools, text and reasoning stream as they arrive. A stream that fails after it started ends with a <code>data: {"error": {...}}</code> line and no <code>data: [DONE]</code>, never with a normal ending.</p>
+
+      <h3 id="error-mapping">Error mapping</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Upstream situation</th><th>Client sees</th><th>Error <code>type</code></th></tr></thead>
+        <tbody>
+          <tr><td>Chat quota used up (Venice 429, 0 remaining)</td><td class="num">403</td><td><code>venice_quota_exhausted</code> (body <code>code</code> 429), message with the reset time</td></tr>
+          <tr><td>Passing rate limit (Venice 429, quota left)</td><td class="num">429</td><td><code>venice_rate_limited</code></td></tr>
+          <tr><td>Request too large (Venice 413)</td><td class="num">400</td><td><code>invalid_request_error</code>, code <code>context_length_exceeded</code></td></tr>
+          <tr><td>Cloudflare challenge</td><td class="num">502</td><td><code>venice_upstream_error</code> (body <code>code</code> 403), with a clear message</td></tr>
+          <tr><td>Plan or credits do not cover the model (Venice 402)</td><td class="num">402</td><td><code>venice_upstream_error</code></td></tr>
+          <tr><td>Auth rejected (Venice 401 after one retry, or 403)</td><td class="num">401 / 403</td><td><code>venice_upstream_error</code></td></tr>
+          <tr><td>Other upstream failure, empty or cut reply</td><td class="num">502</td><td><code>venice_upstream_error</code> or <code>bridge_error</code></td></tr>
+        </tbody>
+      </table></div>
+      <p>The quota is answered as 403 on purpose: OpenCode retries a 429 silently. While the quota is known to be used up, the bridge answers at once without calling Venice; <code>POST /reload</code> clears that lock.</p>
+    </section>
+
+    <section id="configuration">
+      <h2>Configuration</h2>
+      <h3>Command-line options</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Option</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>--host</code></td><td><code>127.0.0.1</code></td><td>Address to listen on.</td></tr>
+          <tr><td><code>--port</code></td><td><code>18891</code></td><td>Port to listen on.</td></tr>
+        </tbody>
+      </table></div>
+      <h3>Environment variables</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>VENICE_BRIDGE_COOKIE_FILE</code></td><td><code>~/.config/venice-bridge/client-cookie.txt</code></td><td>Text file with the <code>__client</code> cookie value.</td></tr>
+          <tr><td><code>VENICE_BRIDGE_SESSION_DIR</code></td><td>unset</td><td>Folder with a local session daemon's <code>client.py</code> exposing <code>get_session(domain)</code>.</td></tr>
+          <tr><td><code>VENICE_BRIDGE_CLIENT_FILE</code></td><td><code>~/.config/venice-bridge/rotated-client.json</code></td><td>Where the rotated Clerk cookie is saved (mode 0600).</td></tr>
+          <tr><td><code>VENICE_BRIDGE_FORMAT_RETRIES</code></td><td><code>2</code></td><td>In-bridge retries for server loop, unreadable call, empty reply and broken stream.</td></tr>
+          <tr><td><code>VENICE_BRIDGE_JUDGE</code></td><td>on</td><td><code>0</code> turns the judge off.</td></tr>
+          <tr><td><code>VENICE_BRIDGE_JUDGE_MODEL</code></td><td><code>qwen3-5-35b-a3b</code></td><td>Model used as the judge.</td></tr>
+          <tr><td><code>VENICE_BRIDGE_JUDGE_RETRIES</code></td><td><code>1</code></td><td>Extra attempts the judge may trigger.</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="api">
+      <h2>API reference</h2>
+      <p>Base URL <code>http://127.0.0.1:18891</code>. Errors use the OpenAI shape <code>{"error": {"message", "type"}}</code>; upstream errors also carry <code>code</code>, while 404 and invalid-JSON errors carry only <code>message</code>. <code>/health</code> uses its own shape. Unknown paths answer 404.</p>
+
+      <h3><code>POST /v1/chat/completions</code></h3>
+      <p>OpenAI Chat Completions, streaming (<code>"stream": true</code>, server-sent events ending with <code>data: [DONE]</code>) and non-streaming. Declared <code>tools</code> come back as <code>tool_calls</code> with <code>finish_reason: "tool_calls"</code>; reasoning text, when the model sends it, arrives as <code>reasoning_content</code> deltas. If <code>model</code> is missing, <code>qwen3-coder-480b-a35b-instruct-turbo</code> is used.</p>
+      <pre><code>curl -s http://127.0.0.1:18891/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4-1-flash-uncensored","messages":[{"role":"user","content":"Reply with PONG"}]}'</code></pre>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Status</th><th>When</th></tr></thead>
+        <tbody>
+          <tr><td class="num">200</td><td><code>chat.completion</code> object, or an SSE stream of <code>chat.completion.chunk</code></td></tr>
+          <tr><td class="num">400</td><td>Invalid JSON body, or <code>context_length_exceeded</code></td></tr>
+          <tr><td class="num">401 / 403</td><td>Venice rejected the login, or a free account (<code>creator_access_required</code>); type <code>venice_upstream_error</code></td></tr>
+          <tr><td class="num">402</td><td>Plan or credits do not cover the model</td></tr>
+          <tr><td class="num">403</td><td>Chat quota used up; type <code>venice_quota_exhausted</code></td></tr>
+          <tr><td class="num">429</td><td>Passing rate limit; type <code>venice_rate_limited</code></td></tr>
+          <tr><td class="num">502</td><td>Upstream failure, Cloudflare challenge, empty or cut reply</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3><code>GET /v1/models</code></h3>
+      <p>Lists the models of your account's web catalogue that do not use credits (<code>owned_by: "venice-web"</code>). Answers 502 (<code>bridge_error</code>) when the catalogue cannot be read.</p>
+      <pre><code>curl -s http://127.0.0.1:18891/v1/models</code></pre>
+
+      <h3><code>GET /health</code></h3>
+      <p>200 <code>{"ok": true, "venice_session": "active", "chat_quota": {"reset_at", "remaining", "resets_in_min"}}</code> when a session JWT can be minted; <code>chat_quota</code> is <code>null</code> when the quota cannot be read. 503 <code>{"ok": false, "error": "..."}</code> when the login does not work.</p>
+      <pre><code>curl -s http://127.0.0.1:18891/health</code></pre>
+
+      <h3><code>POST /reload</code></h3>
+      <p>Drops the cached auth (Clerk cookie, session, JWT, attestation) and the quota lock. Answers 200 <code>{"ok": true}</code>.</p>
+      <pre><code>curl -s -X POST http://127.0.0.1:18891/reload</code></pre>
+    </section>
+
+    <section id="performance">
+      <h2>Measured performance</h2>
+      <div class="callout" role="note">
+        <p><strong>One machine, one account, November 2026.</strong> These numbers describe what was measured, not what you will get. Venice's load, your plan and your network change them.</p>
+      </div>
+      <ul>
+        <li>Bridge overhead per request: about 21 ms with a 441k-character prompt and 401 tools (local fake upstream).</li>
+        <li>A short model step through the bridge: 1.5–3 s. A warm OpenCode session: 2.8–4.5 s per message.</li>
+        <li>Calls that Venice swallows cost roughly 20–45 % of bridge time on models that prefer native tool calls.</li>
+      </ul>
+      <p>Small-project benchmark: OpenCode builds a Python todo CLI with tests and a README from one prompt. Wall time includes OpenCode's own startup.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Model id</th><th>Result</th><th>Time</th></tr></thead>
+        <tbody>
+          <tr><td><code>deepseek-v4-1-flash-uncensored</code></td><td>working project</td><td class="num">43–63 s</td></tr>
+          <tr><td><code>deepseek-v4-1-flash</code></td><td>working project (after the tagged-call reader was added)</td><td class="num">63–114 s</td></tr>
+          <tr><td><code>z-ai-glm-5-3-flash</code></td><td>working project</td><td class="num">88 s</td></tr>
+          <tr><td><code>qwen3-coder-480b-a35b-instruct-turbo</code></td><td>working project</td><td class="num">123 s</td></tr>
+          <tr><td><code>kimi-k2-5</code></td><td>working project</td><td class="num">119–139 s</td></tr>
+          <tr><td><code>default</code> (Venice "Auto")</td><td>working project</td><td class="num">336 s (63 steps)</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="troubleshooting">
+      <h2>Troubleshooting</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+        <tbody>
+          <tr><td>Connection refused on port 18891</td><td>The bridge is not running.</td><td>Start <code>python3 venice_bridge.py</code>, or check <code>venice_bridge.log</code> when launchd runs it.</td></tr>
+          <tr><td><code>/health</code> answers 503</td><td>No cookie, or Clerk no longer accepts it.</td><td>Copy a fresh <code>__client</code> value into the cookie file, then <code>POST /reload</code>.</td></tr>
+          <tr><td>403 with <code>creator_access_required</code> (type <code>venice_upstream_error</code>)</td><td>Free Venice account.</td><td>The web route needs a paid Venice web plan (Pro).</td></tr>
+          <tr><td>403 with type <code>venice_quota_exhausted</code></td><td>Web chat quota used up.</td><td>Wait for the reset time in the message; <code>/health</code> shows <code>resets_in_min</code>.</td></tr>
+          <tr><td>429 with type <code>venice_rate_limited</code></td><td>Venice is rate limiting briefly; quota is left.</td><td>Retry after a short wait.</td></tr>
+          <tr><td>502 "Cloudflare challenged the request"</td><td>Cloudflare wants a browser check.</td><td>Open venice.ai in your browser, refresh the cookie file (or sync your session daemon), and try again.</td></tr>
+          <tr><td>400 <code>context_length_exceeded</code></td><td>The request is larger than Venice accepts.</td><td>Start a new session or compact the conversation; declare fewer tools.</td></tr>
+          <tr><td>402</td><td>Your plan or credits do not cover the model.</td><td>Pick a model from <code>GET /v1/models</code>.</td></tr>
+          <tr><td>The model stops early or a tool call fails now and then</td><td>Tool calling is emulated; open models sometimes need a retry.</td><td>Ask again or switch models; <code>deepseek-v4-1-flash-uncensored</code> was the fastest in the benchmark.</td></tr>
+          <tr><td>Short replies appear all at once in tools mode</td><td>The stream gate holds replies under 200 characters until they are complete.</td><td>Expected behaviour.</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="faq">
+      <h2>FAQ</h2>
+      <details class="faq" open>
+        <summary>Does it need a Venice API key?</summary>
+        <p>No. venice-bridge does not use the paid Venice API. It talks to the backend of the venice.ai web app with your own browser login (the <code>__client</code> cookie of <code>clerk.venice.ai</code>). The <code>apiKey</code> value in the OpenCode config is a placeholder that the bridge does not check.</p>
+      </details>
+      <details class="faq">
+        <summary>Does it work on a free Venice account?</summary>
+        <p>No. The web route the bridge uses needs a paid Venice web plan (Pro). On a free account Venice answers <code>403 creator_access_required</code>.</p>
+      </details>
+      <details class="faq">
+        <summary>Does it work with Claude Code or Codex?</summary>
+        <p>Not directly. The bridge speaks OpenAI Chat Completions (<code>/v1/chat/completions</code>) only. It does not implement the Anthropic Messages API (<code>/v1/messages</code>) or the OpenAI Responses API (<code>/v1/responses</code>), which Claude Code and Codex CLI use.</p>
+      </details>
+      <details class="faq">
+        <summary>Does it work on Linux or Windows?</summary>
+        <p>Untested. The bridge streams through the system <code>curl</code> of macOS, which passes Cloudflare. Linux and Windows have not been tried.</p>
+      </details>
+      <details class="faq">
+        <summary>Is this allowed by Venice?</summary>
+        <p>venice-bridge is unofficial and not affiliated with, endorsed by, or supported by Venice.ai. It automates your own logged-in web session through undocumented endpoints, which may be against Venice's terms of service. Use it at your own risk, with your own account only, and never share cookies or accounts.</p>
+      </details>
+      <details class="faq">
+        <summary>Where do my chats go?</summary>
+        <p>From your client to the bridge on <code>127.0.0.1</code>, then to the venice.ai web backend under your own account (<code>clerk.venice.ai</code> for login, <code>outerface.venice.ai</code> for inference), as with the web app. When the judge is on, a short excerpt of the turn is sent to Venice as a second request. The bridge keeps no conversation history: each request body sits in a private temporary folder (mode 0700) only while its upstream call runs and is deleted afterwards. Its log records sizes, timings and outcomes and can include short excerpts of unreadable replies or swallowed tool calls.</p>
+      </details>
+      <details class="faq">
+        <summary>Is it an alternative to opencode-venice-web?</summary>
+        <p>Yes, it is an independent Python implementation of the same idea. opencode-venice-web (Node) is the most mature Venice web proxy and sends the full schema of every tool; venice-bridge is one Python file that sends a tiered tool list within a fixed budget. Its tolerant tool-call parser is a port of the opencode-venice-web parser (MIT).</p>
+      </details>
+    </section>
+
+    <section id="alternatives">
+      <h2>Alternatives</h2>
+      <ul>
+        <li><a href="https://github.com/CanArslanDev/opencode-venice-web">CanArslanDev/opencode-venice-web</a>: Node; the most mature Venice web proxy; sends full schemas for every tool.</li>
+        <li><a href="https://github.com/aintlikeu/unofficial-venice-proxy">aintlikeu/unofficial-venice-proxy</a> and <a href="https://github.com/zalo-alex/venice-opencode">zalo-alex/venice-opencode</a>: other Venice web proxies.</li>
+        <li>The official Venice API with an API key (metered credits), and OpenCode's built-in <code>venice</code> provider.</li>
+      </ul>
+    </section>
+
+    <section id="ai-agents">
+      <h2>AI agent integration</h2>
+      <p>Two files in the repository are written for coding agents:</p>
+      <ul>
+        <li><a href="https://github.com/nsozturk/venice-bridge/blob/main/AGENTS.md"><code>AGENTS.md</code></a>: the contract for agents that work on or with this repository: how to start, stop and check the bridge, endpoints, environment variables, tests, rules and common failures.</li>
+        <li><a href="https://github.com/nsozturk/venice-bridge/blob/main/GLOBAL_AGENT_RULE.md"><code>GLOBAL_AGENT_RULE.md</code></a>: a standalone snippet you can paste into your own agent's instructions so it knows how to start, check and use the bridge.</li>
+      </ul>
+      <p>For LLM ingestion this site also serves <a href="llms.txt"><code>llms.txt</code></a> and <a href="llms-full.txt"><code>llms-full.txt</code></a>.</p>
+    </section>
+
+    <section id="license">
+      <h2>License and credits</h2>
+      <p>MIT License, Copyright (c) 2026 venice-bridge contributors. See <a href="https://github.com/nsozturk/venice-bridge/blob/main/LICENSE"><code>LICENSE</code></a>.</p>
+      <p><code>tolerant_parser.py</code> is a Python port of the tolerant tool-call parser of <a href="https://github.com/CanArslanDev/opencode-venice-web">opencode-venice-web</a>, and the real malformed replies in <code>test_fixtures_real_replies.json</code> come from its test fixtures; several reminder texts and the judge prompt are adapted from the same project. All are used under the MIT License; see <a href="https://github.com/nsozturk/venice-bridge/blob/main/NOTICE.md"><code>NOTICE.md</code></a>.</p>
+      <p>Venice and venice.ai are names of their owner, used here only to describe compatibility.</p>
+    </section>
+
+    <div class="no-results" id="noResults">No section matches your search.</div>
+
+    <footer>
+      <p>venice-bridge v0.1.0 · MIT · <a href="https://github.com/nsozturk/venice-bridge">github.com/nsozturk/venice-bridge</a> · Unofficial, not affiliated with Venice.ai.</p>
+    </footer>
+  </main>
+</div>
+
+<script>
+(function () {
+  // Copy buttons on every code block.
+  document.querySelectorAll('pre').forEach(function (pre) {
+    var wrap = document.createElement('div');
+    wrap.className = 'code-wrap';
+    pre.parentNode.insertBefore(wrap, pre);
+    wrap.appendChild(pre);
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'copy-btn';
+    btn.textContent = 'Copy';
+    btn.setAttribute('aria-label', 'Copy code');
+    btn.addEventListener('click', function () {
+      var text = pre.innerText.replace(/\n$/, '');
+      var done = function () {
+        btn.textContent = 'Copied';
+        btn.classList.add('done');
+        setTimeout(function () { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1600);
+      };
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(done, function () { fallback(text); done(); });
+      } else { fallback(text); done(); }
+    });
+    wrap.appendChild(btn);
+  });
+  function fallback(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+
+  // Mobile menu.
+  var sidebar = document.getElementById('sidebar');
+  var menuBtn = document.getElementById('menuBtn');
+  menuBtn.addEventListener('click', function () {
+    var open = sidebar.classList.toggle('open');
+    menuBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+  sidebar.querySelectorAll('a').forEach(function (a) {
+    a.addEventListener('click', function () {
+      sidebar.classList.remove('open');
+      menuBtn.setAttribute('aria-expanded', 'false');
+    });
+  });
+
+  // Active section highlighting.
+  var links = Array.prototype.slice.call(document.querySelectorAll('.nav-item'));
+  var byId = {};
+  links.forEach(function (a) { byId[a.getAttribute('href').slice(1)] = a; });
+  var targets = Object.keys(byId).map(function (id) { return document.getElementById(id); }).filter(Boolean);
+  function setActive(id) {
+    links.forEach(function (a) { a.classList.toggle('active', a.getAttribute('href') === '#' + id); });
+  }
+  // Scroll-spy: the last visible target whose top has passed just below the navbar.
+  var ticking = false;
+  function spy() {
+    ticking = false;
+    var current = null;
+    for (var i = 0; i < targets.length; i++) {
+      var t = targets[i];
+      if (t.offsetParent === null) continue;  // hidden by the search
+      if (t.getBoundingClientRect().top <= 110) current = t.id;
+      // at the very bottom the last sections cannot reach the top: take the last one in view
+      if (innerHeight + scrollY >= document.documentElement.scrollHeight - 2 &&
+          t.getBoundingClientRect().top < innerHeight) current = t.id;
+    }
+    if (current) setActive(current);
+  }
+  window.addEventListener('scroll', function () {
+    if (!ticking) { ticking = true; requestAnimationFrame(spy); }
+  }, { passive: true });
+  setActive((location.hash || '#overview').slice(1));
+
+  // Live search: filters sections and the sidebar.
+  var input = document.getElementById('docSearch');
+  var status = document.getElementById('searchStatus');
+  var sections = Array.prototype.slice.call(document.querySelectorAll('main.content section'));
+  var noResults = document.getElementById('noResults');
+  function filter() {
+    var q = input.value.trim().toLowerCase();
+    var shown = 0;
+    sections.forEach(function (sec) {
+      var hit = !q || sec.textContent.toLowerCase().indexOf(q) !== -1;
+      sec.classList.toggle('hidden', !hit);
+      if (hit) shown++;
+    });
+    links.forEach(function (a) {
+      var id = a.getAttribute('href').slice(1);
+      var el = document.getElementById(id);
+      var sec = el && el.closest('section');
+      var hide = sec && sec.classList.contains('hidden');
+      if (!hide && q && a.classList.contains('sub')) hide = el.textContent.toLowerCase().indexOf(q) === -1 &&
+        (el.nextElementSibling ? el.nextElementSibling.textContent.toLowerCase().indexOf(q) === -1 : true);
+      a.classList.toggle('hidden', !!hide);
+    });
+    document.querySelectorAll('.nav-group').forEach(function (g) {
+      g.classList.toggle('hidden', !g.querySelector('.nav-item:not(.hidden)'));
+    });
+    noResults.style.display = shown ? 'none' : 'block';
+    status.textContent = q ? shown + (shown === 1 ? ' section matches' : ' sections match') : '';
+  }
+  input.addEventListener('input', filter);
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { input.value = ''; filter(); }
+  });
+})();
+</script>
+</body>
+</html>

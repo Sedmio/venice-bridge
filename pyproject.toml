@@ -1,0 +1,13 @@
+[project]
+name = "venice-bridge"
+version = "0.1.0"
+description = "Local OpenAI-compatible bridge that lets OpenCode and other coding agents use a venice.ai web subscription, with working tool calls."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["curl_cffi>=0.7"]
+keywords = ["venice", "venice-ai", "opencode", "openai-compatible", "llm-proxy", "tool-calling", "coding-agent", "local-bridge", "macos"]
+
+[project.urls]
+Homepage = "https://nsozturk.github.io/venice-bridge/"
+Repository = "https://github.com/nsozturk/venice-bridge"

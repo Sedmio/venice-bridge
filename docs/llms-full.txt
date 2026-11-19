@@ -1,0 +1,263 @@
+# venice-bridge
+
+> venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.
+
+Version 0.1.0 · MIT · Repository: https://github.com/nsozturk/venice-bridge · Docs: https://nsozturk.github.io/venice-bridge/
+
+## Overview
+
+venice-bridge is one Python file (`venice_bridge.py`, about 1,500 lines) plus `tolerant_parser.py`. It runs an HTTP server on `127.0.0.1:18891` that speaks OpenAI Chat Completions, and forwards each request to the backend of the venice.ai web app, authenticated with your own browser login. It does not use the paid Venice API and needs no API key.
+
+### Disclaimer
+
+- Unofficial. Not affiliated with, endorsed by, or supported by Venice.ai.
+- It talks to undocumented web endpoints that can change or break at any time.
+- It automates your own logged-in web session; that may be against Venice's terms of service. You use it at your own risk, with your own account.
+- Do not share cookies or accounts. The cookie is a live credential for your Venice account: never commit it, never share it.
+
+## Requirements
+
+- macOS. The bridge streams through the system `curl`, which passes Cloudflare. Linux and Windows are untested.
+- Python 3.10+ and `curl_cffi` (`pip install curl_cffi`).
+- A paid Venice web plan (Pro). On a free account the route answers `403 creator_access_required`.
+- OpenCode, or any client that speaks OpenAI Chat Completions.
+- Not supported: Anthropic Messages (`/v1/messages`) and OpenAI Responses (`/v1/responses`), so Claude Code and Codex CLI do not work with it directly.
+
+## Quick start
+
+1. Get the code and the dependency:
+
+```
+git clone https://github.com/nsozturk/venice-bridge.git
+cd venice-bridge
+pip install curl_cffi
+```
+
+2. Save your login cookie (the only setup step). The bridge needs the value of the `__client` cookie of `clerk.venice.ai` (a long-lived Clerk cookie). From it the bridge mints a session JWT of about 60 seconds and a client attestation for every request window. Log in on venice.ai in Chrome, open DevTools → Application → Cookies → `https://clerk.venice.ai`, copy the Value of `__client`, then:
+
+```
+mkdir -p ~/.config/venice-bridge && pbpaste > ~/.config/venice-bridge/client-cookie.txt && chmod 600 ~/.config/venice-bridge/client-cookie.txt
+```
+
+The file may hold the bare value or a pasted `__client=...;` string. Override its path with `VENICE_BRIDGE_COOKIE_FILE`. Clerk rotates the cookie while it is used; the bridge saves the rotated value to `~/.config/venice-bridge/rotated-client.json` (mode 0600, override with `VENICE_BRIDGE_CLIENT_FILE`).
+
+Optional second source: a local session daemon. Set `VENICE_BRIDGE_SESSION_DIR` to a folder containing a `client.py` that exposes `get_session(domain)` returning `{"timestamp": <ms>, "tokens": {"clerk_client": "<value>"}}`. The cookie file wins when both are present.
+
+3. Run the bridge: `python3 venice_bridge.py` (options `--host`, `--port`; default 127.0.0.1:18891). It prints `[+] Venice AI Bridge listening on http://127.0.0.1:18891/v1`. Logs go to stderr.
+
+4. Check it: `curl -s http://127.0.0.1:18891/health` answers `{"ok": true, "venice_session": "active", "chat_quota": {...}}`. Offline self-check without network: `python3 test_venice_bridge.py` prints `cookie file ok`, `session ok`, `ok`, `end to end ok`.
+
+5. Add the provider to OpenCode: copy the provider block from `examples/opencode.json` into `~/.config/opencode/opencode.json` (or a project `opencode.json`). Shortened to one model:
+
+```
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "venice-bridge": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Venice Web (local bridge)",
+      "options": {
+        "baseURL": "http://127.0.0.1:18891/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "deepseek-v4-1-flash-uncensored": {
+          "name": "DeepSeek V4.1 Flash Uncensored (Venice Web)",
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "limit": { "context": 524288, "output": 131072 }
+        }
+      }
+    }
+  }
+}
+```
+
+Models in the example config: deepseek-v4-1-flash-uncensored, deepseek-v4-1-flash, z-ai-glm-5-3-flash, kimi-k2-5, default, qwen3-coder-480b-a35b-instruct-turbo, qwen3-6-27b, zai-org-glm-5.2, venice-uncensored-1-2. `GET /v1/models` lists whatever the account's web catalogue offers without credits.
+
+6. First run: `opencode -m venice-bridge/deepseek-v4-1-flash-uncensored`
+
+## Autostart (launchd)
+
+`examples/com.example.venice-bridge.plist` is a launchd template: `RunAtLoad`, `KeepAlive`, `ThrottleInterval` 60, stdout and stderr to `venice_bridge.log` in the repository folder. Replace every `/PATH/TO` with real absolute paths, copy it to `~/Library/LaunchAgents/`, then:
+
+```
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.venice-bridge.plist
+```
+
+## How it works
+
+Flow: client (OpenAI Chat Completions) → venice-bridge on 127.0.0.1:18891 → `clerk.venice.ai` (the `__client` cookie gives a session and a ~60 s JWT) and `outerface.venice.ai` (client attestation, then the SSE route `/api/inference/chat/agents/ad-hoc`, the route the web app uses; it needs a paid plan). A 401 from Venice is retried once with a fresh JWT and attestation.
+
+### Tool emulation and the tiered tool list
+
+Venice's web routes do not expose client-declared tools to the model (measured: a declared `bash` client tool is invisible to the model on both `/agents/ad-hoc` and `/agents/venice`). So tools are emulated in text. The tool list goes into the system prompt: built-in tools and tools already used in the conversation get a compact full JSON schema (tier A), the rest are one-liners (tier B), inside a 78,000-character budget. Over budget, tier B degrades from the end to shorter descriptions, then names only; tier A is never cut. A real OpenCode request measured 411 tools and about 441,000 characters of system prompt. The model replies `{"tool_calls":[{"name":"...","arguments":{...}}]}`; a format reminder with one example is appended as the last user message.
+
+### Tolerant parser
+
+`tolerant_parser.py` (a port of the opencode-venice-web parser, MIT) reads calls that are bare, fenced, after prose, in several envelopes, or structurally broken (8 of 8 real malformed replies in the fixtures). A second reader handles `<tool_calls>{"name":...,"arguments":...}</tool_calls>` with unescaped quotes in file content. Calls to tools the client did not declare are dropped.
+
+### Completion check
+
+A reply counts only after Venice sends `response.completed`. A cut stream never becomes a half-written file.
+
+### Server-loop cut
+
+Venice sometimes takes a model's native tool call for one of its own server tools and answers the model "Tool not found" in a loop. The bridge tolerates 3 such steps, then cuts the response and retries with a corrective reminder.
+
+### In-bridge retries
+
+In tools mode the bridge retries by itself, budget 2 (`VENICE_BRIDGE_FORMAT_RETRIES`), for: server loop, unreadable call, empty reply, broken stream (resent once, unchanged). Each retry adds a targeted reminder and is a full upstream request; a retry never replaces a better reply. A reply that was already streamed live (see the stream gate) is neither retried nor judged.
+
+### Judge
+
+When a reply ends the turn right after a tool result without calling a tool, a small judge model (`qwen3-5-35b-a3b`) checks it for an early stop, an ignored failure or a missing result, and can trigger one more attempt (`VENICE_BRIDGE_JUDGE_RETRIES`, default 1). It only sees the latest user request, the last two tool results and the reply, as tails. Any judge failure keeps the reply. Disable it with `VENICE_BRIDGE_JUDGE=0`.
+
+### Stream gate
+
+With tools, a prose reply longer than 200 characters is streamed while it is written; anything that may still become a tool call is held back. Failures before the status line are returned as HTTP 502, because OpenCode retries a 502 but not an error inside a started stream (measured). Without tools, text and reasoning stream as they arrive. A stream that fails after it started ends with a `data: {"error": {...}}` line and no `data: [DONE]`, never with a normal ending.
+
+### Error mapping
+
+| Upstream situation | Client sees | Error type |
+|---|---|---|
+| Chat quota used up (Venice 429, 0 remaining) | 403 | `venice_quota_exhausted` (body code 429), message with the reset time |
+| Passing rate limit (Venice 429, quota left) | 429 | `venice_rate_limited` |
+| Request too large (Venice 413) | 400 | `invalid_request_error`, code `context_length_exceeded` |
+| Cloudflare challenge | 502 | `venice_upstream_error` (body code 403), with a clear message |
+| Plan or credits do not cover the model (Venice 402) | 402 | `venice_upstream_error` |
+| Auth rejected (Venice 401 after one retry, or 403) | 401 / 403 | `venice_upstream_error` |
+| Other upstream failure, empty or cut reply | 502 | `venice_upstream_error` or `bridge_error` |
+
+The quota is answered as 403 on purpose: OpenCode retries a 429 silently. While the quota is known to be used up, the bridge answers at once without calling Venice; `POST /reload` clears that lock.
+
+## Configuration
+
+Command-line options: `--host` (default `127.0.0.1`), `--port` (default `18891`).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VENICE_BRIDGE_COOKIE_FILE` | `~/.config/venice-bridge/client-cookie.txt` | Text file with the `__client` cookie value |
+| `VENICE_BRIDGE_SESSION_DIR` | unset | Folder with a local session daemon's `client.py` exposing `get_session(domain)` |
+| `VENICE_BRIDGE_CLIENT_FILE` | `~/.config/venice-bridge/rotated-client.json` | Where the rotated Clerk cookie is saved (mode 0600) |
+| `VENICE_BRIDGE_FORMAT_RETRIES` | `2` | In-bridge retries for server loop, unreadable call, empty reply, broken stream |
+| `VENICE_BRIDGE_JUDGE` | on | `0` turns the judge off |
+| `VENICE_BRIDGE_JUDGE_MODEL` | `qwen3-5-35b-a3b` | Model used as the judge |
+| `VENICE_BRIDGE_JUDGE_RETRIES` | `1` | Extra attempts the judge may trigger |
+
+## API reference
+
+Base URL `http://127.0.0.1:18891`. Errors use the OpenAI shape `{"error": {"message", "type"}}`; upstream errors also carry `code`, while 404 and invalid-JSON errors carry only `message`. `/health` uses its own shape. Unknown paths answer 404.
+
+### POST /v1/chat/completions
+
+OpenAI Chat Completions, streaming (`"stream": true`, server-sent events ending with `data: [DONE]`) and non-streaming. Declared `tools` come back as `tool_calls` with `finish_reason: "tool_calls"`; reasoning text arrives as `reasoning_content` deltas. If `model` is missing, `qwen3-coder-480b-a35b-instruct-turbo` is used.
+
+```
+curl -s http://127.0.0.1:18891/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4-1-flash-uncensored","messages":[{"role":"user","content":"Reply with PONG"}]}'
+```
+
+Status codes: 200 (completion or SSE stream); 400 (invalid JSON, or `context_length_exceeded`); 401/403 (Venice rejected the login, or a free account with `creator_access_required`; type `venice_upstream_error`); 402 (plan or credits do not cover the model); 403 (quota used up; type `venice_quota_exhausted`); 429 (passing rate limit; type `venice_rate_limited`); 502 (upstream failure, Cloudflare challenge, empty or cut reply).
+
+### GET /v1/models
+
+Lists the models of the account's web catalogue that do not use credits (`owned_by: "venice-web"`). 502 (`bridge_error`) when the catalogue cannot be read.
+
+```
+curl -s http://127.0.0.1:18891/v1/models
+```
+
+### GET /health
+
+200 `{"ok": true, "venice_session": "active", "chat_quota": {"reset_at", "remaining", "resets_in_min"}}` when a session JWT can be minted; `chat_quota` is `null` when the quota cannot be read. 503 `{"ok": false, "error": "..."}` when the login does not work.
+
+```
+curl -s http://127.0.0.1:18891/health
+```
+
+### POST /reload
+
+Drops the cached auth (Clerk cookie, session, JWT, attestation) and the quota lock. 200 `{"ok": true}`.
+
+```
+curl -s -X POST http://127.0.0.1:18891/reload
+```
+
+## Measured performance
+
+Measured in November 2026 on one machine with one account. These are observations, not guarantees.
+
+- Bridge overhead per request: about 21 ms with a 441k-character prompt and 401 tools (local fake upstream).
+- A short model step through the bridge: 1.5–3 s; a warm OpenCode session: 2.8–4.5 s per message.
+- Calls that Venice swallows cost roughly 20–45 % of bridge time on models that prefer native tool calls.
+
+Small-project benchmark (OpenCode builds a Python todo CLI with tests and a README from one prompt), wall time including OpenCode's own startup:
+
+| Model id | Result | Time |
+|---|---|---|
+| deepseek-v4-1-flash-uncensored | working project | 43–63 s |
+| deepseek-v4-1-flash | working project (after the tagged-call reader was added) | 63–114 s |
+| z-ai-glm-5-3-flash | working project | 88 s |
+| qwen3-coder-480b-a35b-instruct-turbo | working project | 123 s |
+| kimi-k2-5 | working project | 119–139 s |
+| default (Venice "Auto") | working project | 336 s (63 steps) |
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Connection refused on port 18891 | The bridge is not running | Start `python3 venice_bridge.py`, or check `venice_bridge.log` when launchd runs it |
+| `/health` answers 503 | No cookie, or Clerk no longer accepts it | Copy a fresh `__client` value into the cookie file, then `POST /reload` |
+| 403 `creator_access_required` (type `venice_upstream_error`) | Free Venice account | The web route needs a paid Venice web plan (Pro) |
+| 403 type `venice_quota_exhausted` | Web chat quota used up | Wait for the reset time in the message; `/health` shows `resets_in_min` |
+| 429 type `venice_rate_limited` | Venice is rate limiting briefly; quota is left | Retry after a short wait |
+| 502 "Cloudflare challenged the request" | Cloudflare wants a browser check | Open venice.ai in your browser, refresh the cookie file (or sync your session daemon), try again |
+| 400 `context_length_exceeded` | The request is larger than Venice accepts | Start a new session or compact the conversation; declare fewer tools |
+| 402 | Plan or credits do not cover the model | Pick a model from `GET /v1/models` |
+| The model stops early or a tool call fails now and then | Tool calling is emulated; open models sometimes need a retry | Ask again or switch models; `deepseek-v4-1-flash-uncensored` was the fastest in the benchmark |
+| Short replies appear all at once in tools mode | The stream gate holds replies under 200 characters until complete | Expected behaviour |
+
+## FAQ
+
+### Does it need a Venice API key?
+
+No. venice-bridge does not use the paid Venice API. It talks to the backend of the venice.ai web app with your own browser login (the `__client` cookie of `clerk.venice.ai`). The `apiKey` value in the OpenCode config is a placeholder that the bridge does not check.
+
+### Does it work on a free Venice account?
+
+No. The web route the bridge uses needs a paid Venice web plan (Pro). On a free account Venice answers `403 creator_access_required`.
+
+### Does it work with Claude Code or Codex?
+
+Not directly. The bridge speaks OpenAI Chat Completions (`/v1/chat/completions`) only. It does not implement the Anthropic Messages API (`/v1/messages`) or the OpenAI Responses API (`/v1/responses`), which Claude Code and Codex CLI use.
+
+### Does it work on Linux or Windows?
+
+Untested. The bridge streams through the system `curl` of macOS, which passes Cloudflare. Linux and Windows have not been tried.
+
+### Is this allowed by Venice?
+
+venice-bridge is unofficial and not affiliated with, endorsed by, or supported by Venice.ai. It automates your own logged-in web session through undocumented endpoints, which may be against Venice's terms of service. Use it at your own risk, with your own account only, and never share cookies or accounts.
+
+### Where do my chats go?
+
+From your client to the bridge on `127.0.0.1`, then to the venice.ai web backend under your own account (`clerk.venice.ai` for login, `outerface.venice.ai` for inference), as with the web app. When the judge is on, a short excerpt of the turn is sent to Venice as a second request. The bridge keeps no conversation history: each request body sits in a private temporary folder (mode 0700) only while its upstream call runs and is deleted afterwards. Its log records sizes, timings and outcomes and can include short excerpts of unreadable replies or swallowed tool calls.
+
+### Is it an alternative to opencode-venice-web?
+
+Yes, it is an independent Python implementation of the same idea. opencode-venice-web (Node) is the most mature Venice web proxy and sends the full schema of every tool; venice-bridge is one Python file that sends a tiered tool list within a fixed budget. Its tolerant tool-call parser is a port of the opencode-venice-web parser (MIT).
+
+## Alternatives
+
+- CanArslanDev/opencode-venice-web (https://github.com/CanArslanDev/opencode-venice-web): Node; the most mature Venice web proxy; sends full schemas for every tool.
+- aintlikeu/unofficial-venice-proxy and zalo-alex/venice-opencode: other Venice web proxies.
+- The official Venice API with an API key (metered credits), and OpenCode's built-in `venice` provider.
+
+## AI agent integration
+
+- `AGENTS.md` (https://github.com/nsozturk/venice-bridge/blob/main/AGENTS.md): the contract for agents that work on or with this repository.
+- `GLOBAL_AGENT_RULE.md` (https://github.com/nsozturk/venice-bridge/blob/main/GLOBAL_AGENT_RULE.md): a standalone snippet to paste into your own agent's instructions.
+
+## License and credits
+
+MIT License, Copyright (c) 2026 venice-bridge contributors. `tolerant_parser.py` is a Python port of the tolerant tool-call parser of opencode-venice-web, and the real malformed replies in `test_fixtures_real_replies.json` come from its test fixtures; several reminder texts and the judge prompt are adapted from the same project. All are used under the MIT License; see `NOTICE.md`. Venice and venice.ai are names of their owner, used here only to describe compatibility.

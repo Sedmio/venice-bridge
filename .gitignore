@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+*.log
+*.har
+*.bak*
+client-cookie.txt
+rotated-client.json
+tmp/
+dist/
+checkpoints/
+.agent-history/

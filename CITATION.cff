@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title: venice-bridge
+type: software
+version: 0.1.0
+date-released: 2026-11-19
+license: MIT
+repository-code: "https://github.com/nsozturk/venice-bridge"
+url: "https://nsozturk.github.io/venice-bridge/"
+abstract: "venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls."
+authors:
+  - name: "venice-bridge contributors"
+keywords:
+  - venice-ai
+  - opencode
+  - openai-compatible
+  - tool-calling
+  - llm-proxy
+  - coding-agent
+  - macos

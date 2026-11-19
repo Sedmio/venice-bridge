@@ -1,0 +1,40 @@
+# venice-bridge
+
+> venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.
+
+Unofficial: not affiliated with, endorsed by, or supported by Venice.ai. It uses undocumented web endpoints and your own logged-in session, which may be against Venice's terms of service. Use your own account only. Version 0.1.0, MIT.
+
+## What it does
+
+- One Python file (`venice_bridge.py`) plus `tolerant_parser.py`; an HTTP server on `127.0.0.1:18891`.
+- Endpoints: `POST /v1/chat/completions` (streaming and non-streaming), `GET /v1/models`, `GET /health`, `POST /reload`.
+- Forwards to the venice.ai web app's own backend with your browser login (`__client` cookie of `clerk.venice.ai`). No Venice API key; needs a paid Venice web plan (Pro).
+- Emulates tool calling in text (Venice's web routes hide client tools) and returns real OpenAI `tool_calls`, with a tolerant parser, in-bridge retries, a judge for early stops, and a stream gate.
+
+## Install
+
+- Requirements: macOS, Python 3.10+, `pip install curl_cffi`, OpenCode or any OpenAI Chat Completions client.
+- Save the `__client` cookie value to `~/.config/venice-bridge/client-cookie.txt` (mode 600).
+- Run `python3 venice_bridge.py`, check `curl -s http://127.0.0.1:18891/health`.
+
+## Use
+
+- OpenCode: copy the provider block from `examples/opencode.json` into `~/.config/opencode/opencode.json`, then `opencode -m venice-bridge/deepseek-v4-1-flash-uncensored`.
+- Autostart: `examples/com.example.venice-bridge.plist` (launchd template).
+- Offline self-check: `python3 test_venice_bridge.py`.
+
+## Limits
+
+- macOS only so far (Linux and Windows untested).
+- No Anthropic Messages (`/v1/messages`) or OpenAI Responses (`/v1/responses`) API, so Claude Code and Codex CLI do not work with it directly.
+- No images. Short replies are not streamed in tools mode. Tool calling is emulated; open models sometimes need a retry.
+- Free Venice accounts get `403 creator_access_required`.
+
+## Links
+
+- [Documentation](https://nsozturk.github.io/venice-bridge/): full docs portal
+- [Full docs as plain text](https://nsozturk.github.io/venice-bridge/llms-full.txt)
+- [Repository](https://github.com/nsozturk/venice-bridge)
+- [README](https://github.com/nsozturk/venice-bridge/blob/main/README.md)
+- [AGENTS.md](https://github.com/nsozturk/venice-bridge/blob/main/AGENTS.md): contract for coding agents
+- [GLOBAL_AGENT_RULE.md](https://github.com/nsozturk/venice-bridge/blob/main/GLOBAL_AGENT_RULE.md): snippet for your own agent's instructions

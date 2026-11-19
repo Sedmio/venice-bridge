@@ -1,0 +1,142 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "venice-bridge": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:18891/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "qwen3-coder-480b-a35b-instruct-turbo": {
+          "name": "Qwen 3 Coder 480B Turbo (Venice Web)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 256000,
+            "output": 65536
+          }
+        },
+        "deepseek-v4-1-flash-uncensored": {
+          "name": "DeepSeek V4.1 Flash Uncensored (Venice Web)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 524288,
+            "output": 131072
+          }
+        },
+        "qwen3-6-27b": {
+          "name": "Qwen 3.6 27B (Venice Web)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 256000,
+            "output": 65536
+          }
+        },
+        "zai-org-glm-5.2": {
+          "name": "GLM 5.2 (Venice Web)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 131072
+          }
+        },
+        "venice-uncensored-1-2": {
+          "name": "Venice Uncensored 1.2 (Venice Web)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 128000,
+            "output": 8192
+          }
+        },
+        "default": {
+          "name": "Auto (Venice Web)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "kimi-k2-5": {
+          "name": "Kimi K2.5 (Venice Web)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        },
+        "deepseek-v4-1-flash": {
+          "name": "DeepSeek V4.1 Flash 1017 (Venice Web)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 131072
+          }
+        },
+        "z-ai-glm-5-3-flash": {
+          "name": "GLM 5.3 Flash (Venice Web)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1048576,
+            "output": 131072
+          }
+        }
+      },
+      "name": "Venice Web (local bridge)"
+    }
+  }
+}
