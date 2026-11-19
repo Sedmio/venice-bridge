@@ -6,11 +6,12 @@
 
 - Runs an OpenAI Chat Completions server on `127.0.0.1:18891` (`POST /v1/chat/completions`, `GET /v1/models`, `GET /health`, `POST /reload`).
 - Forwards requests to the venice.ai web app's own backend, signed in with the user's browser login (the `__client` cookie of `clerk.venice.ai`). It does not use the paid Venice API and needs no API key.
-- Emulates tool calling in text: the tool list goes into the system prompt, and a tolerant parser turns the model's reply into OpenAI `tool_calls`. Includes retries, a completion check, a stream gate, and an optional early-stop judge.
+- `VENICE_BRIDGE_ROUTE=auto` (default) uses Venice's plain chat route, where no Venice agent loop swallows tool calls, and falls back to the agent route for a model the chat route does not know; `chat` and `agent` force one route.
+- Emulates tool calling in text: the tool list goes into the prompt, and a tolerant parser plus native and tagged call readers turn the model's reply into OpenAI `tool_calls`; foreign tool and argument names are routed to the client's tools. Includes retries, a completion check, a stream gate, and an optional early-stop judge.
 
 ## Install
 
-- Requirements: macOS, Python 3.10+, `pip install curl_cffi`, a paid venice.ai web plan (Pro).
+- Requirements: macOS, Python 3.10+, `pip install curl_cffi`, a venice.ai web account (tested on a paid plan, Pro).
 - Save the cookie value to `~/.config/venice-bridge/client-cookie.txt` (mode 0600).
 - Run `python3 venice_bridge.py`, then check `curl -s http://127.0.0.1:18891/health`.
 
@@ -24,9 +25,9 @@
 
 - Unofficial; not affiliated with Venice.ai. Uses undocumented web endpoints that can change at any time.
 - Automating a logged-in web session may be against Venice's terms of service; use only your own account.
-- Free Venice accounts get `403 creator_access_required`.
+- Tested on a paid plan (Pro). The agent route needs a paid plan (a free account gets `403 creator_access_required`); a free account has a very small chat quota.
 - macOS only so far. No Anthropic Messages or OpenAI Responses API, so Claude Code and Codex CLI do not work directly. No images.
-- Tool calling is emulated; open models sometimes need a retry.
+- With tools, short replies are sent only when complete. Tool calling is emulated; open models sometimes need a retry.
 
 ## Links
 

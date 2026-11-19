@@ -8,8 +8,9 @@ Unofficial: not affiliated with, endorsed by, or supported by Venice.ai. It uses
 
 - One Python file (`venice_bridge.py`) plus `tolerant_parser.py`; an HTTP server on `127.0.0.1:18891`.
 - Endpoints: `POST /v1/chat/completions` (streaming and non-streaming), `GET /v1/models`, `GET /health`, `POST /reload`.
-- Forwards to the venice.ai web app's own backend with your browser login (`__client` cookie of `clerk.venice.ai`). No Venice API key; needs a paid Venice web plan (Pro).
-- Emulates tool calling in text (Venice's web routes hide client tools) and returns real OpenAI `tool_calls`, with a tolerant parser, in-bridge retries, a judge for early stops, and a stream gate.
+- Forwards to the venice.ai web app's own backend with your browser login (`__client` cookie of `clerk.venice.ai`). No Venice API key. Tested on a paid Venice web plan (Pro).
+- `VENICE_BRIDGE_ROUTE=auto` (default) uses Venice's plain chat route (no Venice agent loop, no swallowed calls) and falls back to the agent route for a model the chat route does not know; `chat` and `agent` force one route.
+- Emulates tool calling in text (Venice's web routes hide client tools) and returns real OpenAI `tool_calls`, with a tolerant parser, native and tagged call readers, tool and argument routing, in-bridge retries, a judge for early stops, and a stream gate.
 
 ## Install
 
@@ -27,8 +28,8 @@ Unofficial: not affiliated with, endorsed by, or supported by Venice.ai. It uses
 
 - macOS only so far (Linux and Windows untested).
 - No Anthropic Messages (`/v1/messages`) or OpenAI Responses (`/v1/responses`) API, so Claude Code and Codex CLI do not work with it directly.
-- No images. Short replies are not streamed in tools mode. Tool calling is emulated; open models sometimes need a retry.
-- Free Venice accounts get `403 creator_access_required`.
+- No images. With tools, short replies are sent only when complete. Tool calling is emulated; open models sometimes need a retry.
+- The agent route needs a paid plan (a free account gets `403 creator_access_required`); a free account has a very small chat quota.
 
 ## Links
 

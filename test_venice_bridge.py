@@ -122,10 +122,73 @@ def main() -> None:
         g.feed(ch)
     assert "".join(out) == "<start>" + "y" * 250 + " now the file." and g.rest().startswith("@@WRITE@@<tool_calls>")
 
+    # the model's own markup, as DeepSeek V4.1 Flash writes it on the plain chat route (real reply, 2026-11-19)
+    dsml = ('<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="command" string="true">pwd && ls -la</｜DSML｜ parameter>\n'
+            '</｜DSML｜ invoke>\n</｜DSML｜ calls>')
+    stools = [{"type": "function", "function": {"name": "shell", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}},
+              {"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}, "content": {"type": "string"}}}}}]
+    calls, content, unreadable = vb._read_reply(dsml, stools)
+    assert [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls] == [("shell", {"command": "pwd && ls -la"})]
+    assert content == "" and not unreadable
+    two_native = ('I will write it.\n<｜DSML｜ function_calls>\n<｜DSML｜ invoke name="write">\n<｜DSML｜ parameter name="path" string="true">a.py</｜DSML｜ parameter>\n'
+                  '<｜DSML｜ parameter name="content" string="true">x = "1"\nprint(x)\n</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n'
+                  '<invoke name="bash"><parameter name="command">ls</parameter><parameter name="timeout" string="false">5</parameter></invoke>')
+    calls, content, unreadable = vb._read_reply(two_native, stools)
+    assert [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls] == [
+        ("write", {"filePath": "a.py", "content": 'x = "1"\nprint(x)\n'}), ("shell", {"command": "ls", "timeout": 5})]
+    assert content == "I will write it."  # the markup is never shown
+    assert vb._read_reply('<｜DSML｜ invoke name="', stools) == (None, "", False) or vb._read_reply('<｜DSML｜ invoke name="', stools)[0] is None
+    out = []
+    g = vb._LiveGate(lambda: out.append("<start>"), out.append)
+    for ch in "y" * 250 + ' now.\n<｜DSML｜ invoke name="shell">':
+        g.feed(ch)
+    assert "".join(out) == "<start>" + "y" * 250 + " now.\n" and g.rest().startswith("<｜DSML｜")
+
     # only tools the request declared; the case is corrected; a lone invented name is passed on
     tools = [{"type": "function", "function": {"name": "read"}}, {"type": "function", "function": {"name": "bash"}}]
     assert names('{"tool_calls":[{"name":"Read","arguments":{}},{"name":"view_media","arguments":{}}]}', tools) == ["read"]
-    assert names('{"tool_calls":[{"name":"cat","arguments":{"path":"a"}}]}', tools) == ["cat"]
+    assert names('{"tool_calls":[{"name":"frobnicate","arguments":{"path":"a"}}]}', tools) == ["frobnicate"]
+
+    # routing: a foreign tool name goes to the client's tool for that job, with its argument names
+    rt = [{"type": "function", "function": {"name": n, "parameters": {"type": "object", "properties": {k: {"type": "string"} for k in keys}}}}
+          for n, keys in (("read", ["filePath"]), ("bash", ["command", "description"]), ("edit", ["filePath", "oldString", "newString"]),
+                          ("write", ["filePath", "content"]), ("grep", ["pattern", "path"]), ("webfetch", ["url"]))]
+
+    def routed(reply):
+        calls = vb._read_reply(reply, rt)[0] or []
+        return [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls]
+
+    assert routed('{"tool_calls":[{"name":"cat","arguments":{"path":"a.txt"}}]}') == [("read", {"filePath": "a.txt"})]
+    assert routed('{"tool_calls":[{"name":"shell","arguments":{"cmd":"ls"}}]}') == [("bash", {"command": "ls"})]
+    assert routed('{"tool_calls":[{"name":"execute","arguments":{"command":"ls"}}]}') == [("bash", {"command": "ls"})]
+    assert routed('{"tool_calls":[{"name":"str_replace","arguments":{"file_path":"a","old_str":"x","new_str":"y"}}]}') == [
+        ("edit", {"filePath": "a", "oldString": "x", "newString": "y"})]
+    assert routed('{"tool_calls":[{"name":"create_file","arguments":{"filename":"a","contents":"x"}}]}') == [
+        ("write", {"filePath": "a", "content": "x"})]
+    assert routed('{"tool_calls":[{"name":"web_scrape","arguments":{"link":"https://example.com"}}]}') == [
+        ("webfetch", {"url": "https://example.com"})]
+    assert routed('{"tool_calls":[{"name":"list_dir","arguments":{"path":"src dir"}}]}') == [("bash", {"command": "ls -la 'src dir'"})]
+    # the desktop app calls its command tool `shell`, the CLI `bash`: each name reaches whichever exists
+    desk = [{"type": "function", "function": {"name": "shell", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}}]
+    got = vb._read_reply('{"tool_calls":[{"name":"bash","arguments":{"cmd":"ls"}}]}', desk)[0]
+    assert got[0]["function"]["name"] == "shell" and json.loads(got[0]["function"]["arguments"]) == {"command": "ls"}
+    assert "run a command with `shell`" in vb._route_hint({"shell": "shell"})
+    # Venice's media tool is a file read only when its id is a path; a made-up id is not
+    assert routed('{"tool_calls":[{"name":"get_attachment","arguments":{"media_ids":["src/app.py"]}}]}') == [("read", {"filePath": "src/app.py"})]
+    assert routed('{"tool_calls":[{"name":"view_media","arguments":{"media_ids":["nope"]}}]}') == [("view_media", {"media_ids": ["nope"]})]
+    # the right tool with a wrong argument name is fixed too; a name the tool knows is left alone
+    assert routed('{"tool_calls":[{"name":"read","arguments":{"path":"a.txt"}}]}') == [("read", {"filePath": "a.txt"})]
+    assert routed('{"tool_calls":[{"name":"grep","arguments":{"query":"x","path":"src"}}]}') == [("grep", {"pattern": "x", "path": "src"})]
+    assert routed('{"tool_calls":[{"name":"read","arguments":{"filePath":"a","path":"b"}}]}') == [("read", {"filePath": "a", "path": "b"})]
+
+    # the retry after a swallowed call names the tools and where they go
+    known = {"read": "read", "bash": "bash"}
+    steer = vb._steer_reminder("server_tool", {"recognized": ["get_attachment"]}, known)
+    assert "`get_attachment`" in steer and "use `read`" in steer and '{"tool_calls"' in steer
+    steer = vb._steer_reminder("server_loop", {"unrecognized": ["Bash", "glob"]}, known)
+    assert steer.startswith(vb.NATIVE_CALL_REMINDER) and "`bash`, `glob`" in steer
+    assert vb._steer_reminder("server_loop", {}, known) == vb.NATIVE_CALL_REMINDER
+    assert "read a file with `read`" in vb._route_hint(known) and "never use them" in vb._route_hint({})
     quoting = "The bridge asks the model for this shape. " * 8 + '{"tool_calls":[{"name":"<exact tool name>","arguments":{}}]}'
     assert names(quoting, tools) == []
     assert vb._read_reply(quoting, tools)[2] is False
@@ -270,6 +333,7 @@ def end_to_end() -> None:
     prose = text("I will now run the tests.") + done
     static = {
         "ok": text("PONG") + done,
+        "agentonly": text("PONG") + done,
         "stale": text("PONG") + done,
         "cut": text('{"tool_calls":[{"name":"write","arguments":{"filePath":"a","content":"half'),  # no response.completed
         "failed": text("so") + frame("response.failed", {"response": {"error": {"message": "boom"}}}),
@@ -290,7 +354,13 @@ def end_to_end() -> None:
         "long_then_cut": b"".join(text(p) for p in LONG_PARTS),  # no response.completed
         "long_with_braces": b"".join(text(p) for p in LONG_PARTS) + text(' Use {"name": "x"} or { y } here.') + done,
     }
+    own_step = frame("veniceai:tool_call_generation.in_progress", {"detected_tools": [{"type": "Recognized", "tool": "get_attachment"}]})
+    static["own_tool_recovered"] = own_step + call  # one step with Venice's tool, then our format: left alone
+    own_tool = (own_step * 4
+                + text("I need file tools, but only media viewing is available here.") + done)
+    static["own_tool"] = own_tool
     sequences = {  # the n-th request of a case gets the n-th reply (the last one repeats)
+        "own_tool_then_call": [own_tool, call],
         "loop_then_call": [swallowed, call], "broken_then_call": [broken, call], "empty_then_text": [done, prose],
         "prose_then_call": [prose, call], "cut_then_loop_then_call": [static["cut"], swallowed, swallowed, call],
         "loop_then_cut_then_call": [swallowed, static["cut"], call], "prose_then_500": [prose, None],  # None = HTTP 500
@@ -298,6 +368,7 @@ def end_to_end() -> None:
     verdicts = {"judge-stopped": "stopped_early", "judge-finished": "finished", "judge-missing": "missing_result",
                 "judge-quota": "stopped_early", "judge-slow": "stopped_early"}
     seen = {}  # case -> last user message text of every request
+    chat_seen = []  # request bodies that reached the plain chat route
     judged = []  # judge request bodies
 
     class FakeVenice(BaseHTTPRequestHandler):
@@ -307,6 +378,24 @@ def end_to_end() -> None:
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             case = body["modelId"]
+            if self.path == "/api/inference/chat":  # the plain chat route: JSON lines, no closing event
+                chat_seen.append(body)
+                if case == "agentonly":
+                    page = b'{"error":"modelNotFound"}'
+                    self.send_response(400); self.send_header("Content-Length", str(len(page))); self.end_headers()
+                    self.wfile.write(page)
+                    return
+                line = lambda kind, content: (json.dumps({"kind": kind, "content": content}) + "\n").encode()
+                out = line("meta", "") + {
+                    "ok": line("content", "PO") + line("content", "NG"),
+                    "call": line("content", '{"tool_calls":[{"name":"read","arguments":{"filePath":"a"}}]}'),
+                }.get(case, line("content", "half an ans"))
+                self.send_response(200)
+                # a body shorter than announced = a cut stream: curl exits non-zero
+                self.send_header("Content-Length", str(len(out) + (40 if case == "cut" else 0)))
+                self.end_headers()
+                self.wfile.write(out)
+                return
             if case.startswith("judge-"):
                 judged.append(body)
                 if case == "judge-quota":  # another request used the quota up meanwhile
@@ -356,6 +445,7 @@ def end_to_end() -> None:
     for srv in (fake, bridge):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
     vb.OUTERFACE_BASE = "http://127.0.0.1:%d" % fake.server_address[1]
+    vb.ROUTE = "agent"
     vb.VENICE.auth_headers = lambda force_refresh=False: {"Content-Type": "application/json"}
     vb.VENICE.quota_until = 0.0
     tools = [{"type": "function", "function": {"name": "read"}}, {"type": "function", "function": {"name": "write"}}]
@@ -392,6 +482,10 @@ def end_to_end() -> None:
         return json.loads(out)["choices"][0]["message"]["content"]
 
     act = lambda reminder: "(act reminder) " + reminder
+
+    # the fake swallows a native `read`: the retry names that tool
+
+    NATIVE_READ = vb._steer_reminder("server_loop", {"unrecognized": ["read"]}, {"read": "read"})
     vb.JUDGE_ENABLED, vb.JUDGE_MODEL = True, "judge-finished"
     code, out = ask("ok")
     assert code == 200 and json.loads(out)["choices"][0]["message"]["content"] == "PONG"
@@ -405,19 +499,19 @@ def end_to_end() -> None:
             assert len(seen[case]) == want, (case, stream, len(seen[case]))
             if case in ("cut", "failed"):  # resent unchanged, no reminder
                 assert set(seen[case]) == {vb.TOOL_REMINDER}, case
-    assert seen["swallowed"] == [vb.TOOL_REMINDER] + [act(vb.NATIVE_CALL_REMINDER)] * 2
+    assert seen["swallowed"] == [vb.TOOL_REMINDER] + [act(NATIVE_READ)] * 2
     # server loop, then the call on the retry, which carries the native-call reminder (stream and not)
     for stream in (False, True):
         code, out = ask("loop_then_call", stream=stream, with_tools=True)
         assert code == 200 and calls_of(out, stream) == ["read"], (stream, out)
-        assert seen["loop_then_call"] == [vb.TOOL_REMINDER, act(vb.NATIVE_CALL_REMINDER)], seen["loop_then_call"]
+        assert seen["loop_then_call"] == [vb.TOOL_REMINDER, act(NATIVE_READ)], seen["loop_then_call"]
     # a broken stream after a reminder retry is resent with the same reminder
     code, out = ask("cut_then_loop_then_call", with_tools=True)
     assert code == 502 and seen["cut_then_loop_then_call"] == [vb.TOOL_REMINDER, vb.TOOL_REMINDER,
-                                                                act(vb.NATIVE_CALL_REMINDER)], seen
+                                                                act(NATIVE_READ)], seen
     # a broken stream after a reminder retry is resent with that reminder, and the call comes through
     code, out = ask("loop_then_cut_then_call", with_tools=True)
-    assert code == 200 and seen["loop_then_cut_then_call"] == [vb.TOOL_REMINDER] + [act(vb.NATIVE_CALL_REMINDER)] * 2
+    assert code == 200 and seen["loop_then_cut_then_call"] == [vb.TOOL_REMINDER] + [act(NATIVE_READ)] * 2
     # unreadable call, then a valid one
     code, out = ask("broken_then_call", with_tools=True)
     assert calls_of(out, False) == ["read"] and seen["broken_then_call"][1] == act(vb.BROKEN_ENVELOPE_REMINDER)
@@ -505,6 +599,47 @@ def end_to_end() -> None:
         code, out = ask(case, stream=True)
         assert code == 200 and '"error"' in out and "finish_reason\": \"" not in out and "[DONE]" not in out, (case, out)
         assert len(seen[case]) == 1
+    # ---- Venice runs one of its own tools: cut at once, asked again with the tool it should use ----
+    for stream in (False, True):
+        code, out = ask("own_tool_then_call", stream=stream, with_tools=True)
+        assert code == 200 and calls_of(out, stream) == ["read"], out[:200]
+        first_last, second_last = seen["own_tool_then_call"]
+        assert "get_attachment" not in first_last and "`get_attachment`" in second_last and "use `read`" in second_last
+    assert ask("own_tool", with_tools=True)[0] == 502 and len(seen["own_tool"]) == 3  # every attempt: budget used up
+    code, out = ask("own_tool_recovered", with_tools=True)  # the model recovered inside the response
+    assert calls_of(out, False) == ["read"] and len(seen["own_tool_recovered"]) == 1
+    code, out = ask("own_tool")  # without tools nothing is cut: the model's text is the answer
+    assert code == 200 and "media viewing" in out
+
+    # ---- the plain chat route: instructions folded into the first user message, no agent loop ----
+    vb.ROUTE = "chat"
+    try:
+        code, out = ask("ok")
+        assert code == 200 and json.loads(out)["choices"][0]["message"]["content"] == "PONG"
+        body = chat_seen[-1]
+        assert body["systemPrompt"] == vb.CHAT_SYSTEM_PROMPT and [m["role"] for m in body["prompt"]] == ["user"]
+        assert body["prompt"][0]["content"].startswith("[SESSION INSTRUCTIONS]\n") and "[USER REQUEST]\nx" in body["prompt"][0]["content"]
+        for stream in (False, True):
+            code, out = ask("call", stream=stream, with_tools=True, messages=after_tool)
+            assert code == 200 and calls_of(out, stream) == ["read"], out[:200]
+        body = chat_seen[-1]  # user(instructions+request) / assistant(call) / user(tool result + reminder)
+        assert [m["role"] for m in body["prompt"]] == ["user", "assistant", "user"]
+        assert "[Tool Result c1]" in body["prompt"][2]["content"] and body["prompt"][2]["content"].endswith(vb.TOOL_REMINDER)
+        assert "- read(" in body["prompt"][0]["content"]  # the tool list travels with the instructions
+        del chat_seen[:]
+        assert ask("cut", with_tools=True)[0] == 502 and len(chat_seen) == 2  # a cut reply is no answer: retried once
+        # auto: a model the chat route does not know is sent to the agent route, and remembered
+        vb.ROUTE = "auto"
+        vb.AGENT_ONLY_MODELS.clear()
+        del chat_seen[:]
+        code, out = ask("agentonly")
+        assert code == 200 and "PONG" in out and len(chat_seen) == 1 and vb.AGENT_ONLY_MODELS == {"agentonly"}
+        code, out = ask("agentonly")
+        assert code == 200 and len(chat_seen) == 1  # the second request goes straight to the agent route
+    finally:
+        vb.ROUTE = "agent"
+        vb.AGENT_ONLY_MODELS.clear()
+
     # ---- the stream gate: long prose is shown while it is written, a call never is ----
     def said(out):
         return "".join(json.loads(l[6:])["choices"][0]["delta"].get("content") or ""

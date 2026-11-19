@@ -8,10 +8,14 @@ change this repository. Read it before you run, configure, or edit anything here
 venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.
 
 - One HTTP server (`venice_bridge.py`) on `127.0.0.1:18891`, speaking OpenAI Chat Completions.
-- Upstream is the venice.ai web app's own backend (`clerk.venice.ai` for login,
-  `outerface.venice.ai/api/inference/chat/agents/ad-hoc` for chat), authenticated with the user's browser login.
-  It is not the paid Venice API and needs no API key.
-- Needs a paid Venice web plan (Pro). A free account gets `403 creator_access_required`.
+- Upstream is the venice.ai web app's own backend (`clerk.venice.ai` for login, `outerface.venice.ai` for chat),
+  authenticated with the user's browser login. It is not the paid Venice API and needs no API key.
+- `VENICE_BRIDGE_ROUTE` picks the chat route: `auto` (default) uses the chat route `/api/inference/chat` and sends a
+  model it does not know (`400 modelNotFound`) to the agent route `/api/inference/chat/agents/ad-hoc`; `chat` and
+  `agent` force one route. The chat route has no Venice agent loop and no Venice tools, so no call is swallowed;
+  the client's system prompt travels in the first user message. The log line `timing open: … route=` shows the route.
+- Tested on a paid Venice web plan (Pro). The agent route needs a paid plan (a free account gets
+  `403 creator_access_required`); a free account has a very small chat quota.
 - Unofficial; the endpoints are undocumented and may change. Using it may be against Venice's terms of service.
 - Does not implement Anthropic Messages (`/v1/messages`) or OpenAI Responses (`/v1/responses`). No images.
 
@@ -62,6 +66,7 @@ Read once at start; set them before starting the bridge.
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `VENICE_BRIDGE_ROUTE` | `auto` | `auto`: chat route, agent route for a model the chat route does not know; `chat`: chat route only; `agent`: agent route only (needs a paid plan). |
 | `VENICE_BRIDGE_COOKIE_FILE` | `~/.config/venice-bridge/client-cookie.txt` | Cookie file (bare value or `__client=...;`). |
 | `VENICE_BRIDGE_SESSION_DIR` | empty | Folder with a `client.py` exposing `get_session(domain)` → `{"timestamp": <ms>, "tokens": {"clerk_client": "<value>"}}`. Used when the cookie file is missing or empty. |
 | `VENICE_BRIDGE_CLIENT_FILE` | `~/.config/venice-bridge/rotated-client.json` | Rotated cookie, written with mode 0600. |
@@ -92,7 +97,7 @@ Any `AssertionError` or non-zero exit is a failure. Run the tests after every ch
 
 | File | Owns |
 |---|---|
-| `venice_bridge.py` | HTTP server, Clerk login and cookie rotation, attestation, OpenAI ↔ Venice translation, tool emulation prompt, retries, judge, stream gate, error mapping. |
+| `venice_bridge.py` | HTTP server, Clerk login and cookie rotation, attestation, route choice (chat / agent), OpenAI ↔ Venice translation, tool emulation prompt, native and tagged call readers, tool routing and argument fitting, retries, judge, stream gate, error mapping. |
 | `tolerant_parser.py` | Reading tool calls from model text (lenient JSON, envelopes, broken replies). Port of opencode-venice-web, MIT. |
 | `test_venice_bridge.py` | Offline self-check. |
 | `test_fixtures_real_replies.json` | Real malformed model replies (from opencode-venice-web, MIT). |
@@ -114,7 +119,8 @@ Any `AssertionError` or non-zero exit is a failure. Run the tests after every ch
    the reply can no longer become a tool call or a retry; only prose past that point streams live, and a tail
    that may still become a call is held back. Keep this property when changing the stream path, because it is
    what lets a failed turn reach OpenCode as a retryable 502.
-4. **A reply counts only after `response.completed`.** Do not emit a cut stream as a normal answer.
+4. **A reply counts only after its completion signal**: `response.completed` on the agent route, a clean end of
+   the HTTP response (curl exit code 0) on the chat route. Do not emit a cut stream as a normal answer.
 5. **Keep the attribution** in `tolerant_parser.py`, `NOTICE.md`, and `THIRD_PARTY_LICENSE-opencode-venice-web.txt`.
 6. **Bind to loopback only.** The bridge has no client authentication; never start it with a non-loopback
    `--host`.
@@ -125,9 +131,10 @@ Any `AssertionError` or non-zero exit is a failure. Run the tests after every ch
 |---|---|
 | `/health` → `503` "No venice.ai login found" | Ask the user to save the cookie (README Quick start step 1). |
 | "Clerk ... rejected" / "token mint failed" | The cookie expired. Ask the user to log in on venice.ai and save a fresh cookie, then `POST /reload`. |
-| `403 creator_access_required` | Free account. Nothing to fix in code; a paid web plan is required. |
+| `403 creator_access_required` | The agent route on a free account. Nothing to fix in code; the agent route needs a paid web plan. If `VENICE_BRIDGE_ROUTE=agent` is set, try `auto`. |
 | `403 venice_quota_exhausted` | Wait for the reset shown in the message; do not loop on retries. |
 | `502` "Cloudflare challenged the request" | Ask the user to open venice.ai in the browser and refresh the cookie file. |
 | `400 context_length_exceeded` | Shorten or compact the conversation. |
-| Model claims its tools are unavailable | Venice swallowed a native tool call; the bridge retries within its budget. Resend, or switch to a model from the README benchmark table. |
+| Model claims its tools are unavailable / "Tool not found" | The request used the agent route (check `route=` in the log), where Venice swallows native tool calls. Use `VENICE_BRIDGE_ROUTE=auto` or `chat`, or a model that exists on the chat route; in an existing conversation tell the model its tools work now, or start a new session. |
+| `502` "Venice answered HTTP 400: … modelNotFound" with `VENICE_BRIDGE_ROUTE=chat` | The model exists only on the agent route. Use `auto`. |
 | `Address already in use` on start | A bridge is already running; check `/health` instead of starting another. |

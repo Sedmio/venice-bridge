@@ -8,7 +8,10 @@ Paste this into your agent's global instructions so it knows the bridge exists a
 
 venice-bridge is a local server on this Mac that exposes the user's venice.ai web subscription as an OpenAI
 Chat Completions API at `http://127.0.0.1:18891/v1`, with tool calling. It is unofficial and uses the venice.ai
-web app's undocumented backend with the user's own login; it needs no Venice API key, but does need a paid Venice web plan.
+web app's undocumented backend with the user's own login; it needs no Venice API key. It was tested on a paid Venice
+web plan (Pro); its agent route needs a paid plan, and a free account has a very small chat quota.
+`VENICE_BRIDGE_ROUTE=auto` (default) uses Venice's plain chat route and falls back to the agent route for a model
+the chat route does not know.
 
 **Check before use**
 
@@ -33,10 +36,11 @@ means the login cookie is missing or expired: ask the user to save the `__client
 | Response | Meaning | Action |
 |---|---|---|
 | `403` `venice_quota_exhausted` | Web chat quota used up | Stop and tell the user when it resets; do not retry in a loop |
-| `403` `creator_access_required` | Free Venice account | Tell the user a paid web plan is required |
+| `403` `creator_access_required` | The agent route on a free Venice account | Tell the user the agent route needs a paid web plan |
 | `502` Cloudflare challenge | Venice challenged the request | Ask the user to open venice.ai in the browser and refresh the cookie |
 | `400` `context_length_exceeded` | Request too large | Compact or shorten the conversation |
 | `429` `venice_rate_limited` | Passing rate limit | Wait briefly, then retry |
+| Model says "Tool not found" / tools unavailable | The request used the agent route | Use `VENICE_BRIDGE_ROUTE=auto` or `chat`; start a new session |
 
 **Rules**
 

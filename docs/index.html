@@ -58,7 +58,7 @@
     {
       "@type": "Question",
       "name": "Does it work on a free Venice account?",
-      "acceptedAnswer": {"@type": "Answer", "text": "No. The web route the bridge uses needs a paid Venice web plan (Pro). On a free account Venice answers 403 creator_access_required."}
+      "acceptedAnswer": {"@type": "Answer", "text": "It was not tested on one. Everything was measured on a paid Venice web plan (Pro). The agent route needs a paid plan; on a free account it answers 403 creator_access_required. A free account also has a very small chat quota (about 5 messages per ~4 hours when it was observed)."}
     },
     {
       "@type": "Question",
@@ -286,8 +286,12 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
       <div class="nav-group">
         <div class="nav-title">Internals</div>
         <a href="#how-it-works" class="nav-item">How it works</a>
+        <a href="#routes" class="nav-item sub" data-parent="how-it-works">Routes</a>
         <a href="#tool-emulation" class="nav-item sub" data-parent="how-it-works">Tool emulation</a>
         <a href="#tolerant-parser" class="nav-item sub" data-parent="how-it-works">Tolerant parser</a>
+        <a href="#call-readers" class="nav-item sub" data-parent="how-it-works">Call readers</a>
+        <a href="#tool-routing" class="nav-item sub" data-parent="how-it-works">Tool routing</a>
+        <a href="#argument-fitting" class="nav-item sub" data-parent="how-it-works">Argument fitting</a>
         <a href="#completion-check" class="nav-item sub" data-parent="how-it-works">Completion check</a>
         <a href="#server-loop" class="nav-item sub" data-parent="how-it-works">Server-loop cut</a>
         <a href="#retries" class="nav-item sub" data-parent="how-it-works">In-bridge retries</a>
@@ -320,7 +324,7 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
     <section id="overview">
       <h1>venice-bridge</h1>
       <p class="lead">venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.</p>
-      <p>It is one Python file (<code>venice_bridge.py</code>, about 1,500 lines) plus <code>tolerant_parser.py</code>. It runs an HTTP server on <code>127.0.0.1:18891</code> that speaks OpenAI Chat Completions, and forwards each request to the backend of the venice.ai <strong>web app</strong>, authenticated with your own browser login. It does not use the paid Venice API and needs no API key.</p>
+      <p>It is one Python file (<code>venice_bridge.py</code>, about 1,900 lines) plus <code>tolerant_parser.py</code>. It runs an HTTP server on <code>127.0.0.1:18891</code> that speaks OpenAI Chat Completions, and forwards each request to the backend of the venice.ai <strong>web app</strong>, authenticated with your own browser login. It does not use the paid Venice API and needs no API key.</p>
 
       <div class="callout warn" role="note">
         <div class="callout-title">Disclaimer: unofficial, read before use</div>
@@ -335,8 +339,8 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
       <div class="grid">
         <div class="card"><h4>OpenAI-compatible</h4><p><code>POST /v1/chat/completions</code> (streaming and non-streaming), <code>GET /v1/models</code>, <code>GET /health</code>, <code>POST /reload</code>.</p></div>
         <div class="card"><h4>Working tool calls</h4><p>Venice's web routes hide client tools from the model, so the bridge emulates them in text and returns real OpenAI <code>tool_calls</code>.</p></div>
-        <div class="card"><h4>Web subscription, no API key</h4><p>Uses the <code>__client</code> cookie of <code>clerk.venice.ai</code>. Needs a paid Venice web plan (Pro).</p></div>
-        <div class="card"><h4>Honest limits</h4><p>macOS only so far. No Anthropic Messages or OpenAI Responses API. No images. Open models sometimes need a retry.</p></div>
+        <div class="card"><h4>Web subscription, no API key</h4><p>Uses the <code>__client</code> cookie of <code>clerk.venice.ai</code>. Tested on a paid Venice web plan (Pro).</p></div>
+        <div class="card"><h4>Honest limits</h4><p>macOS only so far. No Anthropic Messages or OpenAI Responses API. No images. With tools, short replies are sent only when complete. Open models sometimes need a retry.</p></div>
       </div>
     </section>
 
@@ -359,7 +363,7 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
       <ul>
         <li><strong>macOS.</strong> The bridge streams through the system <code>curl</code>, which passes Cloudflare. Linux and Windows are untested.</li>
         <li><strong>Python 3.10+</strong> and <code>curl_cffi</code> (<code>pip install curl_cffi</code>).</li>
-        <li><strong>A paid Venice web plan (Pro).</strong> On a free account the route answers <code>403 creator_access_required</code>.</li>
+        <li><strong>A venice.ai web account</strong>, logged in in your browser. Everything was tested on a paid plan (Pro). The agent route needs a paid plan (a free account gets <code>403 creator_access_required</code>); a free account has a very small chat quota.</li>
         <li><strong>OpenCode</strong>, or any client that speaks OpenAI Chat Completions.</li>
       </ul>
       <p>Not supported: the Anthropic Messages API (<code>/v1/messages</code>) and the OpenAI Responses API (<code>/v1/responses</code>), so Claude Code and Codex CLI do not work with it directly.</p>
@@ -435,7 +439,7 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
 
     <section id="how-it-works">
       <h2>How it works</h2>
-      <div class="flow" role="img" aria-label="Request flow: the client sends OpenAI Chat Completions to the bridge on 127.0.0.1:18891; the bridge gets a session JWT from clerk.venice.ai, mints a client attestation and streams the reply from outerface.venice.ai, then returns an OpenAI response with tool_calls.">
+      <div class="flow" role="img" aria-label="Request flow: the client sends OpenAI Chat Completions to the bridge on 127.0.0.1:18891; the bridge gets a session JWT from clerk.venice.ai, mints a client attestation and streams the reply from outerface.venice.ai on the chat route by default or on the agent route as fallback, reads the calls in the reply, then returns an OpenAI response with tool_calls.">
         <div class="flow-node">
           <h4>Your client</h4>
           <div class="where">OpenCode or any OpenAI client</div>
@@ -445,7 +449,7 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
         <div class="flow-node main">
           <h4>venice-bridge</h4>
           <div class="where">127.0.0.1:18891</div>
-          <ul><li>Tool list into the system prompt</li><li>Tolerant reply parser</li><li>Retries, judge, stream gate</li><li>Error mapping</li></ul>
+          <ul><li>Route: <code>auto</code>, <code>chat</code> or <code>agent</code></li><li>Tool list into the prompt</li><li>Call readers, tool routing, argument fitting</li><li>Retries, judge, stream gate</li><li>Error mapping</li></ul>
         </div>
         <div class="flow-arrow"><span class="arr arr-h">&#8644;</span><span class="arr arr-v">&#8645;</span>your login</div>
         <div class="upstreams">
@@ -457,15 +461,28 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
           <div class="flow-node">
             <h4>Venice web backend</h4>
             <div class="where">outerface.venice.ai</div>
-            <ul><li>Client attestation</li><li><code>/api/inference/chat/agents/ad-hoc</code> (SSE)</li></ul>
+            <ul><li>Client attestation</li><li>Chat route <code>/api/inference/chat</code> (JSON lines; default)</li><li>Agent route <code>/api/inference/chat/agents/ad-hoc</code> (SSE; fallback)</li></ul>
           </div>
         </div>
       </div>
-      <p class="flow-caption">Request flow. The inference route is the one the venice.ai web app itself uses; it needs a paid plan.</p>
-      <p>The bridge reads the <code>__client</code> cookie, finds the active Clerk session, mints a short-lived session JWT and a client attestation, and streams the reply from Venice's <code>/agents/ad-hoc</code> route. A 401 from Venice is retried once with a fresh JWT and attestation.</p>
+      <p class="flow-caption">Request flow. Both inference routes are routes of the venice.ai web app itself; <code>VENICE_BRIDGE_ROUTE</code> chooses between them.</p>
+      <p>The bridge reads the <code>__client</code> cookie, finds the active Clerk session, mints a short-lived session JWT and a client attestation, and streams the reply from the Venice route chosen by <code>VENICE_BRIDGE_ROUTE</code>. A 401 from Venice is retried once with a fresh JWT and attestation.</p>
+
+      <h3 id="routes">Routes</h3>
+      <p>Routes: <code>VENICE_BRIDGE_ROUTE</code> is <code>auto</code> (default), <code>chat</code> or <code>agent</code>. The chat route is the default path because Venice runs no agent loop there and gives the model no tools of its own, so nothing collides with the client's tools and no call is swallowed.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Setting</th><th>Route</th><th>What happens</th></tr></thead>
+        <tbody>
+          <tr><td><code>auto</code> (default)</td><td>chat, agent as fallback</td><td>Uses the chat route. If Venice answers <code>400 modelNotFound</code> for a model (measured for <code>kimi-k2-5</code>), the bridge remembers that model until it restarts and sends it to the agent route.</td></tr>
+          <tr><td><code>chat</code></td><td><code>POST outerface.venice.ai/api/inference/chat</code></td><td>The web app's plain chat route (JSON lines, one object per line with a <code>kind</code>). No agent loop, no Venice tools, no swallowed calls.</td></tr>
+          <tr><td><code>agent</code></td><td><code>POST outerface.venice.ai/api/inference/chat/agents/ad-hoc</code></td><td>The agent route (Responses-style SSE). Needs a paid plan (a free account gets <code>403 creator_access_required</code>). Venice runs its own agent loop: the model gets Venice's server tools as native tools, a native call to a client tool is swallowed, and turns can end in "Tool not found".</td></tr>
+        </tbody>
+      </table></div>
+      <p>On the chat route the client's system prompt is folded into the first user message (<code>[SESSION INSTRUCTIONS] … [END OF SESSION INSTRUCTIONS]</code>, then <code>[USER REQUEST]</code>), because that route's <code>413 userPromptTooLong</code> limit (about 150,000 characters) applies to the <code>systemPrompt</code> field only; 460,000 characters inside a user message were accepted (measured). The log line <code>timing open: … route=chat|agent</code> shows which route a request used.</p>
+      <p>On the agent route a swallowed call shows only the tool name in the stream, never its arguments, so it cannot be forwarded; Venice's own <code>get_attachment</code> / <code>view_media</code> run there with made-up ids.</p>
 
       <h3 id="tool-emulation">Tool emulation and the tiered tool list</h3>
-      <p>Venice's web routes do not expose client-declared tools to the model (measured: a declared <code>bash</code> client tool is invisible to the model on both <code>/agents/ad-hoc</code> and <code>/agents/venice</code>). So tools are emulated in text:</p>
+      <p>Venice's web routes do not give the model the client's declared tools (measured on the agent route <code>/agents/ad-hoc</code> and on <code>/agents/venice</code>: a declared <code>bash</code> client tool is invisible to the model; the chat route offers the model no tools). So tools are emulated in text:</p>
       <ul>
         <li>The tool list goes into the system prompt. Built-in tools and tools already used in the conversation get a compact full JSON schema (tier A); the rest are one-liners (tier B). The whole block has a budget of 78,000 characters; over budget, tier B degrades from the end to shorter descriptions, then to names only. Tier A is never cut.</li>
         <li>For scale: a real OpenCode request measured 411 tools and about 441,000 characters of system prompt.</li>
@@ -473,13 +490,42 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
       </ul>
 
       <h3 id="tolerant-parser">Tolerant parser</h3>
-      <p><code>tolerant_parser.py</code>, a port of the opencode-venice-web parser (MIT), reads calls that are bare, fenced, after prose, in several envelopes, or structurally broken (8 of 8 real malformed replies in the fixtures). A second reader handles <code>&lt;tool_calls&gt;{"name":...,"arguments":...}&lt;/tool_calls&gt;</code> with unescaped quotes in file content. Calls to tools the client did not declare are dropped.</p>
+      <p><code>tolerant_parser.py</code>, a port of the opencode-venice-web parser (MIT), reads calls that are bare, fenced, after prose, in several envelopes, or structurally broken (8 of 8 real malformed replies in the fixtures). Two more call readers and tool routing follow below.</p>
+
+      <h3 id="call-readers">Call readers</h3>
+      <p>Call readers: a native call reader for the model's own markup and a tagged call reader for <code>&lt;tool_calls&gt;</code>.</p>
+      <ul>
+        <li><strong>Native call reader.</strong> Some models write tool calls in their own markup, with arguments, as text. On the chat route DeepSeek V4.1 Flash writes <code>&lt;&#xFF5C;DSML&#xFF5C; invoke name="shell"&gt;&lt;&#xFF5C;DSML&#xFF5C; parameter name="command" string="true"&gt;ls&lt;/&#xFF5C;DSML&#xFF5C; parameter&gt;&lt;/&#xFF5C;DSML&#xFF5C; invoke&gt;</code>. The bridge reads that form and plain <code>&lt;invoke name=…&gt;&lt;parameter name=…&gt;</code>, several calls per reply, takes <code>string="false"</code> parameters as JSON, and never shows the markup as text.</li>
+        <li><strong>Tagged call reader.</strong> <code>&lt;tool_calls&gt;{"name":…,"arguments":…}&lt;/tool_calls&gt;</code>, including file content with unescaped quotes.</li>
+      </ul>
+
+      <h3 id="tool-routing">Tool routing</h3>
+      <p>Tool routing: a call to a tool the client did not declare is routed to the client's tool for the same job. A call to an unknown name with no counterpart is passed to the client when the reply is only that call (under 200 characters of other text), so the client can tell the model; otherwise it is dropped and logged.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>The model calls</th><th>Routed to</th></tr></thead>
+        <tbody>
+          <tr><td><code>cat</code>, <code>read_file</code>, <code>view</code></td><td><code>read</code></td></tr>
+          <tr><td><code>shell</code>, <code>execute</code>, <code>run_command</code></td><td><code>bash</code> (or <code>shell</code> on clients that name it so)</td></tr>
+          <tr><td><code>str_replace</code>, <code>edit_file</code></td><td><code>edit</code></td></tr>
+          <tr><td><code>create_file</code>, <code>write_file</code></td><td><code>write</code></td></tr>
+          <tr><td><code>search</code>, <code>rg</code></td><td><code>grep</code></td></tr>
+          <tr><td><code>find_files</code></td><td><code>glob</code></td></tr>
+          <tr><td><code>web_search</code></td><td><code>websearch</code></td></tr>
+          <tr><td><code>web_scrape</code>, <code>fetch</code></td><td><code>webfetch</code></td></tr>
+          <tr><td><code>ls</code>, <code>list_dir</code></td><td><code>list</code>, or a shell <code>ls</code></td></tr>
+          <tr><td>Venice's <code>get_attachment</code>, <code>view_media</code></td><td><code>read</code>, only when the id is a file path</td></tr>
+        </tbody>
+      </table></div>
+      <p>The tool block in the prompt also tells the model that Venice's own tools and built-in function calling do not reach this computer, and which client tool does which job (read a file, run a command, search the web, fetch a web page).</p>
+
+      <h3 id="argument-fitting">Argument fitting</h3>
+      <p>Argument fitting renames arguments the model named differently: <code>path</code> / <code>file_path</code> / <code>filename</code> → <code>filePath</code>, <code>cmd</code> / <code>script</code> → <code>command</code>, <code>old_str</code> → <code>oldString</code>, <code>new_str</code> → <code>newString</code>, <code>contents</code> / <code>text</code> → <code>content</code>, <code>query</code> / <code>regex</code> → <code>pattern</code>, <code>link</code> → <code>url</code>. This happens only when the tool expects that name, did not get it, and does not know the other name.</p>
 
       <h3 id="completion-check">Completion check</h3>
-      <p>A reply counts only after Venice sends <code>response.completed</code>. A cut stream never becomes a half-written file.</p>
+      <p>A reply counts only after its completion signal: <code>response.completed</code> on the agent route; on the chat route, which sends no closing event, a clean end of the HTTP response (curl exit code 0). A cut stream never becomes a half-written file.</p>
 
-      <h3 id="server-loop">Server-loop cut</h3>
-      <p>Venice sometimes takes a model's native tool call for one of its own server tools and answers the model "Tool not found" in a loop. The bridge tolerates 3 such steps, then cuts the response and retries with a corrective reminder.</p>
+      <h3 id="server-loop">Server-loop cut (agent route only)</h3>
+      <p>On the agent route Venice sometimes takes a model's native tool call for one of its own server tools, or runs one of its own tools, and answers the model "Tool not found" in a loop. The bridge tolerates 3 such steps, then cuts the response and retries with a reminder that names the tools. Cutting at the first step in which Venice runs its own tool was tried and removed: it made DeepSeek V4.1 Flash fail 7 of 8 turns, because the model usually recovers inside the same response.</p>
 
       <h3 id="retries">In-bridge retries</h3>
       <p>In tools mode the bridge retries by itself, with a budget of 2 (<code>VENICE_BRIDGE_FORMAT_RETRIES</code>), for: a server loop, an unreadable call, an empty reply, and a broken stream (resent once, unchanged). Each retry adds a targeted reminder and is a full upstream request; a retry never replaces a better reply. A reply that was already streamed live (see the stream gate) is neither retried nor judged.</p>
@@ -498,6 +544,7 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
           <tr><td>Passing rate limit (Venice 429, quota left)</td><td class="num">429</td><td><code>venice_rate_limited</code></td></tr>
           <tr><td>Request too large (Venice 413)</td><td class="num">400</td><td><code>invalid_request_error</code>, code <code>context_length_exceeded</code></td></tr>
           <tr><td>Cloudflare challenge</td><td class="num">502</td><td><code>venice_upstream_error</code> (body <code>code</code> 403), with a clear message</td></tr>
+          <tr><td>Model not on the chat route (Venice 400 <code>modelNotFound</code>)</td><td class="num">auto: agent route; chat: 502</td><td><code>venice_upstream_error</code> (body <code>code</code> 400), "Venice answered HTTP 400: …"</td></tr>
           <tr><td>Plan or credits do not cover the model (Venice 402)</td><td class="num">402</td><td><code>venice_upstream_error</code></td></tr>
           <tr><td>Auth rejected (Venice 401 after one retry, or 403)</td><td class="num">401 / 403</td><td><code>venice_upstream_error</code></td></tr>
           <tr><td>Other upstream failure, empty or cut reply</td><td class="num">502</td><td><code>venice_upstream_error</code> or <code>bridge_error</code></td></tr>
@@ -520,6 +567,7 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
       <div class="table-wrap"><table>
         <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
         <tbody>
+          <tr><td><code>VENICE_BRIDGE_ROUTE</code></td><td><code>auto</code></td><td>Venice web route: <code>auto</code> (chat route; agent route for a model the chat route does not know), <code>chat</code> (chat route only), <code>agent</code> (agent route only; needs a paid plan). See <a href="#routes">Routes</a>.</td></tr>
           <tr><td><code>VENICE_BRIDGE_COOKIE_FILE</code></td><td><code>~/.config/venice-bridge/client-cookie.txt</code></td><td>Text file with the <code>__client</code> cookie value.</td></tr>
           <tr><td><code>VENICE_BRIDGE_SESSION_DIR</code></td><td>unset</td><td>Folder with a local session daemon's <code>client.py</code> exposing <code>get_session(domain)</code>.</td></tr>
           <tr><td><code>VENICE_BRIDGE_CLIENT_FILE</code></td><td><code>~/.config/venice-bridge/rotated-client.json</code></td><td>Where the rotated Clerk cookie is saved (mode 0600).</td></tr>
@@ -544,7 +592,7 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
         <tbody>
           <tr><td class="num">200</td><td><code>chat.completion</code> object, or an SSE stream of <code>chat.completion.chunk</code></td></tr>
           <tr><td class="num">400</td><td>Invalid JSON body, or <code>context_length_exceeded</code></td></tr>
-          <tr><td class="num">401 / 403</td><td>Venice rejected the login, or a free account (<code>creator_access_required</code>); type <code>venice_upstream_error</code></td></tr>
+          <tr><td class="num">401 / 403</td><td>Venice rejected the login, or the agent route on a free account (<code>creator_access_required</code>); type <code>venice_upstream_error</code></td></tr>
           <tr><td class="num">402</td><td>Plan or credits do not cover the model</td></tr>
           <tr><td class="num">403</td><td>Chat quota used up; type <code>venice_quota_exhausted</code></td></tr>
           <tr><td class="num">429</td><td>Passing rate limit; type <code>venice_rate_limited</code></td></tr>
@@ -573,18 +621,18 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
       <ul>
         <li>Bridge overhead per request: about 21 ms with a 441k-character prompt and 401 tools (local fake upstream).</li>
         <li>A short model step through the bridge: 1.5–3 s. A warm OpenCode session: 2.8–4.5 s per message.</li>
-        <li>Calls that Venice swallows cost roughly 20–45 % of bridge time on models that prefer native tool calls.</li>
+        <li>On the agent route, swallowed calls cost roughly 20–50 % of bridge time on models that prefer native tool calls; on the chat route none were seen.</li>
       </ul>
-      <p>Small-project benchmark: OpenCode builds a Python todo CLI with tests and a README from one prompt. Wall time includes OpenCode's own startup.</p>
+      <p>Small-project benchmark: the coding client builds a Python todo CLI with tests and a README from one prompt. Wall time includes the client's own startup.</p>
       <div class="table-wrap"><table>
-        <thead><tr><th>Model id</th><th>Result</th><th>Time</th></tr></thead>
+        <thead><tr><th>Model id</th><th>Route used</th><th>Result</th><th>Time</th></tr></thead>
         <tbody>
-          <tr><td><code>deepseek-v4-1-flash-uncensored</code></td><td>working project</td><td class="num">43–63 s</td></tr>
-          <tr><td><code>deepseek-v4-1-flash</code></td><td>working project (after the tagged-call reader was added)</td><td class="num">63–114 s</td></tr>
-          <tr><td><code>z-ai-glm-5-3-flash</code></td><td>working project</td><td class="num">88 s</td></tr>
-          <tr><td><code>qwen3-coder-480b-a35b-instruct-turbo</code></td><td>working project</td><td class="num">123 s</td></tr>
-          <tr><td><code>kimi-k2-5</code></td><td>working project</td><td class="num">119–139 s</td></tr>
-          <tr><td><code>default</code> (Venice "Auto")</td><td>working project</td><td class="num">336 s (63 steps)</td></tr>
+          <tr><td><code>deepseek-v4-1-flash</code></td><td>chat</td><td>working project, 3 of 3 runs, 0 retries, 0 swallowed calls</td><td class="num">34–51 s</td></tr>
+          <tr><td><code>deepseek-v4-1-flash</code> (before, agent route)</td><td>agent</td><td>2 of 4 runs produced a project</td><td class="num">63–203 s</td></tr>
+          <tr><td><code>deepseek-v4-1-flash-uncensored</code></td><td>chat</td><td>working project, 3 of 3 runs</td><td>16 s, 56 s, and one 460 s run where the model itself took 86 steps to debug a test</td></tr>
+          <tr><td><code>z-ai-glm-5-3-flash</code></td><td>chat</td><td>working project</td><td class="num">84 s</td></tr>
+          <tr><td><code>qwen3-coder-480b-a35b-instruct-turbo</code></td><td>chat</td><td>working project</td><td class="num">86 s</td></tr>
+          <tr><td><code>kimi-k2-5</code></td><td>agent (not on the chat route)</td><td>commands work, its own tests left failing</td><td class="num">146 s</td></tr>
         </tbody>
       </table></div>
     </section>
@@ -596,14 +644,16 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
         <tbody>
           <tr><td>Connection refused on port 18891</td><td>The bridge is not running.</td><td>Start <code>python3 venice_bridge.py</code>, or check <code>venice_bridge.log</code> when launchd runs it.</td></tr>
           <tr><td><code>/health</code> answers 503</td><td>No cookie, or Clerk no longer accepts it.</td><td>Copy a fresh <code>__client</code> value into the cookie file, then <code>POST /reload</code>.</td></tr>
-          <tr><td>403 with <code>creator_access_required</code> (type <code>venice_upstream_error</code>)</td><td>Free Venice account.</td><td>The web route needs a paid Venice web plan (Pro).</td></tr>
+          <tr><td>403 with <code>creator_access_required</code> (type <code>venice_upstream_error</code>)</td><td>The request went to the agent route on a free Venice account.</td><td>The agent route needs a paid Venice web plan (Pro); with <code>VENICE_BRIDGE_ROUTE=agent</code>, try <code>auto</code>.</td></tr>
           <tr><td>403 with type <code>venice_quota_exhausted</code></td><td>Web chat quota used up.</td><td>Wait for the reset time in the message; <code>/health</code> shows <code>resets_in_min</code>.</td></tr>
           <tr><td>429 with type <code>venice_rate_limited</code></td><td>Venice is rate limiting briefly; quota is left.</td><td>Retry after a short wait.</td></tr>
           <tr><td>502 "Cloudflare challenged the request"</td><td>Cloudflare wants a browser check.</td><td>Open venice.ai in your browser, refresh the cookie file (or sync your session daemon), and try again.</td></tr>
           <tr><td>400 <code>context_length_exceeded</code></td><td>The request is larger than Venice accepts.</td><td>Start a new session or compact the conversation; declare fewer tools.</td></tr>
           <tr><td>402</td><td>Your plan or credits do not cover the model.</td><td>Pick a model from <code>GET /v1/models</code>.</td></tr>
-          <tr><td>The model stops early or a tool call fails now and then</td><td>Tool calling is emulated; open models sometimes need a retry.</td><td>Ask again or switch models; <code>deepseek-v4-1-flash-uncensored</code> was the fastest in the benchmark.</td></tr>
+          <tr><td>The model stops early or a tool call fails now and then</td><td>Tool calling is emulated; open models sometimes need a retry.</td><td>Ask again or switch models (see the <a href="#performance">benchmark</a>).</td></tr>
           <tr><td>Short replies appear all at once in tools mode</td><td>The stream gate holds replies under 200 characters until they are complete.</td><td>Expected behaviour.</td></tr>
+          <tr><td>The model says its tools are unavailable, or "Tool not found" (for example "the tool layer is down — shell, execute and read all return Tool not found")</td><td>The request went through the agent route (check <code>route=</code> in the log).</td><td>Use <code>VENICE_BRIDGE_ROUTE=auto</code> or <code>chat</code>, or pick a model that exists on the chat route. In an existing conversation the model may keep believing its tools are broken: tell it they work now, or start a new session.</td></tr>
+          <tr><td>502 "Venice answered HTTP 400: … modelNotFound" with <code>VENICE_BRIDGE_ROUTE=chat</code></td><td>That model exists only on the agent route.</td><td>Use <code>VENICE_BRIDGE_ROUTE=auto</code>.</td></tr>
         </tbody>
       </table></div>
     </section>
@@ -616,7 +666,7 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
       </details>
       <details class="faq">
         <summary>Does it work on a free Venice account?</summary>
-        <p>No. The web route the bridge uses needs a paid Venice web plan (Pro). On a free account Venice answers <code>403 creator_access_required</code>.</p>
+        <p>It was not tested on one. Everything was measured on a paid Venice web plan (Pro). The agent route needs a paid plan; on a free account it answers <code>403 creator_access_required</code>. A free account also has a very small chat quota (about 5 messages per ~4 hours when it was observed).</p>
       </details>
       <details class="faq">
         <summary>Does it work with Claude Code or Codex?</summary>

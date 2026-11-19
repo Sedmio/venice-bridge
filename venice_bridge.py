@@ -8,10 +8,14 @@ Auth & inference flow:
   2. Discovers active Clerk session via GET https://clerk.venice.ai/v1/client
   3. Mints short-lived (~60s) session JWT via POST https://clerk.venice.ai/v1/client/sessions/<sid>/tokens
   4. Mints client attestation via POST https://outerface.venice.ai/api/app/user/client_attestation/mint
-  5. Streams inference via POST https://outerface.venice.ai/api/inference/chat/agents/ad-hoc
-     (Responses-style body and SSE events). Measured 2026-11-18: this route needs a paid plan
-     (FREE gets 403 creator_access_required) and takes OpenCode's 440k-char system prompt; the
-     older /api/inference/chat answers 413 userPromptTooLong above roughly 150k chars.
+  5. Streams inference. Route `auto` (default, VENICE_BRIDGE_ROUTE): POST
+     https://outerface.venice.ai/api/inference/chat, the plain chat route, with the client's system
+     prompt folded into the first user message. Venice runs no agent loop and offers the model no
+     tools of its own there, so nothing collides with the client's tools. Its 413 userPromptTooLong
+     limit (~150k chars) applies to the systemPrompt field only (measured 2026-11-19).
+     A model that route does not know (400 modelNotFound) is sent to the agent route,
+     /api/inference/chat/agents/ad-hoc (Responses-style SSE; needs a paid plan: a free account
+     gets 403 creator_access_required), where Venice may swallow native tool calls.
      Over quota Venice answers 429 with body `{}`.
   6. Emulates OpenAI tool calling (tools / tool_calls) via JSON envelope for OpenCode agent loops.
 """
@@ -25,6 +29,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -70,6 +75,53 @@ CLERK_BASE = "https://clerk.venice.ai"
 OUTERFACE_BASE = "https://outerface.venice.ai"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18891
+# Which Venice web route carries the chat (read at call time; VENICE_BRIDGE_ROUTE=agent|chat).
+#   agent: /api/inference/chat/agents/ad-hoc. Venice runs its own agent loop there: the model gets
+#          Venice's server tools as native tools, calls them or the client's tools natively, and
+#          Venice swallows those calls (20-50 % of the time lost, measured 2026-11-18/19).
+#   chat:  /api/inference/chat. No agent loop and no Venice tools, so nothing collides with the
+#          client's tools. Its 413 "userPromptTooLong" limit (~150k chars) applies to the
+#          systemPrompt field only: the same 460k chars are accepted inside a user message
+#          (measured 2026-11-19), so the instructions travel as the first user message.
+#   auto:  chat, except for a model the chat route does not know (400 modelNotFound, e.g. kimi-k2-5
+#          and Venice's "default"): that model is remembered and sent to the agent route.
+ROUTE = os.environ.get("VENICE_BRIDGE_ROUTE", "auto")
+AGENT_ONLY_MODELS: set = set()
+
+
+def _uses_chat_route(model: Any) -> bool:
+    return ROUTE == "chat" or (ROUTE == "auto" and model not in AGENT_ONLY_MODELS)
+CHAT_SYSTEM_PROMPT = "Follow the session instructions given at the start of the first user message."
+
+
+def _to_chat_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The request in the plain chat route's shape: instructions folded into the first user message,
+    neighbouring messages of one role joined (the route is a plain user/assistant conversation)."""
+    turns: List[Dict[str, str]] = [{
+        "role": "user",
+        "content": "[SESSION INSTRUCTIONS]\n" + payload["systemPrompt"]["instructions"] + "\n[END OF SESSION INSTRUCTIONS]",
+    }]
+    first_user = True
+    for m in payload["messages"]:
+        role, text = m["role"], m["content"][0]["text"]
+        if role == "user" and first_user:
+            text, first_user = "[USER REQUEST]\n" + text, False
+        if turns[-1]["role"] == role:
+            turns[-1]["content"] += "\n\n" + text
+        else:
+            turns.append({"role": role, "content": text})
+    return {
+        "requestId": uuid.uuid4().hex[:16],
+        "conversationType": "text",
+        "modelId": payload["modelId"],
+        "prompt": turns,
+        "systemPrompt": CHAT_SYSTEM_PROMPT,
+        "includeVeniceSystemPrompt": False,
+        "isCharacter": False,
+        "simpleMode": False,
+    }
+
+
 SERVER_LOOP_STEPS = 3  # refused native calls tolerated in one response (same value as opencode-venice-web)
 STALL_SECONDS = 180  # no byte from Venice for this long = dead stream (calibrate from the log if it trips)
 BROWSER_UA = (
@@ -454,8 +506,11 @@ class VeniceClient:
             return None
 
     def open_chat_stream(self, payload: Dict[str, Any], force_refresh: bool = False, max_time: Optional[float] = None):
-        """Stream POST /api/inference/chat/agents/ad-hoc via system curl --http1.1 (passes Cloudflare)."""
+        """Stream the request to the route chosen for its model, via system curl --http1.1 (passes Cloudflare)."""
         hdrs = self.auth_headers(force_refresh=force_refresh)
+        path = "/api/inference/chat/agents/ad-hoc"
+        if _uses_chat_route(payload.get("modelId")):
+            payload, path = _to_chat_payload(payload), "/api/inference/chat"
         tmpdir = tempfile.mkdtemp(prefix="vbridge-")
         os.chmod(tmpdir, 0o700)
         hdr_file = os.path.join(tmpdir, "headers.txt")
@@ -482,7 +537,7 @@ class VeniceClient:
             f"@{hdr_file}",
             "--data-binary",
             f"@{body_file}",
-            f"{OUTERFACE_BASE}/api/inference/chat/agents/ad-hoc",
+            OUTERFACE_BASE + path,
         ]
         if max_time:  # the judge's overall limit; chat has none (a stall still ends it)
             cmd[1:1] = ["--max-time", str(max_time)]
@@ -574,6 +629,7 @@ def _build_tool_instructions(
         '{"tool_calls":[{"name":"<exact tool name>","arguments":{...}}]}\n'
         "Then stop: the tool result arrives in the next user message. Never invent a tool result. "
         "When the task is finished, reply with normal text.\n"
+        + _route_hint({fn["name"].lower(): fn["name"] for fn in fns}) + "\n"
     )
     lines_a = []
     for fn in tier_a:
@@ -610,9 +666,10 @@ def _build_tool_instructions(
     block = header + "\n".join(lines_a + lines_b + tail)
     sys.stderr.write(
         "[venice-bridge] tool list: A=%d tools/%d chars, B=%d one-line + %d short/%d chars, "
-        "names only=%d, block=%d of %d\n" % (
+        "names only=%d, block=%d of %d, full schema for: %s\n" % (
             len(tier_a), sum(len(line) + 1 for line in lines_a), level.count(0), level.count(1),
-            sum(len(line) + 1 for line in lines_b), len(names_only), len(block), budget))
+            sum(len(line) + 1 for line in lines_b), len(names_only), len(block), budget,
+            ", ".join(fn["name"] for fn in tier_a[:20])))
     return block
 
 
@@ -705,6 +762,122 @@ def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         "reasoningMode": "disabled" if effort in (None, "none", "minimal", "low") else "enabled",
     }  # the route ignores temperature, top_p and max_tokens
     return payload, has_tools
+
+
+# ---- Routing: Venice's tools and other foreign tool names -> the tools the client declared ----
+# Venice's web route gives the model its own server tools and hides the client's. Two things go wrong:
+# the model calls a Venice tool (Venice runs it, it cannot see this computer, the turn ends in
+# "tools are not available"), or it names a tool the client does not have (shell, cat, read_file, ...).
+# Both are steered to the client's tool that does the same job. Measured 2026-11-19: for a call
+# Venice swallows, the stream carries only the tool NAME, never its arguments, so such a call
+# cannot be forwarded; it is asked for again, by name, in the right format.
+VENICE_SERVER_TOOLS = {  # Venice tool -> the client tools that do that job, best first
+    "view_media": ("read",), "get_attachment": ("read",), "hydrate_content": ("read",),
+    "web_search": ("websearch", "webfetch"), "web_scrape": ("webfetch",), "web_fetch": ("webfetch",),
+    "calculator": ("bash",), "code_interpreter": ("bash",), "python": ("bash",),
+}
+TOOL_ALIASES = {  # client tool -> names models use for it
+    "bash": ("shell", "sh", "zsh", "terminal", "execute", "exec", "run", "run_command", "execute_command",
+             "run_shell_command", "run_terminal_cmd", "shell_command", "command", "calculator",
+             "code_interpreter", "python"),
+    "read": ("cat", "read_file", "readfile", "view", "view_file", "open", "open_file", "get_file",
+             "get_attachment", "view_media", "hydrate_content"),
+    "write": ("write_file", "writefile", "create_file", "save_file", "create", "write_to_file"),
+    "edit": ("edit_file", "str_replace", "str_replace_editor", "replace", "replace_in_file", "apply_edit",
+             "update_file", "patch"),
+    "grep": ("search", "rg", "ripgrep", "search_files", "grep_search", "find_in_files", "search_code"),
+    "glob": ("find", "find_files", "file_search", "search_file_names"),
+    "websearch": ("web_search", "search_web", "google", "internet_search"),
+    "webfetch": ("web_scrape", "web_fetch", "fetch", "fetch_url", "browse", "open_url", "http_get", "scrape"),
+}
+# The same client tool under the names different OpenCode versions give it (CLI: bash, desktop app: shell).
+SAME_TOOL = {"bash": ("bash", "shell"), "glob": ("glob", "find"), "task": ("task", "subagent")}
+
+
+def _have(target: str, declared: Dict[str, str]) -> Optional[str]:
+    """The declared tool that plays `target`'s role, or None."""
+    return next((declared[n] for n in SAME_TOOL.get(target, (target,)) if n in declared), None)
+
+
+LISTING_ALIASES = ("ls", "list_files", "list_dir", "list_directory", "listdir", "dir")
+ARG_ALIASES = {  # argument name of the client tool -> names models use for it
+    "filePath": ("path", "file", "file_path", "filepath", "filename", "file_name", "target_file"),
+    "path": ("filePath", "file_path", "dir", "directory", "folder", "cwd"),
+    "command": ("cmd", "script", "code", "shell_command", "input", "expression"),
+    "oldString": ("old_string", "old_str", "old", "old_text", "search", "find"),
+    "newString": ("new_string", "new_str", "new", "new_text", "replace", "replacement"),
+    "content": ("contents", "text", "file_text", "data", "body"),
+    "pattern": ("query", "regex", "glob", "q", "search", "name"),
+    "query": ("q", "search", "pattern", "text", "prompt"),
+    "url": ("link", "uri", "href", "address"),
+}
+
+
+def _fit_arguments(args: Any, props: Dict[str, Any]) -> Any:
+    """Rename arguments the model named differently (path -> filePath, cmd -> command, ...).
+    Only a name the tool expects and did not get is filled, and only from a name it does not know."""
+    if not isinstance(args, dict) or not props:
+        return args
+    args = dict(args)
+    for key, others in ARG_ALIASES.items():
+        if key in props and key not in args:
+            for other in others:
+                if other in args and other not in props:
+                    args[key] = args.pop(other)
+                    break
+    return args
+
+
+def _route_call(name: str, args: Any, declared: Dict[str, str]) -> Optional[Tuple[str, Any]]:
+    """(client tool, arguments) for a call to a tool the client does not have, or None."""
+    low = name.lower()
+    args = args if isinstance(args, dict) else {}
+    if low in LISTING_ALIASES:
+        where = next((args[k] for k in ("path", "dir", "directory", "folder") if isinstance(args.get(k), str)), ".")
+        if "list" in declared:
+            return declared["list"], {"path": where}
+        if _have("bash", declared):
+            return _have("bash", declared), {"command": "ls -la " + shlex.quote(where)}
+        return None
+    if low in ("view_media", "get_attachment", "hydrate_content"):
+        # Venice's media tools take ids; such a call is a file read only when the id is a file path
+        ids = args.get("media_ids") or args.get("media_id") or args.get("id") or args.get("path") or args.get("file")
+        first = ids[0] if isinstance(ids, list) and ids else ids
+        if isinstance(first, str) and ("/" in first or "." in first) and _have("read", declared):
+            return _have("read", declared), {"filePath": first}
+        return None
+    for target, aliases in TOOL_ALIASES.items():
+        if (low in aliases or low in SAME_TOOL.get(target, ())) and _have(target, declared):
+            return _have(target, declared), args
+    return None
+
+
+def _route_hint(declared: Dict[str, str]) -> str:
+    """One sentence for the prompt: which client tool does what Venice's own tools would do."""
+    jobs = [("read a file", "read"), ("run a command", "bash"), ("search the web", "websearch"),
+            ("fetch a web page", "webfetch")]
+    have = [f"{job} with `{_have(tool, declared)}`" for job, tool in jobs if _have(tool, declared)]
+    return ("Venice's own tools (view_media, get_attachment, web_search, web_scrape) and built-in function "
+            "calling do not reach this computer: never use them."
+            + (" Here you " + ", ".join(have) + "." if have else ""))
+
+
+def _steer_reminder(trigger: str, venice: Optional[Dict[str, List[str]]], declared: Dict[str, str]) -> str:
+    """The reminder for a reply Venice swallowed, naming the tools involved and where they go."""
+    venice = venice or {}
+    if trigger == "server_tool":
+        used = venice.get("recognized") or ["view_media"]
+        routes = []
+        for tool in used:
+            target = next((_have(t, declared) for t in VENICE_SERVER_TOOLS.get(tool, ()) if _have(t, declared)), None)
+            routes.append(f"instead of `{tool}` use `{target}`" if target else f"`{tool}` has no counterpart here")
+        return ("you called " + ", ".join(f"`{t}`" for t in used) + ", which is one of Venice's own tools. It cannot "
+                "see the user's computer and its result never reaches the agent. " + "; ".join(routes) + ". "
+                'Call it now by replying with ONLY {"tool_calls":[{"name":"<exact tool name>","arguments":{...}}]}.')
+    names = [declared.get(n.lower(), n) for n in venice.get("unrecognized") or []]
+    extra = (" You tried to call " + ", ".join(f"`{n}`" for n in names[:4]) + " that way and it was not run: "
+             "send the same call again as that JSON object.") if names else ""
+    return NATIVE_CALL_REMINDER + extra
 
 
 _TAGGED_CALLS = re.compile(r"<tool_calls?>(.*?)(?:</tool_calls?>|$)", re.S | re.I)
@@ -812,6 +985,35 @@ def _tagged_calls(text: str) -> Tuple[List[Dict[str, Any]], str]:
     return calls, _CALL_MARKER.sub("", _TAGGED_CALLS.sub("", text)).strip()
 
 
+_BAR = r"(?:[｜|]\s*DSML\s*[｜|]\s*)?"
+_INVOKE = re.compile(rf'<\s*{_BAR}invoke\s+name="([^"]+)"[^>]*>(.*?)(?:<\s*/\s*{_BAR}invoke\s*>|$)', re.S | re.I)
+_PARAMETER = re.compile(rf'<\s*{_BAR}parameter\s+name="([^"]+)"([^>]*)>(.*?)<\s*/\s*{_BAR}parameter\s*>', re.S | re.I)
+_NATIVE_MARKUP = re.compile(rf"<\s*/?\s*{_BAR}(?:function_calls|calls|invoke|parameter)\b[^>]*>", re.I)
+# what a reply looks like, lower-cased and without blanks, where native call markup starts
+NATIVE_STARTS = ("<tool_call", "<｜dsml｜", "<|dsml|", "<invoke", "<function_calls")
+
+
+def _native_calls(text: str) -> Tuple[List[Dict[str, Any]], str]:
+    """(calls, prose) for calls written in the model's own markup:
+    <｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="command" string="true">ls</｜DSML｜ parameter>...
+    (DeepSeek on the plain chat route, measured 2026-11-19) and the same without the DSML bars.
+    A parameter marked string="false" holds JSON; everything else is taken as text, unchanged."""
+    calls: List[Dict[str, Any]] = []
+    for m in _INVOKE.finditer(text):
+        args: Dict[str, Any] = {}
+        for pm in _PARAMETER.finditer(m.group(2)):
+            value: Any = pm.group(3)
+            if re.search(r'string\s*=\s*"false"', pm.group(2), re.I):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    pass
+            args[pm.group(1)] = value
+        calls.append({"name": m.group(1), "arguments": args})
+    first = _NATIVE_MARKUP.search(text)
+    return calls, (text[:first.start()] if first else text).strip()
+
+
 def _read_reply(
     text: str, tools: Optional[List[Dict[str, Any]]] = None
 ) -> Tuple[Optional[List[Dict[str, Any]]], str, bool]:
@@ -832,16 +1034,35 @@ def _read_reply(
         found, prose = _tagged_calls(text)
         if found:
             parsed = dict(parsed, calls=found, content=prose)
+    native = bool(_INVOKE.search(text))
+    if native and not (tagged and parsed["calls"]):
+        found, prose = _native_calls(text)
+        if found:
+            parsed = dict(parsed, calls=found, content=prose)
+        tagged = True  # same handling below: with no readable call it is unreadable, never shown raw
     declared = {}
     for t in tools or []:
         name = (t.get("function") or {}).get("name") if isinstance(t, dict) else None
         if name:
             declared[name.lower()] = name
+    props = {}
+    for t in tools or []:
+        fn = t.get("function") if isinstance(t, dict) else None
+        if isinstance(fn, dict) and fn.get("name") and isinstance(fn.get("parameters"), dict):
+            props[fn["name"]] = fn["parameters"].get("properties") if isinstance(
+                fn["parameters"].get("properties"), dict) else {}
     calls: List[Tuple[str, Any]] = []
     unknown: List[Tuple[str, Any]] = []
     for c in parsed["calls"] or []:
-        name = declared.get(c["name"].lower()) if declared else c["name"]
-        (calls if name else unknown).append((name or c["name"], c["arguments"]))
+        name, args = (declared.get(c["name"].lower()) if declared else c["name"]), c["arguments"]
+        if declared and not name:
+            routed = _route_call(c["name"], args, declared)
+            if routed:
+                name, args = routed
+                sys.stderr.write(f"[venice-bridge] routed call {c['name']} -> {name}\n")
+        if name and declared:
+            args = _fit_arguments(args, props.get(name) or {})
+        (calls if name else unknown).append((name or c["name"], args))
     if unknown and not calls and len(parsed["content"]) < 200:
         # the reply is only a call, with an invented tool name: OpenCode tells the model it does not exist.
         # A long text around it is prose that quotes the format, not a call.
@@ -863,7 +1084,8 @@ def _read_reply(
         # ponytail: a long text that ends in a cut call is read as prose (the judge may still catch it),
         # because a long answer that quotes the format must not cost two 441k-char retries
         # with tags, the prose is what stands outside them: the parser's own content mixes in call pieces
-        content = _CALL_MARKER.sub("", _TAGGED_CALLS.sub("", text)).strip() if tagged else parsed["content"]
+        content = (_native_calls(text)[1] if native else
+                   _CALL_MARKER.sub("", _TAGGED_CALLS.sub("", text)).strip() if tagged else parsed["content"])
         unreadable = (len(content) < 200 and not parsed["calls"]
                       and not re.search(r'"tool_calls"\s*:\s*\[\s*\]', text))
         if unreadable:
@@ -932,7 +1154,8 @@ def _upstream_error(status: int, detail: str) -> Tuple[int, str, Tuple[str, Any]
     return 502, f"Venice answered HTTP {status}: {detail or 'no detail'}", kind
 
 
-def _iter_chat_events(proc: subprocess.Popen, unread: Optional[List[str]] = None):
+def _iter_chat_events(proc: subprocess.Popen, unread: Optional[List[str]] = None,
+                      venice: Optional[Dict[str, List[str]]] = None, cut_server_tools: bool = False):
     """Yield (kind, text) from the Responses-style SSE stream. Unparsable lines go to `unread` (first 5).
 
     Kinds: reasoning, text, done, error, and server_loop when Venice's own agent loop kept refusing
@@ -943,6 +1166,7 @@ def _iter_chat_events(proc: subprocess.Popen, unread: Optional[List[str]] = None
     item_types: Dict[Any, str] = {}
     steps: List[str] = []  # Venice's own tool-detection steps in this response
     swallowed = 0
+    plain = False
     for raw_line in proc.stdout:
         line = raw_line.decode("utf-8", "ignore").strip()
         if not line or line.startswith(":"):
@@ -960,14 +1184,40 @@ def _iter_chat_events(proc: subprocess.Popen, unread: Optional[List[str]] = None
             if unread is not None and len(unread) < 5:
                 unread.append(line[:200])
             continue
+        if not event and isinstance(evt.get("kind"), str):
+            # the plain chat route: one JSON object per line, no event names, no closing event
+            plain = True
+            if evt["kind"] == "content" and isinstance(evt.get("content"), str) and evt["content"]:
+                yield ("text", evt["content"])
+            elif evt["kind"] in ("thinking", "reasoning") and isinstance(evt.get("content"), str) and evt["content"]:
+                yield ("reasoning", evt["content"])
+            elif evt.get("error"):
+                yield ("error", json.dumps(evt, ensure_ascii=False)[:500])
+            continue
         kind = evt.get("type") or event
         if kind == "response.output_item.added":
             item_types[evt.get("output_index")] = (evt.get("item") or {}).get("type") or ""
         elif kind == "veniceai:tool_call_generation.in_progress":
-            detected = evt.get("detected_tools") or []
+            detected = [d for d in evt.get("detected_tools") or [] if isinstance(d, dict)]
             steps.append(json.dumps(detected, ensure_ascii=False)[:200])
-            if any(isinstance(d, dict) and d.get("type") == "Unrecognized" for d in detected):
+            if venice is not None:  # which tools Venice saw, for the reminder that steers the retry
+                for d in detected:
+                    key, tool = ("recognized", d.get("tool")) if d.get("type") == "Recognized" else ("unrecognized", d.get("name"))
+                    if isinstance(tool, str) and tool not in venice.setdefault(key, []):
+                        venice[key].append(tool)
+            # A step in which Venice handled a call itself: either it ran one of its own tools
+            # (Recognized: it cannot see this computer) or refused a native call (Unrecognized).
+            # Both count as steps and are left alone at first: inside one response the model learns
+            # from Venice's own "not found" answers and often falls back to our text format.
+            # Cutting at the first Recognized step was tried on 2026-11-19 and made DeepSeek V4.1
+            # Flash fail 7 of 8 turns, because every retry started with the same native call.
+            own = cut_server_tools and any(d.get("type") == "Recognized" for d in detected)
+            if own or any(d.get("type") == "Unrecognized" for d in detected):
                 swallowed += 1
+            if own and swallowed > SERVER_LOOP_STEPS:
+                sys.stderr.write(f"[venice-bridge] venice ran its own tool: {steps[-1]}\n")
+                yield ("server_tool", "the model called one of Venice's own tools instead of the agent's; retrying usually works")
+                return
             if swallowed > SERVER_LOOP_STEPS:
                 # Venice took the model's call for one of its own server tools. It answers the model
                 # "Tool not found" up to 10 times and the reply ends as "my tools are broken"
@@ -993,6 +1243,15 @@ def _iter_chat_events(proc: subprocess.Popen, unread: Optional[List[str]] = None
             yield ("done", "")
         elif kind in ("error", "response.failed", "response.incomplete") or evt.get("error"):
             yield ("error", json.dumps(evt, ensure_ascii=False)[:500])
+    if plain:
+        # the chat route sends no closing event: a clean end of the HTTP response is the signal
+        # (curl exits non-zero when the body is cut short)
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+        if proc.returncode == 0:
+            yield ("done", "")
 
 
 def _cleanup(handle) -> None:
@@ -1025,8 +1284,9 @@ def _open_upstream(payload: Dict[str, Any], max_time: Optional[float] = None):
         t1 = time.time()
         status, head = _read_head(proc.stdout)
         # where the wait before the first byte goes: our token minting vs Venice reading the prompt
-        sys.stderr.write("[venice-bridge] timing open: auth=%.1fs head=%.1fs status=%s model=%s\n" % (
-            t1 - t0, time.time() - t1, status, payload.get("modelId")))
+        sys.stderr.write("[venice-bridge] timing open: auth=%.1fs head=%.1fs status=%s model=%s route=%s\n" % (
+            t1 - t0, time.time() - t1, status, payload.get("modelId"),
+            "chat" if _uses_chat_route(payload.get("modelId")) else "agent"))
         if status == 401 and attempt == 0:
             sys.stderr.write("[venice-bridge] upstream 401, refreshing the session and retrying once\n")
             _cleanup(handle)
@@ -1039,6 +1299,11 @@ def _open_upstream(payload: Dict[str, Any], max_time: Optional[float] = None):
     if status == 0:
         detail = proc.stderr.read(500).decode("utf-8", "replace").strip()
     _cleanup(handle)
+    model = payload.get("modelId")
+    if ROUTE == "auto" and status == 400 and "modelNotFound" in detail and model not in AGENT_ONLY_MODELS:
+        AGENT_ONLY_MODELS.add(model)  # the chat route does not have this model: the agent route does
+        sys.stderr.write(f"[venice-bridge] {model} is not on the chat route; using the agent route for it\n")
+        return _open_upstream(payload, max_time)
     if status == 403 and ("challenge" in head.get("cf-mitigated", "") or detail.startswith("<")):
         # a Cloudflare challenge is neither a quota nor an auth problem: never lock on it
         message = ("Cloudflare challenged the request. Open venice.ai in your browser, refresh the "
@@ -1130,8 +1395,9 @@ class _LiveGate:
         self.buf += delta
         if not self.live:
             head = self.buf.lstrip()
+            compact = re.sub(r"\s+", "", self.buf.lower())
             if (len(head) < STREAM_GATE_CHARS or head[0] in "{`<" or '"tool_calls"' in self.buf
-                    or "<tool_call" in self.buf.lower()):
+                    or any(start in compact for start in NATIVE_STARTS)):
                 return
             self.live = True
             self._start()
@@ -1145,7 +1411,8 @@ class _LiveGate:
         low = self.buf.lower()
         t = low.find("<", self.sent)
         while t >= 0:  # a <tool_call(s)> tag, whole or still being written
-            if "<tool_call".startswith(low[t:t + 10]):
+            ahead = re.sub(r"\s+", "", low[t:t + 24])
+            if any(start.startswith(ahead[:len(start)]) for start in NATIVE_STARTS):
                 marker = _CALL_MARKER.search(self.buf, self.sent, t)  # the @@WRITE@@ in front of it
                 return marker.start() if marker and not self.buf[marker.end():t].strip() else t
             t = low.find("<", t + 1)
@@ -1166,7 +1433,7 @@ class _LiveGate:
         return self.buf[self.sent:]
 
 
-def _drain(handle, gate: Optional[_LiveGate] = None) -> Dict[str, Any]:
+def _drain(handle, gate: Optional[_LiveGate] = None, tools_mode: bool = False) -> Dict[str, Any]:
     """Read one upstream reply to its end: {text, reasoning, failure: None | (transport|server_loop, message)}.
     A reply counts only when Venice said response.completed: a stream cut in the middle of a write
     call would otherwise become a write of half the file."""
@@ -1175,13 +1442,14 @@ def _drain(handle, gate: Optional[_LiveGate] = None) -> Dict[str, Any]:
     reasoning: List[str] = []
     unread: List[str] = []
     done, failure = False, None
+    venice: Dict[str, List[str]] = {}
     t0, first = time.time(), None
     try:
-        for kind, delta in _iter_chat_events(proc, unread):
+        for kind, delta in _iter_chat_events(proc, unread, venice, cut_server_tools=tools_mode):
             if first is None and kind in ("text", "reasoning"):
                 first = time.time() - t0
-            if kind in ("error", "server_loop"):
-                failure = ("server_loop" if kind == "server_loop" else "transport", delta)
+            if kind in ("error", "server_loop", "server_tool"):
+                failure = (kind if kind != "error" else "transport", delta)
                 break
             if kind == "done":
                 done = True
@@ -1202,7 +1470,7 @@ def _drain(handle, gate: Optional[_LiveGate] = None) -> Dict[str, Any]:
         "%.1fs" % first if first is not None else "-", time.time() - t0,
         sum(map(len, text)), sum(map(len, reasoning)), " failed=" + failure[0] if failure else ""))
     return {"text": "".join(text), "reasoning": "".join(reasoning), "failure": failure,
-            "streamed": bool(gate and gate.live)}
+            "streamed": bool(gate and gate.live), "venice": venice}
 
 
 def _reply_of(att: Dict[str, Any], tools: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
@@ -1211,13 +1479,13 @@ def _reply_of(att: Dict[str, Any], tools: Optional[List[Dict[str, Any]]]) -> Dic
     if att["failure"]:
         kind, problem = att["failure"]
         return {"calls": None, "content": "", "reasoning": att["reasoning"], "trigger": kind, "problem": problem,
-                "streamed": streamed}
+                "streamed": streamed, "venice": att.get("venice")}
     calls, content, unreadable = _read_reply(att["text"], tools)
     trigger = "unreadable" if unreadable else None if calls or content.strip() else "empty"
     problem = {"unreadable": "the model sent a tool call that could not be read",
                "empty": "Venice finished without sending any text."}.get(trigger)
     return {"calls": calls, "content": content, "reasoning": att["reasoning"], "trigger": trigger, "problem": problem,
-            "streamed": streamed}
+            "streamed": streamed, "venice": att.get("venice")}
 
 
 def _rank(r: Dict[str, Any]) -> int:
@@ -1298,7 +1566,9 @@ def _complete_with_tools(body: Dict[str, Any], payload: Dict[str, Any], handle,
     stream, at most MAX_FORMAT_RETRIES together (a broken stream once, resent unchanged); then, when
     the reply ends the turn right after a tool result, the judge, and at most MAX_JUDGE_RETRIES."""
     tools = body.get("tools")
-    best = _reply_of(_drain(handle, gate), tools)
+    declared = {t["function"]["name"].lower(): t["function"]["name"] for t in tools or []
+                if isinstance(t, dict) and isinstance(t.get("function"), dict) and t["function"].get("name")}
+    best = _reply_of(_drain(handle, gate, tools_mode=True), tools)
     n = 1
     sys.stderr.write(f"[venice-bridge] attempt 1 (first): {_outcome(best)}\n")
     if best["streamed"]:
@@ -1317,8 +1587,9 @@ def _complete_with_tools(body: Dict[str, Any], payload: Dict[str, Any], handle,
                 transport_left -= 1
                 nxt = last  # resent as it was, reminder included
             else:
-                nxt = dict(payload, messages=payload["messages"] + [
-                    _message("user", "(act reminder) " + FORMAT_REMINDERS[trigger])])
+                reminder = (_steer_reminder(trigger, best.get("venice"), declared)
+                            if trigger in ("server_loop", "server_tool") else FORMAT_REMINDERS[trigger])
+                nxt = dict(payload, messages=payload["messages"] + [_message("user", "(act reminder) " + reminder)])
             why = trigger
         elif best["calls"] or not JUDGE_ENABLED or judge_left < 1 or not _ends_after_tool(body):
             break
@@ -1339,7 +1610,7 @@ def _complete_with_tools(body: Dict[str, Any], payload: Dict[str, Any], handle,
         last = nxt
         if gate:
             gate.reset()
-        cand = _reply_of(_drain(handle, gate), tools)
+        cand = _reply_of(_drain(handle, gate, tools_mode=True), tools)
         sys.stderr.write(f"[venice-bridge] attempt {n} ({why}): {_outcome(cand)}\n")
         if cand["streamed"]:
             return cand
@@ -1474,7 +1745,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             calls, content = best["calls"], best["content"]
             if best["streamed"]:
                 try:
-                    if best["trigger"] in ("transport", "server_loop"):
+                    if best["trigger"] in ("transport", "server_loop", "server_tool"):
                         # the text is already on its way: end with an error, never with a normal ending
                         sys.stderr.write(f"[venice-bridge] upstream failed mid-reply: {best['problem']}\n")
                         err = {"error": {"message": best["problem"], "type": "venice_upstream_error"}}
