@@ -125,7 +125,87 @@ def main() -> None:
     # the model's own markup, as DeepSeek V4.1 Flash writes it on the plain chat route (real reply, 2026-11-19)
     dsml = ('<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="command" string="true">pwd && ls -la</｜DSML｜ parameter>\n'
             '</｜DSML｜ invoke>\n</｜DSML｜ calls>')
-    stools = [{"type": "function", "function": {"name": "shell", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}},
+    stools = [{"type": "function", "function": {"name": "shell", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "number"}}}}},
+              {"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}, "content": {"type": "string"}}}}}]
+    calls, content, unreadable = vb._read_reply(dsml, stools)
+    assert [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls] == [("shell", {"command": "pwd && ls -la"})]
+    assert content == "" and not unreadable
+    two_native = ('I will write it.\n<｜DSML｜ function_calls>\n<｜DSML｜ invoke name="write">\n<｜DSML｜ parameter name="path" string="true">a.py</｜DSML｜ parameter>\n'
+                  '<｜DSML｜ parameter name="content" string="true">x = "1"\nprint(x)\n</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n'
+                  '<invoke name="bash"><parameter name="command">ls</parameter><parameter name="timeout" string="false">5</parameter></invoke>')
+    calls, content, unreadable = vb._read_reply(two_native, stools)
+    assert [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls] == [
+        ("write", {"filePath": "a.py", "content": 'x = "1"\nprint(x)\n'}), ("shell", {"command": "ls", "timeout": 5})]
+    assert content == "I will write it."  # the markup is never shown
+    assert vb._read_reply('<｜DSML｜ invoke name="', stools) == (None, "", False) or vb._read_reply('<｜DSML｜ invoke name="', stools)[0] is None
+    out = []
+    g = vb._LiveGate(lambda: out.append("<start>"), out.append)
+    for ch in "y" * 250 + ' now.\n<｜DSML｜ invoke name="shell">':
+        g.feed(ch)
+    assert "".join(out) == "<start>" + "y" * 250 + " now.\n" and g.rest().startswith("<｜DSML｜")
+
+    # --- gap-fix routing (tool-audit 2026-11-20): OpenCode 2.3.2 tools take `path`, not `filePath` ---
+    oc = [{"type": "function", "function": {"name": n, "parameters": {"type": "object", "properties": pr}}} for n, pr in [
+        ("read", {"path": {"type": "string"}, "offset": {"type": "number"}}),
+        ("write", {"path": {"type": "string"}, "content": {"type": "string"}}),
+        ("edit", {"path": {"type": "string"}, "oldString": {"type": "string"}, "newString": {"type": "string"}, "replaceAll": {"type": "boolean"}}),
+        ("grep", {"pattern": {"type": "string"}, "path": {"type": "string"}, "include": {"type": "string"}}),
+        ("shell", {"command": {"type": "string"}, "workdir": {"type": "string"}}),
+        ("subagent", {"agent": {"type": "string"}, "description": {"type": "string"}, "prompt": {"type": "string"}}),
+        ("skill", {"id": {"type": "string"}}),
+        ("websearch", {"query": {"type": "string"}}),
+        ("webfetch", {"url": {"type": "string"}}),
+        ("execute", {"code": {"type": "string"}}),
+    ]]
+
+    def g(reply):
+        calls = vb._read_reply(reply, oc)[0] or []
+        return [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls]
+
+    # file-name aliases reach `path`
+    assert g('{"tool_calls":[{"name":"cat","arguments":{"file":"a.txt"}}]}') == [("read", {"path": "a.txt"})]
+    assert g('{"tool_calls":[{"name":"read_file","arguments":{"absolute_path":"/x/a"}}]}') == [("read", {"path": "/x/a"})]
+    assert g('{"tool_calls":[{"name":"edit_file","arguments":{"target_file":"a","old_str":"x","new_str":"y"}}]}') == [
+        ("edit", {"path": "a", "oldString": "x", "newString": "y"})]
+    # new shell/grep names + argument renames (workdir, include, replaceAll)
+    assert g('{"tool_calls":[{"name":"exec_command","arguments":{"command":"ls","cwd":"src"}}]}') == [("shell", {"command": "ls", "workdir": "src"})]
+    assert g('{"tool_calls":[{"name":"search_file_content","arguments":{"pattern":"TODO","file_pattern":"*.py"}}]}') == [
+        ("grep", {"pattern": "TODO", "include": "*.py"})]
+    assert g('{"tool_calls":[{"name":"search_replace","arguments":{"path":"a","oldString":"x","newString":"y","replace_all":true}}]}') == [
+        ("edit", {"path": "a", "oldString": "x", "newString": "y", "replaceAll": True})]
+    # execute-with-command goes to shell even though `execute` is a declared Code Mode tool
+    assert g('{"tool_calls":[{"name":"execute","arguments":{"command":"ls"}}]}') == [("shell", {"command": "ls"})]
+    # a real execute (code) is left alone (declared) -> passes through as execute
+    assert g('{"tool_calls":[{"name":"execute","arguments":{"code":"print(1)"}}]}') == [("execute", {"code": "print(1)"})]
+    # wrapper prefix stripped
+    assert g('{"tool_calls":[{"name":"functions.shell","arguments":{"command":"ls"}}]}') == [("shell", {"command": "ls"})]
+    # command as a list -> one string
+    assert g('{"tool_calls":[{"name":"shell","arguments":{"command":["bash","-lc","ls -la"]}}]}') == [("shell", {"command": "bash -lc ls -la"})]
+    # sub-agent: Agent alias -> subagent, agent filled, description from prompt
+    out = g('{"tool_calls":[{"name":"Agent","arguments":{"subagent_type":"reviewer","prompt":"Review the diff carefully"}}]}')
+    assert out == [("subagent", {"agent": "reviewer", "prompt": "Review the diff carefully", "description": "Review the diff carefully"})], out
+    out = g('{"tool_calls":[{"name":"subagent","arguments":{"prompt":"do x"}}]}')
+    assert out[0][1]["agent"] == "general" and out[0][1]["description"] == "do x"
+    # skill: foreign name + arg
+    assert g('{"tool_calls":[{"name":"use_skill","arguments":{"skill":"deploy"}}]}') == [("skill", {"id": "deploy"})]
+    # webfetch: url pulled out of a prompt
+    assert g('{"tool_calls":[{"name":"web_fetch","arguments":{"prompt":"read https://example.com/x please"}}]}') == [
+        ("webfetch", {"url": "https://example.com/x"})]
+    # unknown keys are dropped (tools are additionalProperties:false): replace_all leftover goes, replaceAll stays
+    out = g('{"tool_calls":[{"name":"edit","arguments":{"path":"a","oldString":"x","newString":"y","replace_all":true,"junk":1}}]}')
+    assert out == [("edit", {"path": "a", "oldString": "x", "newString": "y", "replaceAll": True})], out
+    # a clean, correct call is untouched
+    assert g('{"tool_calls":[{"name":"read","arguments":{"path":"a","offset":5}}]}') == [("read", {"path": "a", "offset": 5})]
+    # patch/replace_in_file are NOT routed to edit (they carry diffs) -> left as the unknown name
+    # patch/replace_in_file are NOT routed to edit (they carry diffs) -> left as the unknown name
+    assert g('{"tool_calls":[{"name":"patch","arguments":{"patchText":"@@"}}]}') == [("patch", {"patchText": "@@"})]
+    # a listing name routes to a shell ls
+    assert g('{"tool_calls":[{"name":"list","arguments":{"path":"src"}}]}') == [("shell", {"command": "ls -la src"})]
+
+    # the model's own markup, as DeepSeek V4.1 Flash writes it on the plain chat route (real reply, 2026-11-19)
+    dsml = ('<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="command" string="true">pwd && ls -la</｜DSML｜ parameter>\n'
+            '</｜DSML｜ invoke>\n</｜DSML｜ calls>')
+    stools = [{"type": "function", "function": {"name": "shell", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "number"}}}}},
               {"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}, "content": {"type": "string"}}}}}]
     calls, content, unreadable = vb._read_reply(dsml, stools)
     assert [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls] == [("shell", {"command": "pwd && ls -la"})]
@@ -179,7 +259,7 @@ def main() -> None:
     # the right tool with a wrong argument name is fixed too; a name the tool knows is left alone
     assert routed('{"tool_calls":[{"name":"read","arguments":{"path":"a.txt"}}]}') == [("read", {"filePath": "a.txt"})]
     assert routed('{"tool_calls":[{"name":"grep","arguments":{"query":"x","path":"src"}}]}') == [("grep", {"pattern": "x", "path": "src"})]
-    assert routed('{"tool_calls":[{"name":"read","arguments":{"filePath":"a","path":"b"}}]}') == [("read", {"filePath": "a", "path": "b"})]
+    assert routed('{"tool_calls":[{"name":"read","arguments":{"filePath":"a","path":"b"}}]}') == [("read", {"filePath": "a"})]
 
     # the retry after a swallowed call names the tools and where they go
     known = {"read": "read", "bash": "bash"}

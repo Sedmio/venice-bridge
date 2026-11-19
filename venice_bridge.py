@@ -779,16 +779,26 @@ VENICE_SERVER_TOOLS = {  # Venice tool -> the client tools that do that job, bes
 TOOL_ALIASES = {  # client tool -> names models use for it
     "bash": ("shell", "sh", "zsh", "terminal", "execute", "exec", "run", "run_command", "execute_command",
              "run_shell_command", "run_terminal_cmd", "shell_command", "command", "calculator",
-             "code_interpreter", "python"),
+             "code_interpreter", "python", "exec_command", "local_shell", "shell_exec", "bash_command",
+             "run_bash", "run_shell", "container.exec"),
     "read": ("cat", "read_file", "readfile", "view", "view_file", "open", "open_file", "get_file",
-             "get_attachment", "view_media", "hydrate_content"),
+             "get_attachment", "view_media", "hydrate_content", "read_many_files", "head", "tail"),
     "write": ("write_file", "writefile", "create_file", "save_file", "create", "write_to_file"),
-    "edit": ("edit_file", "str_replace", "str_replace_editor", "replace", "replace_in_file", "apply_edit",
-             "update_file", "patch"),
-    "grep": ("search", "rg", "ripgrep", "search_files", "grep_search", "find_in_files", "search_code"),
+    # patch / replace_in_file / apply_diff carry a diff or patchText we cannot turn into oldString/newString,
+    # so they are intentionally NOT routed: the model gets a clear "no such tool" instead of a broken edit.
+    "edit": ("edit_file", "str_replace", "str_replace_editor", "replace", "apply_edit", "update_file",
+             "search_replace", "str_replace_based_edit_tool", "text_editor"),
+    "grep": ("search", "rg", "ripgrep", "search_files", "grep_search", "find_in_files", "search_code",
+             "search_file_content", "codebase_search", "search_in_files", "text_search", "content_search"),
     "glob": ("find", "find_files", "file_search", "search_file_names"),
-    "websearch": ("web_search", "search_web", "google", "internet_search"),
+    "websearch": ("web_search", "search_web", "google", "internet_search", "google_web_search",
+                  "google_search", "bing_search", "brave_search", "search_internet"),
     "webfetch": ("web_scrape", "web_fetch", "fetch", "fetch_url", "browse", "open_url", "http_get", "scrape"),
+    # the sub-agent tool: `task` in the CLI, `subagent` in the desktop app; models also say Agent / Task
+    # (seen live 2026-11-19: "No tool named agent / Task / task")
+    "task": ("agent", "sub_agent", "spawn_agent", "launch_agent", "dispatch_agent", "delegate", "delegate_task",
+             "new_task", "run_agent", "subagent_call", "call_agent", "start_agent", "task_agent"),
+    "skill": ("use_skill", "load_skill", "run_skill", "invoke_skill"),
 }
 # The same client tool under the names different OpenCode versions give it (CLI: bash, desktop app: shell).
 SAME_TOOL = {"bash": ("bash", "shell"), "glob": ("glob", "find"), "task": ("task", "subagent")}
@@ -799,10 +809,17 @@ def _have(target: str, declared: Dict[str, str]) -> Optional[str]:
     return next((declared[n] for n in SAME_TOOL.get(target, (target,)) if n in declared), None)
 
 
-LISTING_ALIASES = ("ls", "list_files", "list_dir", "list_directory", "listdir", "dir")
+LISTING_ALIASES = ("ls", "list_files", "list_dir", "list_directory", "listdir", "dir", "list", "tree", "list_dir_tree")
 ARG_ALIASES = {  # argument name of the client tool -> names models use for it
     "filePath": ("path", "file", "file_path", "filepath", "filename", "file_name", "target_file"),
-    "path": ("filePath", "file_path", "dir", "directory", "folder", "cwd"),
+    "path": ("filePath", "file_path", "file", "filepath", "filename", "file_name", "target_file",
+             "absolute_path", "relative_path", "notebook_path", "dir", "directory", "folder", "cwd"),
+    "workdir": ("cwd", "dir", "directory", "working_directory", "working_dir"),
+    "include": ("file_pattern", "include_pattern", "globs", "file_glob"),
+    "replaceAll": ("replace_all", "all", "global"),
+    "caseSensitive": ("case_sensitive",),
+    "agent": ("subagent_type", "agent_type", "subagent", "agent_name", "role", "mode"),
+    "id": ("skill_id", "skill_name", "skill", "name"),
     "command": ("cmd", "script", "code", "shell_command", "input", "expression"),
     "oldString": ("old_string", "old_str", "old", "old_text", "search", "find"),
     "newString": ("new_string", "new_str", "new", "new_text", "replace", "replacement"),
@@ -810,6 +827,7 @@ ARG_ALIASES = {  # argument name of the client tool -> names models use for it
     "pattern": ("query", "regex", "glob", "q", "search", "name"),
     "query": ("q", "search", "pattern", "text", "prompt"),
     "url": ("link", "uri", "href", "address"),
+    "prompt": ("task", "instructions", "instruction", "message", "request", "query"),
 }
 
 
@@ -828,10 +846,49 @@ def _fit_arguments(args: Any, props: Dict[str, Any]) -> Any:
     return args
 
 
+_HTTP_RE = re.compile(r"https?://[^\s\"'<>)\]]+")
+_PREFIX_RE = re.compile(r"^(?:functions|default_api|tools)\.", re.I)
+
+
+def _coerce_arguments(args: Any, props: Dict[str, Any]) -> Any:
+    """Fix argument VALUES (not just names), keyed off the tool's own schema:
+    a command given as a list -> one string; a url the model put in prompt; the sub-agent tool's
+    required agent/description when the model left them out."""
+    if not isinstance(args, dict) or not props:
+        return args
+    args = dict(args)
+    if "command" in props and isinstance(args.get("command"), list):
+        args["command"] = " ".join(str(x) for x in args["command"])  # Codex ["bash","-lc","…"]
+    if "url" in props and not isinstance(args.get("url"), str):
+        for k in ("prompt", "query", "text", "input"):
+            m = _HTTP_RE.search(args.get(k) or "") if isinstance(args.get(k), str) else None
+            if m:
+                args["url"] = m.group(0)
+                if k not in props:
+                    args.pop(k, None)  # the source key is not a real argument of this tool
+                break
+    if "agent" in props and not args.get("agent"):
+        args["agent"] = "general"  # the sub-agent tool requires it; general is the safe default
+    if "description" in props and not isinstance(args.get("description"), str) and isinstance(args.get("prompt"), str):
+        args["description"] = args["prompt"].strip().splitlines()[0][:80] if args["prompt"].strip() else "subtask"
+    # OpenCode 2.3.2 tools are additionalProperties:false, so any key not in the schema is rejected.
+    # Drop the leftovers from aliasing (e.g. `replace_all` after it became `replaceAll`).
+    extra = [k for k in args if k not in props]
+    for k in extra:
+        args.pop(k, None)
+    if extra:
+        sys.stderr.write(f"[venice-bridge] dropped args not in schema: {extra}\n")
+    return args
+
+
 def _route_call(name: str, args: Any, declared: Dict[str, str]) -> Optional[Tuple[str, Any]]:
     """(client tool, arguments) for a call to a tool the client does not have, or None."""
-    low = name.lower()
+    low = _PREFIX_RE.sub("", name).lower()  # functions.shell / default_api.read -> the bare name
     args = args if isinstance(args, dict) else {}
+    # `execute` is a declared Code Mode tool (arg: code) AND a bash alias; a model that means "run a
+    # command" and says execute{"command":...} must reach the shell, not the broken Code Mode call.
+    if low == "execute" and ("command" in args or "cmd" in args) and "code" not in args and _have("bash", declared):
+        return _have("bash", declared), args
     if low in LISTING_ALIASES:
         where = next((args[k] for k in ("path", "dir", "directory", "folder") if isinstance(args.get(k), str)), ".")
         if "list" in declared:
@@ -1055,13 +1112,17 @@ def _read_reply(
     unknown: List[Tuple[str, Any]] = []
     for c in parsed["calls"] or []:
         name, args = (declared.get(c["name"].lower()) if declared else c["name"]), c["arguments"]
+        if (name and name.lower() == "execute" and isinstance(args, dict) and "code" not in args
+                and ("command" in args or "cmd" in args) and _have("bash", declared)):
+            name = _have("bash", declared)  # declared Code Mode `execute`, but used as a shell
         if declared and not name:
             routed = _route_call(c["name"], args, declared)
             if routed:
                 name, args = routed
                 sys.stderr.write(f"[venice-bridge] routed call {c['name']} -> {name}\n")
         if name and declared:
-            args = _fit_arguments(args, props.get(name) or {})
+            tp = props.get(name) or {}
+            args = _coerce_arguments(_fit_arguments(args, tp), tp)
         (calls if name else unknown).append((name or c["name"], args))
     if unknown and not calls and len(parsed["content"]) < 200:
         # the reply is only a call, with an invented tool name: OpenCode tells the model it does not exist.
