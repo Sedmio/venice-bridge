@@ -24,6 +24,8 @@ import argparse
 import base64
 import datetime
 import email.utils
+import http.client
+import fnmatch
 import itertools
 import json
 import math
@@ -35,6 +37,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
@@ -94,6 +97,27 @@ def _uses_chat_route(model: Any) -> bool:
 CHAT_SYSTEM_PROMPT = "Follow the session instructions given at the start of the first user message."
 
 
+def _parse_web_tags(model: str) -> Tuple[str, bool, bool, bool]:
+    """Opt-in per-call toggles for the plain chat route (all off by default), via env or a model-id
+    suffix stripped before the id reaches Venice. `VENICE_WEB=1` / `VENICE_X_SEARCH=1` /
+    `VENICE_REASONING=1` turn one on process-wide; suffixes do it for one call:
+    `<model>:web` (web search + URL scraping), `:xsearch` (X/Twitter), `:think` (reasoning / chain of
+    thought), combinable (`<model>:web:think`). Returns (clean_model, web_enabled, x_search, think).
+    Web/reasoning can compete with or break a client's own tool loop, so they are never on unless asked;
+    the caller still suppresses `/think` when the request carries tools."""
+    web = os.environ.get("VENICE_WEB") == "1"
+    xsearch = os.environ.get("VENICE_X_SEARCH") == "1"
+    think = os.environ.get("VENICE_REASONING") == "1"
+    parts = model.split(":")
+    extra = {p.lower() for p in parts[1:]}
+    if extra and extra <= {"web", "scrape", "xsearch", "xweb", "x", "think", "reason", "reasoning"}:
+        web = web or bool({"web", "scrape"} & extra)
+        xsearch = xsearch or bool({"xsearch", "xweb", "x"} & extra)
+        think = think or bool({"think", "reason", "reasoning"} & extra)
+        model = parts[0]
+    return model, web, xsearch, think
+
+
 def _to_chat_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """The request in the plain chat route's shape: instructions folded into the first user message,
     neighbouring messages of one role joined (the route is a plain user/assistant conversation)."""
@@ -110,7 +134,14 @@ def _to_chat_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             turns[-1]["content"] += "\n\n" + text
         else:
             turns.append({"role": role, "content": text})
-    return {
+    # Reasoning lever for the web chat route: prefix the last user turn with `/think ` (the official web
+    # app's own switch). Set by openai_to_venice_chat only when asked and no tools are in play.
+    if payload.get("_think"):
+        for t in reversed(turns):
+            if t["role"] == "user":
+                t["content"] = "/think " + t["content"]
+                break
+    out: Dict[str, Any] = {
         "requestId": uuid.uuid4().hex[:16],
         "conversationType": "text",
         "modelId": payload["modelId"],
@@ -119,7 +150,30 @@ def _to_chat_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "includeVeniceSystemPrompt": False,
         "isCharacter": False,
         "simpleMode": False,
+        # classic-chat fields the official web client sends on this same route (venice.ai-normalChat.har):
+        "enableLargeContextChat": True,
+        # reasoning is a plain bool here (NOT the agent route's reasoningMode, which this route drops).
+        # Default off so tool calls stay reliable (reasoning models want reasoning_content passed back,
+        # which most clients do not carry -> 400 on tool turns); on only when `_think` was set (opt-in,
+        # no-tools) or the client asked for effort.
+        "reasoning": bool(payload.get("_think")) or payload.get("reasoningMode") == "enabled",
     }
+    if payload.get("_think"):
+        # the official web client's own reasoning request (venice.ai-normalChat.har) sends the model
+        # Venice's system prompt on this turn; without it the plain route returns no reasoning_content.
+        out["includeVeniceSystemPrompt"] = True
+    # sampling controls: forwarded only when the client set them, else Venice's own default applies.
+    if isinstance(payload.get("temperature"), (int, float)):
+        out["temperature"] = payload["temperature"]
+    if isinstance(payload.get("topP"), (int, float)):
+        out["topP"] = payload["topP"]
+    # opt-in Venice server-side web (see _parse_web_tags); off unless asked.
+    if payload.get("_webEnabled"):
+        out["webEnabled"] = True
+        out["webScrapeEnabled"] = True
+    if payload.get("_xSearch"):
+        out["xSearchEnabled"] = True
+    return out
 
 
 SERVER_LOOP_STEPS = 3  # refused native calls tolerated in one response (same value as opencode-venice-web)
@@ -470,6 +524,10 @@ class VeniceClient:
         raw_list = (text_section or {}).get("models") if isinstance(text_section, dict) else None
         if not isinstance(raw_list, list):
             raw_list = data.get("data", []) if isinstance(data, dict) else []
+        # Hide models a plain OpenAI client cannot actually use, so it never selects one that 403s:
+        # `e2ee-*` are end-to-end-encrypted (need client-side keys the bridge has no part in), plus any
+        # glob in VENICE_EXCLUDE_MODELS (comma-separated, e.g. "e2ee-*,qwen3-vl-*").
+        exclude = ["e2ee-*"] + [p.strip() for p in os.environ.get("VENICE_EXCLUDE_MODELS", "").split(",") if p.strip()]
         for m in raw_list:
             if not isinstance(m, dict):
                 continue
@@ -477,7 +535,7 @@ class VeniceClient:
             if m.get("usesCredits") is True:
                 continue
             mid = m.get("id") or m.get("modelId") or m.get("slug")
-            if mid:
+            if mid and not any(fnmatch.fnmatch(mid, pat) for pat in exclude):
                 models.append({
                     "id": mid,
                     "object": "model",
@@ -511,6 +569,8 @@ class VeniceClient:
         path = "/api/inference/chat/agents/ad-hoc"
         if _uses_chat_route(payload.get("modelId")):
             payload, path = _to_chat_payload(payload), "/api/inference/chat"
+        else:
+            payload = {k: v for k, v in payload.items() if not k.startswith("_")}  # drop internal flags
         tmpdir = tempfile.mkdtemp(prefix="vbridge-")
         os.chmod(tmpdir, 0o700)
         hdr_file = os.path.join(tmpdir, "headers.txt")
@@ -748,6 +808,7 @@ def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     model = str(body.get("model") or "qwen3-coder-480b-a35b-instruct-turbo")
     if model.startswith("venice-bridge/"):
         model = model.split("/", 1)[1]
+    model, web_enabled, x_search, think = _parse_web_tags(model)
 
     if has_tools:
         prompt.append(_message("user", TOOL_REMINDER))
@@ -760,7 +821,22 @@ def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         "tools": [],  # Venice server tools; OpenCode's tools travel in the system prompt instead
         "clientTools": [],
         "reasoningMode": "disabled" if effort in (None, "none", "minimal", "low") else "enabled",
-    }  # the route ignores temperature, top_p and max_tokens
+    }  # max_tokens is ignored by the route
+    # temperature / top_p ARE honoured by the plain chat route (the official web client sends them,
+    # venice.ai-normalChat.har); _to_chat_payload forwards them. Pass only what the client set.
+    if isinstance(body.get("temperature"), (int, float)):
+        payload["temperature"] = body["temperature"]
+    if isinstance(body.get("top_p"), (int, float)):
+        payload["topP"] = body["top_p"]
+    if web_enabled:
+        payload["_webEnabled"] = True
+    if x_search:
+        payload["_xSearch"] = True
+    # Reasoning / chain of thought: on when asked (`:think`, VENICE_REASONING, or reasoning_effort
+    # medium|high) AND the request carries no tools — a reasoning turn emits reasoning_content Venice
+    # wants passed back, which breaks tool calls (400), so tool requests never get it.
+    if (think or effort in ("medium", "high")) and not has_tools:
+        payload["_think"] = True
     return payload, has_tools
 
 
@@ -780,14 +856,14 @@ TOOL_ALIASES = {  # client tool -> names models use for it
     "bash": ("shell", "sh", "zsh", "terminal", "execute", "exec", "run", "run_command", "execute_command",
              "run_shell_command", "run_terminal_cmd", "shell_command", "command", "calculator",
              "code_interpreter", "python", "exec_command", "local_shell", "shell_exec", "bash_command",
-             "run_bash", "run_shell", "container.exec"),
+             "run_bash", "run_shell", "container.exec", "execute_shell", "exec_shell", "execcommand"),
     "read": ("cat", "read_file", "readfile", "view", "view_file", "open", "open_file", "get_file",
-             "get_attachment", "view_media", "hydrate_content", "read_many_files", "head", "tail"),
-    "write": ("write_file", "writefile", "create_file", "save_file", "create", "write_to_file"),
+             "get_attachment", "view_media", "hydrate_content", "head", "tail"),
+    "write": ("write_file", "writefile", "create_file", "save_file", "create", "write_to_file", "replace_file"),
     # patch / replace_in_file / apply_diff carry a diff or patchText we cannot turn into oldString/newString,
     # so they are intentionally NOT routed: the model gets a clear "no such tool" instead of a broken edit.
     "edit": ("edit_file", "str_replace", "str_replace_editor", "replace", "apply_edit", "update_file",
-             "search_replace", "str_replace_based_edit_tool", "text_editor"),
+             "search_replace"),
     "grep": ("search", "rg", "ripgrep", "search_files", "grep_search", "find_in_files", "search_code",
              "search_file_content", "codebase_search", "search_in_files", "text_search", "content_search"),
     "glob": ("find", "find_files", "file_search", "search_file_names"),
@@ -797,8 +873,13 @@ TOOL_ALIASES = {  # client tool -> names models use for it
     # the sub-agent tool: `task` in the CLI, `subagent` in the desktop app; models also say Agent / Task
     # (seen live 2026-11-19: "No tool named agent / Task / task")
     "task": ("agent", "sub_agent", "spawn_agent", "launch_agent", "dispatch_agent", "delegate", "delegate_task",
-             "new_task", "run_agent", "subagent_call", "call_agent", "start_agent", "task_agent"),
+             "new_task", "run_agent", "subagent_call", "call_agent", "start_agent", "task_agent",
+             # names models actually used in the survey (research/venice-model-habit-vs-bridge.json)
+             "start_sub_agent", "start_subagent", "startsubagent", "spawn_subagent", "launch_subagent",
+             "create_agent", "create_subagent", "create_sub_agent"),
     "skill": ("use_skill", "load_skill", "run_skill", "invoke_skill"),
+    "question": ("askuserquestion", "ask_user", "ask_followup_question", "questionnaire", "ask",
+                 "ask_question", "clarify"),
 }
 # The same client tool under the names different OpenCode versions give it (CLI: bash, desktop app: shell).
 SAME_TOOL = {"bash": ("bash", "shell"), "glob": ("glob", "find"), "task": ("task", "subagent")}
@@ -815,7 +896,9 @@ ARG_ALIASES = {  # argument name of the client tool -> names models use for it
     "path": ("filePath", "file_path", "file", "filepath", "filename", "file_name", "target_file",
              "absolute_path", "relative_path", "notebook_path", "dir", "directory", "folder", "cwd"),
     "workdir": ("cwd", "dir", "directory", "working_directory", "working_dir"),
-    "include": ("file_pattern", "include_pattern", "globs", "file_glob"),
+    "include": ("glob", "file_pattern", "include_pattern", "globs", "file_glob"),
+    "background": ("run_in_background", "run_async", "detach"),
+    "limit": ("head_limit", "max_results", "max", "count"),
     "replaceAll": ("replace_all", "all", "global"),
     "caseSensitive": ("case_sensitive",),
     "agent": ("subagent_type", "agent_type", "subagent", "agent_name", "role", "mode"),
@@ -827,7 +910,7 @@ ARG_ALIASES = {  # argument name of the client tool -> names models use for it
     "pattern": ("query", "regex", "glob", "q", "search", "name"),
     "query": ("q", "search", "pattern", "text", "prompt"),
     "url": ("link", "uri", "href", "address"),
-    "prompt": ("task", "instructions", "instruction", "message", "request", "query"),
+    "prompt": ("task", "instructions", "instruction", "message", "request", "query", "task_description"),
 }
 
 
@@ -867,10 +950,33 @@ def _coerce_arguments(args: Any, props: Dict[str, Any]) -> Any:
                 if k not in props:
                     args.pop(k, None)  # the source key is not a real argument of this tool
                 break
-    if "agent" in props and not args.get("agent"):
-        args["agent"] = "general"  # the sub-agent tool requires it; general is the safe default
+    if "agent" in props:
+        v = args.get("agent")
+        if isinstance(v, str) and v.strip():
+            v = v.strip().lower().replace(" ", "-")
+            args["agent"] = "general" if v in ("general-purpose", "general_purpose", "default") else v
+        else:
+            args["agent"] = "general"  # the sub-agent tool requires it; general is the safe default
     if "description" in props and not isinstance(args.get("description"), str) and isinstance(args.get("prompt"), str):
         args["description"] = args["prompt"].strip().splitlines()[0][:80] if args["prompt"].strip() else "subtask"
+    if "questions" in props:
+        # OpenCode's question tool wants questions[{question, header, options, multiple}].
+        qs = args.get("questions")
+        if not isinstance(qs, list):
+            text = next((args.get(k) for k in ("question", "prompt", "query", "text") if isinstance(args.get(k), str)), None)
+            qs = [{"question": text}] if text else []
+        norm = []
+        for q in qs:
+            if not isinstance(q, dict):
+                q = {"question": str(q)}
+            q = dict(q)
+            if "multiSelect" in q:
+                q["multiple"] = q.pop("multiSelect")
+            q.setdefault("header", (q.get("question") or "")[:30])
+            q.setdefault("options", q.get("options") or [])
+            # the item is additionalProperties:false: keep only the four allowed keys
+            norm.append({k: q[k] for k in ("question", "header", "options", "multiple") if k in q})
+        args["questions"] = norm
     # OpenCode 2.3.2 tools are additionalProperties:false, so any key not in the schema is rejected.
     # Drop the leftovers from aliasing (e.g. `replace_all` after it became `replaceAll`).
     extra = [k for k in args if k not in props]
@@ -879,6 +985,46 @@ def _coerce_arguments(args: Any, props: Dict[str, Any]) -> Any:
     if extra:
         sys.stderr.write(f"[venice-bridge] dropped args not in schema: {extra}\n")
     return args
+
+
+_SEARCH_REPLACE = re.compile(
+    r"<{3,}\s*SEARCH\s*\n(.*?)\n={3,}\s*\n(.*?)\n>{3,}\s*REPLACE", re.S | re.I)
+_MULTI_NAMES = ("multiedit", "multi_edit", "multiple_edit", "patch_file", "edit_block")
+_READMANY_NAMES = ("read_many_files", "read_files", "read_multiple_files", "readmany")
+
+
+def _one_edit(item: Dict[str, Any], path: Any) -> Optional[Dict[str, Any]]:
+    old = next((item[k] for k in ("oldString", "old_string", "old_str", "old_text", "search", "old") if k in item), None)
+    new = next((item[k] for k in ("newString", "new_string", "new_str", "new_text", "replace", "new") if k in item), None)
+    p = item.get("path") or item.get("filePath") or item.get("file_path") or item.get("file") or path
+    if isinstance(old, str) and isinstance(new, str):
+        return {"path": p, "oldString": old, "newString": new}
+    return None
+
+
+def _expand_call(name: str, args: Any, declared: Dict[str, str]) -> Optional[List[Tuple[str, Dict[str, Any]]]]:
+    """One model call that stands for SEVERAL (MultiEdit, a SEARCH/REPLACE diff, read_many_files) ->
+    a list of (tool, args). None when it is an ordinary single call. The foreign call is never declared
+    (a declared name wins and is left alone)."""
+    low = _PREFIX_RE.sub("", name).lower()
+    if not isinstance(args, dict) or low in declared:
+        return None
+    edit = _have("edit", declared)
+    read = _have("read", declared)
+    path = args.get("path") or args.get("filePath") or args.get("file_path") or args.get("file")
+    # MultiEdit / patch_file: a list of edit items
+    if edit and (low in _MULTI_NAMES or isinstance(args.get("edits"), list)) and isinstance(args.get("edits"), list):
+        out = [(edit, e) for e in (_one_edit(i, path) for i in args["edits"] if isinstance(i, dict)) if e]
+        return out or None
+    # a Cline-style diff string with SEARCH/REPLACE blocks
+    if edit and isinstance(args.get("diff"), str) and "SEARCH" in args["diff"].upper():
+        out = [(edit, {"path": path, "oldString": o, "newString": n}) for o, n in _SEARCH_REPLACE.findall(args["diff"]) if path]
+        return out or None
+    # read_many_files: a list of paths
+    if read and (low in _READMANY_NAMES or isinstance(args.get("paths"), list)) and isinstance(args.get("paths"), list):
+        out = [(read, {"path": p}) for p in args["paths"] if isinstance(p, str)]
+        return out or None
+    return None
 
 
 def _route_call(name: str, args: Any, declared: Dict[str, str]) -> Optional[Tuple[str, Any]]:
@@ -912,7 +1058,7 @@ def _route_call(name: str, args: Any, declared: Dict[str, str]) -> Optional[Tupl
 def _route_hint(declared: Dict[str, str]) -> str:
     """One sentence for the prompt: which client tool does what Venice's own tools would do."""
     jobs = [("read a file", "read"), ("run a command", "bash"), ("search the web", "websearch"),
-            ("fetch a web page", "webfetch")]
+            ("fetch a web page", "webfetch"), ("start a sub-agent", "task")]
     have = [f"{job} with `{_have(tool, declared)}`" for job, tool in jobs if _have(tool, declared)]
     return ("Venice's own tools (view_media, get_attachment, web_search, web_scrape) and built-in function "
             "calling do not reach this computer: never use them."
@@ -1110,8 +1256,17 @@ def _read_reply(
                 fn["parameters"].get("properties"), dict) else {}
     calls: List[Tuple[str, Any]] = []
     unknown: List[Tuple[str, Any]] = []
+    subcalls: List[Tuple[str, Any]] = []
     for c in parsed["calls"] or []:
-        name, args = (declared.get(c["name"].lower()) if declared else c["name"]), c["arguments"]
+        expanded = _expand_call(c["name"], c["arguments"], declared) if declared else None
+        if expanded:
+            sys.stderr.write(f"[venice-bridge] expanded {c['name']} -> {len(expanded)} x {expanded[0][0]}\n")
+            subcalls.extend(expanded)
+        else:
+            subcalls.append((c["name"], c["arguments"]))
+    for rawname, rawargs in subcalls:
+        c = {"name": rawname}
+        name, args = (declared.get(rawname.lower()) if declared else rawname), rawargs
         if (name and name.lower() == "execute" and isinstance(args, dict) and "code" not in args
                 and ("command" in args or "cmd" in args) and _have("bash", declared)):
             name = _have("bash", declared)  # declared Code Mode `execute`, but used as a shell
@@ -1120,6 +1275,17 @@ def _read_reply(
             if routed:
                 name, args = routed
                 sys.stderr.write(f"[venice-bridge] routed call {c['name']} -> {name}\n")
+        if (name and name == _have("edit", declared) and isinstance(args, dict)
+                and ("content" in args or "contents" in args or "file_text" in args)
+                and not any(k in args for k in ("oldString", "old_string", "old_str", "diff"))
+                and _have("write", declared)):
+            name = _have("write", declared)  # an edit call with a whole-file body is really a write
+        if (name and name == _have("edit", declared) and c["name"].lower() not in declared
+                and not any(k in (args or {}) for k in ("oldString", "old_string", "old_str", "newString",
+                                                        "new_string", "new_str", "replacement"))):
+            # routed to edit but the payload is a format we cannot fill (Cursor code_edit, text_editor view, ...):
+            # let it pass through as the unknown name so the client answers "no such tool" clearly
+            name = None
         if name and declared:
             tp = props.get(name) or {}
             args = _coerce_arguments(_fit_arguments(args, tp), tp)
@@ -1248,8 +1414,12 @@ def _iter_chat_events(proc: subprocess.Popen, unread: Optional[List[str]] = None
         if not event and isinstance(evt.get("kind"), str):
             # the plain chat route: one JSON object per line, no event names, no closing event
             plain = True
-            if evt["kind"] == "content" and isinstance(evt.get("content"), str) and evt["content"]:
-                yield ("text", evt["content"])
+            if evt["kind"] in ("", "content"):
+                # a content line can carry visible text and/or a reasoning_content field (web "/think")
+                if isinstance(evt.get("content"), str) and evt["content"]:
+                    yield ("text", evt["content"])
+                if isinstance(evt.get("reasoning_content"), str) and evt["reasoning_content"]:
+                    yield ("reasoning", evt["reasoning_content"])
             elif evt["kind"] in ("thinking", "reasoning") and isinstance(evt.get("content"), str) and evt["content"]:
                 yield ("reasoning", evt["content"])
             elif evt.get("error"):
@@ -1687,6 +1857,177 @@ def _outcome(r: Dict[str, Any]) -> str:
     return out + " (shown live)" if r.get("streamed") else out
 
 
+# ---- Local OpenAI-compatible backends (Ollama, LM Studio, llama.cpp, MLX): plain passthrough ----
+# These servers already speak OpenAI, so none of the Venice machinery applies to them: no Venice
+# login, no tool emulation, no retries, no judge. A model id `<backend name>/<model>` is sent as it
+# is to that backend's /chat/completions and the answer is relayed byte for byte (tool_calls too).
+# The route is chosen by the PREFIX alone, never by asking the backend: a prompt meant for a local
+# model must not go to Venice because the local server happens to be down.
+# Config: a JSON list (or {"backends": [...]}) of {"name", "base_url", optional "api_key"} in
+# BACKENDS_FILE; without the file the two defaults below; an empty list turns local backends off.
+BACKENDS_FILE = os.environ.get("VENICE_BRIDGE_BACKENDS", "~/.config/venice-bridge/backends.json")
+DEFAULT_BACKENDS = [
+    {"name": "ollama", "base_url": "http://127.0.0.1:11434/v1"},
+    {"name": "lmstudio", "base_url": "http://127.0.0.1:1234/v1"},
+]
+BACKENDS: Optional[List[Dict[str, Any]]] = None  # tests set a list; None = the file, read per request
+LOCAL_TIMEOUT = 600  # seconds without a byte from a local backend (a cold model load takes minutes)
+
+
+def _backends() -> List[Dict[str, Any]]:
+    if BACKENDS is not None:
+        return BACKENDS
+    try:
+        with open(os.path.expanduser(BACKENDS_FILE), encoding="utf-8") as f:
+            data = json.load(f)
+    except OSError:
+        return DEFAULT_BACKENDS
+    except ValueError as exc:
+        sys.stderr.write(f"[venice-bridge] {BACKENDS_FILE} is not valid JSON ({exc}); using the default backends\n")
+        return DEFAULT_BACKENDS
+    items = data.get("backends") if isinstance(data, dict) else data
+    return [{"name": str(b["name"]), "base_url": str(b["base_url"]).rstrip("/"), "api_key": b.get("api_key")}
+            for b in (items if isinstance(items, list) else [])
+            if isinstance(b, dict) and b.get("name") and b.get("base_url")]
+
+
+# A virtual model that keeps working when Venice is out. `VENICE_AUTO_MODELS` (comma list) is the
+# priority: Venice model ids first, a local `backend/id` as the offline fallback. Venice's web quota is
+# PLAN-WIDE (every Venice model shares it), so falling back to another Venice model cannot beat quota —
+# the only real fallback is a local backend. So `venice-auto` serves the first Venice candidate normally
+# and switches to the first local candidate while the bridge knows the plan is over quota (quota_until).
+DEFAULT_AUTO_MODELS = "deepseek-v4-1-flash-uncensored,ollama/qwen3:8b"
+
+
+def _resolve_auto(model: str) -> str:
+    """Resolve `venice-auto` (optionally `venice-auto:think`/`:web`) to a concrete model id."""
+    base, _, suffix = model.partition(":")
+    if base != "venice-auto":
+        return model
+    cands = [c.strip() for c in os.environ.get("VENICE_AUTO_MODELS", DEFAULT_AUTO_MODELS).split(",") if c.strip()]
+    venice_c = [c for c in cands if "/" not in c]
+    local_c = [c for c in cands if "/" in c]
+    if time.time() < VENICE.quota_until and local_c:
+        return local_c[0]  # over quota: a Venice tag is meaningless on a local backend, so drop the suffix
+    chosen = venice_c[0] if venice_c else (local_c[0] if local_c else "deepseek-v4-1-flash-uncensored")
+    return chosen + (":" + suffix if suffix and "/" not in chosen else "")
+
+
+def _resolve_backend(model: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """(backend, the model's id on that backend) for `ollama/qwen3:8b`, else (None, model)."""
+    if model.startswith("venice-bridge/"):
+        model = model.split("/", 1)[1]
+    for b in _backends():
+        if model.startswith(b["name"] + "/"):
+            return b, model[len(b["name"]) + 1:]
+    return None, model
+
+
+def _local_request(backend: Dict[str, Any], method: str, suffix: str, body: Optional[bytes] = None,
+                   timeout: float = LOCAL_TIMEOUT):
+    """(connection, response). http.client on purpose: urllib would use the macOS system proxy."""
+    u = urllib.parse.urlsplit(backend["base_url"])
+    cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+    conn = cls(u.hostname, u.port, timeout=timeout)
+    headers = {"Content-Type": "application/json"}
+    if backend.get("api_key"):
+        headers["Authorization"] = "Bearer " + str(backend["api_key"])
+    try:
+        conn.request(method, u.path.rstrip("/") + suffix, body, headers)
+        return conn, conn.getresponse()
+    except Exception:
+        conn.close()
+        raise
+
+
+def list_local_models() -> List[Dict[str, Any]]:
+    """Every reachable local backend's models as `<backend>/<id>`; a backend that is down is skipped."""
+    out: List[Dict[str, Any]] = []
+    for b in _backends():
+        try:
+            conn, resp = _local_request(b, "GET", "/models", timeout=2)
+            try:
+                data = json.loads(resp.read()) if resp.status == 200 else {}
+            finally:
+                conn.close()
+            for m in data.get("data") or []:
+                if isinstance(m, dict) and m.get("id"):
+                    out.append({"id": f"{b['name']}/{m['id']}", "object": "model",
+                                "created": int(time.time()), "owned_by": b["name"]})
+        except Exception as exc:
+            sys.stderr.write(f"[venice-bridge] local backend {b['name']} not listed: {type(exc).__name__}\n")
+    return out
+
+
+def _usage(prompt_chars: int, completion_text: str) -> Dict[str, int]:
+    """An APPROXIMATE OpenAI usage block (~4 chars per token). Venice's web API returns no token
+    counts, so coding clients (Claude Code, Codex) otherwise show 0. These are estimates."""
+    p = max(0, round(prompt_chars / 4))
+    c = max(0, round(len(completion_text or "") / 4))
+    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+# --- response cache -------------------------------------------------------------
+# Serve a BYTE-IDENTICAL repeat request (same model+messages+tools+params, stream aside)
+# from memory, WITHOUT spending a Venice web-quota call. The web plan is request-metered
+# (not token-metered), so this protects the daily quota on exact retries / repeated prompts.
+# Agentic turns rarely repeat verbatim, so the hit rate is modest by design.
+# Disable with VENICE_BRIDGE_CACHE=0. Only clean successes (real answer or tool call) are stored.
+import collections as _collections
+import hashlib as _hashlib
+
+_CACHE_ENABLED = os.environ.get("VENICE_BRIDGE_CACHE", "1") != "0"
+_CACHE_MAX = int(os.environ.get("VENICE_BRIDGE_CACHE_MAX", "256"))
+_CACHE_TTL = float(os.environ.get("VENICE_BRIDGE_CACHE_TTL", "3600"))
+_CACHE_LOCK = threading.Lock()
+_CACHE = _collections.OrderedDict()  # key -> (stored_at_epoch, entry)
+_CACHE_STATS = {"hits": 0, "misses": 0, "stores": 0}
+
+
+def _cache_key(body: Dict[str, Any]) -> Optional[str]:
+    if not _CACHE_ENABLED or not isinstance(body, dict):
+        return None
+    keyable = {k: v for k, v in body.items() if k != "stream"}
+    try:
+        blob = json.dumps(keyable, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        return None
+    return _hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _cache_get(key: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not key:
+        return None
+    now = time.time()
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+        if hit is None:
+            _CACHE_STATS["misses"] += 1
+            return None
+        stored_at, entry = hit
+        if now - stored_at > _CACHE_TTL:
+            _CACHE.pop(key, None)
+            _CACHE_STATS["misses"] += 1
+            return None
+        _CACHE.move_to_end(key)
+        _CACHE_STATS["hits"] += 1
+        return entry
+
+
+def _cache_put(key: Optional[str], entry: Dict[str, Any]) -> None:
+    if not key:
+        return
+    # never cache a non-answer (no text and no tool call)
+    if not (entry.get("content") or entry.get("tool_calls")):
+        return
+    with _CACHE_LOCK:
+        _CACHE[key] = (time.time(), entry)
+        _CACHE.move_to_end(key)
+        _CACHE_STATS["stores"] += 1
+        while len(_CACHE) > _CACHE_MAX:
+            _CACHE.popitem(last=False)
+
+
 class OpenAIBridgeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1701,25 +2042,110 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _serve_cached(self, entry: Dict[str, Any], stream: bool, model: str) -> None:
+        """Replay a cached result as a normal /v1/chat/completions response (stream or not)."""
+        content = entry.get("content") or ""
+        reasoning = entry.get("reasoning")
+        calls = entry.get("tool_calls")  # already in {id,type,function} shape, or None
+        finish = entry.get("finish") or ("tool_calls" if calls else "stop")
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        completion = (content or "") + "".join(c["function"]["arguments"] for c in (calls or []))
+        usage = _usage(int(entry.get("prompt_chars") or 0), completion)
+        if not stream:
+            message_obj: Dict[str, Any] = {"role": "assistant", "content": content or None}
+            if calls:
+                message_obj["tool_calls"] = calls
+            self._send_json(200, {
+                "id": chat_id, "object": "chat.completion", "created": created, "model": model,
+                "choices": [{"index": 0, "message": message_obj, "finish_reason": finish}],
+                "usage": usage,
+            })
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def _emit(delta: Dict[str, Any], fin: Optional[str] = None) -> None:
+            chunk = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                     "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
+        try:
+            _emit({"role": "assistant"})
+            if reasoning:
+                _emit({"reasoning_content": reasoning})
+            if content:
+                _emit({"content": content})
+            if calls:
+                _emit({"tool_calls": calls})
+            _emit({}, finish)
+            uchunk = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                      "choices": [], "usage": usage}
+            self.wfile.write(f"data: {json.dumps(uchunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        finally:
+            self.close_connection = True
+
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
         if path == "/health":
             try:
                 VENICE.get_jwt()
-                self._send_json(200, {"ok": True, "venice_session": "active", "chat_quota": VENICE.chat_quota()})
+                self._send_json(200, {"ok": True, "venice_session": "active", "chat_quota": VENICE.chat_quota(),
+                                      "cache": {**_CACHE_STATS, "entries": len(_CACHE), "enabled": _CACHE_ENABLED}})
             except Exception as exc:
                 self._send_json(503, {"ok": False, "error": str(exc)})
             return
 
         if path == "/v1/models":
+            models = list_local_models()
             try:
-                models = VENICE.list_models()
-                self._send_json(200, {"object": "list", "data": models})
+                models = VENICE.list_models() + models
             except Exception as exc:
-                self._send_json(502, {"error": {"message": str(exc), "type": "bridge_error"}})
+                if not models:
+                    self._send_json(502, {"error": {"message": str(exc), "type": "bridge_error"}})
+                    return
+                # the local models stay usable while Venice is logged out or unreachable
+                sys.stderr.write(f"[venice-bridge] Venice models not listed: {type(exc).__name__}\n")
+            models = [{"id": "venice-auto", "object": "model", "created": int(time.time()),
+                       "owned_by": "venice-bridge"}] + models  # virtual: Venice, local fallback over quota
+            self._send_json(200, {"object": "list", "data": models})
             return
 
         self._send_json(404, {"error": {"message": f"Unknown GET path: {path}"}})
+
+    def _passthrough(self, backend: Dict[str, Any], model: str, body: Dict[str, Any]) -> None:
+        """Send the request to a local backend unchanged (only the model id loses its prefix) and
+        relay the answer as it arrives, whatever its status."""
+        try:
+            conn, resp = _local_request(
+                backend, "POST", "/chat/completions", json.dumps(dict(body, model=model), ensure_ascii=False).encode("utf-8"))
+        except Exception as exc:
+            sys.stderr.write(f"[venice-bridge] local {backend['name']} model={model}: {type(exc).__name__}: {exc}\n")
+            self._send_json(502, {"error": {
+                "message": f"Local backend '{backend['name']}' ({backend['base_url']}) did not answer: {exc}",
+                "type": "local_backend_error"}})
+            return
+        sys.stderr.write(f"[venice-bridge] local {backend['name']} model={model} status={resp.status}\n")
+        try:
+            self.send_response(resp.status)
+            self.send_header("Content-Type", resp.getheader("Content-Type") or "application/json")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            # read1 returns what has arrived; read(n) would hold the tokens back until n bytes are there
+            for chunk in iter(lambda: resp.read1(65536), b""):
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        finally:  # a client that went away ends here too: closing the connection stops the generation
+            conn.close()
+            self.close_connection = True
 
     def do_POST(self) -> None:
         started = time.time()
@@ -1754,14 +2180,29 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": f"Invalid JSON: {exc}"}})
             return
 
+        if isinstance(body, dict):
+            body["model"] = _resolve_auto(str(body.get("model") or ""))  # venice-auto -> a concrete id
+        backend, local_model = _resolve_backend(str(body.get("model") or "")) if isinstance(body, dict) else (None, "")
+        if backend:  # before anything Venice: its quota, login and prompt rewriting do not apply
+            self._passthrough(backend, local_model, body)
+            return
+
         if time.time() < VENICE.quota_until:  # known to be over quota: do not spend an upstream call
             code, message = _quota_error()
             self._send_json(code, {"error": {"message": message, "type": "venice_quota_exhausted", "code": 429}})
             return
 
         stream = bool(body.get("stream", False))
-        model = str(body.get("model") or "qwen3-coder-480b-a35b-instruct-turbo")
+        model = _parse_web_tags(str(body.get("model") or "qwen3-coder-480b-a35b-instruct-turbo"))[0]
+        cache_key = _cache_key(body)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            sys.stderr.write("[venice-bridge] cache hit (no Venice call spent)\n")
+            self._serve_cached(cached, stream, model)
+            return
         venice_payload, has_tools = openai_to_venice_chat(body)
+        prompt_chars = (len(venice_payload["systemPrompt"]["instructions"])
+                        + sum(len(m["content"][0]["text"]) for m in venice_payload["messages"]))
         sys.stderr.write(
             "[venice-bridge] request chars: system=%d messages=%d (%d) tools=%d\n" % (
                 len(venice_payload["systemPrompt"]["instructions"]),
@@ -1796,6 +2237,12 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
             self.wfile.flush()
 
+        def send_usage(completion_text: str) -> None:
+            chunk = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                     "choices": [], "usage": _usage(prompt_chars, completion_text)}
+            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
         if has_tools:
             # The answer may be a call, so nothing is sent until it is complete, retries included. That
             # also keeps the status line free: a failed turn goes out as a 502, which OpenCode retries by
@@ -1818,6 +2265,10 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                     elif gate.rest() and best["trigger"] != "unreadable":
                         emit({"content": gate.rest()})
                     emit({}, "tool_calls" if calls else "stop")
+                    send_usage((gate.buf if gate else "") + "".join(c["function"]["arguments"] for c in (calls or [])))
+                    _cache_put(cache_key, {"content": content or "", "reasoning": best["reasoning"],
+                                           "tool_calls": [{"id": c["id"], "type": "function", "function": c["function"]} for c in calls] if calls else None,
+                                           "finish": "tool_calls" if calls else "stop", "prompt_chars": prompt_chars})
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
                 finally:
@@ -1833,12 +2284,17 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 message_obj: Dict[str, Any] = {"role": "assistant", "content": content or None}
                 if calls:
                     message_obj["tool_calls"] = [{"id": c["id"], "type": "function", "function": c["function"]} for c in calls]
+                completion = (content or "") + "".join(c["function"]["arguments"] for c in (calls or []))
+                _cache_put(cache_key, {"content": content or "", "reasoning": best["reasoning"],
+                                       "tool_calls": message_obj.get("tool_calls"),
+                                       "finish": "tool_calls" if calls else "stop", "prompt_chars": prompt_chars})
                 self._send_json(200, {
                     "id": chat_id,
                     "object": "chat.completion",
                     "created": created,
                     "model": model,
                     "choices": [{"index": 0, "message": message_obj, "finish_reason": "tool_calls" if calls else "stop"}],
+                    "usage": _usage(prompt_chars, completion),
                 })
                 return
             try:
@@ -1851,6 +2307,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 if calls:
                     emit({"tool_calls": calls})
                 emit({}, "tool_calls" if calls else "stop")
+                send_usage((content or "") + "".join(c["function"]["arguments"] for c in (calls or [])))
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             finally:
@@ -1895,29 +2352,37 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             return "".join(parts), None if done else "the Venice stream ended before the reply was complete"
 
         if not stream:
+            reason_parts: List[str] = []
             try:
-                full_text, problem = collect()
+                full_text, problem = collect(on_reasoning=reason_parts.append)
             finally:
                 _cleanup(handle)
             if problem:
                 sys.stderr.write(f"[venice-bridge] upstream failed mid-reply: {problem}\n")
                 self._send_json(502, {"error": {"message": problem, "type": "venice_upstream_error"}})
                 return
+            reasoning = "".join(reason_parts) or None  # surfaced when the model reasoned (`/think`)
+            message_obj = {"role": "assistant", "content": full_text or None}
+            if reasoning:
+                message_obj["reasoning_content"] = reasoning
+            _cache_put(cache_key, {"content": full_text or "", "reasoning": reasoning, "tool_calls": None,
+                                   "finish": "stop", "prompt_chars": prompt_chars})
             self._send_json(200, {
                 "id": chat_id,
                 "object": "chat.completion",
                 "created": created,
                 "model": model,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": full_text or None},
-                             "finish_reason": "stop"}],
+                "choices": [{"index": 0, "message": message_obj, "finish_reason": "stop"}],
+                "usage": _usage(prompt_chars, full_text),
             })
             return
 
         try:
             start_stream()
             emit({"role": "assistant"})
+            reason_parts: List[str] = []
             full_text, problem = collect(
-                on_reasoning=lambda d: emit({"reasoning_content": d}),
+                on_reasoning=lambda d: (reason_parts.append(d), emit({"reasoning_content": d}))[1],
                 on_text=lambda d: emit({"content": d}),
             )
             if problem:
@@ -1928,6 +2393,9 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
             emit({}, "stop")
+            _cache_put(cache_key, {"content": full_text or "", "reasoning": "".join(reason_parts) or None,
+                                   "tool_calls": None, "finish": "stop", "prompt_chars": prompt_chars})
+            send_usage(full_text)
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         finally:
@@ -1936,7 +2404,9 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Venice AI OpenAI-compatible bridge")
-    parser.add_argument("--host", default=DEFAULT_HOST)
+    # 127.0.0.1 unless asked otherwise: the bridge has no authentication of its own, so any other
+    # address (0.0.0.0 for a Docker container reaching host.docker.internal) opens it to the network
+    parser.add_argument("--host", default=os.environ.get("VENICE_BRIDGE_HOST") or DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
     srv = ThreadingHTTPServer((args.host, args.port), OpenAIBridgeHandler)

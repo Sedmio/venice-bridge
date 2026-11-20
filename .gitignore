@@ -11,3 +11,12 @@ tmp/
 dist/
 checkpoints/
 .agent-history/
+.pytest_cache/
+.env
+*.sqlite*
+logs/
+backends.json.local
+.claude-venice/
+.roundtable/
+*.pem
+*.p8

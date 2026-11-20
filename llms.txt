@@ -1,37 +1,49 @@
 # venice-bridge
 
-> venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.
+> venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.
 
 ## What it does
 
-- Runs an OpenAI Chat Completions server on `127.0.0.1:18891` (`POST /v1/chat/completions`, `GET /v1/models`, `GET /health`, `POST /reload`).
+- The bridge (`venice_bridge.py`) runs an OpenAI Chat Completions server on `127.0.0.1:18891` (`POST /v1/chat/completions`, `GET /v1/models`, `GET /health`, `POST /reload`).
+- The optional adapter (`venice_adapters.py`, standard library only) runs on `127.0.0.1:18892` and serves Anthropic Messages (`POST /v1/messages`, `/v1/messages/count_tokens`) for Claude Code and OpenAI Responses (`POST /v1/responses`) for Codex CLI, translating them to Chat Completions for the bridge.
+- The `claude-venice` launcher runs the Claude Code CLI on the adapter in an isolated profile (`~/.claude-venice`); it skips Claude Code's permission prompts by default (`VENICE_CLAUDE_SKIP_PERMS=0` turns that off).
 - Forwards requests to the venice.ai web app's own backend, signed in with the user's browser login (the `__client` cookie of `clerk.venice.ai`). It does not use the paid Venice API and needs no API key.
 - `VENICE_BRIDGE_ROUTE=auto` (default) uses Venice's plain chat route, where no Venice agent loop swallows tool calls, and falls back to the agent route for a model the chat route does not know; `chat` and `agent` force one route.
 - Emulates tool calling in text: the tool list goes into the prompt, and a tolerant parser plus native and tagged call readers turn the model's reply into OpenAI `tool_calls`; foreign tool and argument names are routed to the client's tools. Includes retries, a completion check, a stream gate, and an optional early-stop judge.
+- A model id `<backend>/<model>` (e.g. `ollama/qwen3:8b`, `lmstudio/<id>`) goes straight to a local OpenAI-compatible server (Ollama, LM Studio, llama.cpp, MLX via `~/.config/venice-bridge/backends.json`), with no Venice login or quota.
+- Opt-in Venice web search per request (`<model>:web`, `<model>:xsearch`) or process-wide (`VENICE_WEB=1`, `VENICE_X_SEARCH=1`); off by default.
+- Opt-in reasoning (chat route) for requests without tools only: model suffix `:think` (aliases `:reason`, `:reasoning`), `VENICE_REASONING=1`, or `reasoning_effort` `medium` / `high`; the chain of thought comes back as `reasoning_content`. `:think` is ignored when tools are declared, so it has no effect in agent loops; leave `reasoning_effort` unset there.
+- `GET /v1/models` lists only models the web subscription covers (no credit models, no `e2ee-*`; `VENICE_EXCLUDE_MODELS` hides more by glob), plus a virtual `venice-auto` model: a Venice model normally, the first local model in `VENICE_AUTO_MODELS` (default `ollama/qwen3:8b`) while the daily quota is used up. The request that hits the limit still fails once.
+- An in-memory response cache answers byte-identical repeat requests without a Venice call (`VENICE_BRIDGE_CACHE=0` disables it).
 
 ## Install
 
 - Requirements: macOS, Python 3.10+, `pip install curl_cffi`, a venice.ai web account (tested on a paid plan, Pro).
 - Save the cookie value to `~/.config/venice-bridge/client-cookie.txt` (mode 0600).
-- Run `python3 venice_bridge.py`, then check `curl -s http://127.0.0.1:18891/health`.
+- Run `python3 venice_bridge.py`, then check `curl -s http://127.0.0.1:18891/health`. For Claude Code or Codex also run `python3 venice_adapters.py`.
+- Self-checks (offline): `python3 test_venice_bridge.py` and `python3 test_venice_adapters.py`.
 
 ## Use
 
 - OpenCode: copy the provider block from `examples/opencode.json` into `~/.config/opencode/opencode.json`, then `opencode -m venice-bridge/deepseek-v4-1-flash-uncensored`.
-- Any OpenAI-compatible client: base URL `http://127.0.0.1:18891/v1`, any placeholder API key.
-- Autostart on macOS with the launchd template `examples/com.example.venice-bridge.plist`.
+- Claude Code: `claude-venice` or `claude-venice -m <venice-model-id>`.
+- Codex CLI: a command-line provider with `base_url="http://127.0.0.1:18892/v1"` and `wire_api="responses"` (full command in the README).
+- Any OpenAI-compatible client: base URL `http://127.0.0.1:18891/v1`, any placeholder API key; from Docker, `http://host.docker.internal:18891/v1`.
+- Autostart on macOS with the launchd templates `examples/com.example.venice-bridge.plist` and `examples/com.example.venice-adapters.plist`.
 
 ## Limits
 
 - Unofficial; not affiliated with Venice.ai. Uses undocumented web endpoints that can change at any time.
 - Automating a logged-in web session may be against Venice's terms of service; use only your own account.
 - Tested on a paid plan (Pro). The agent route needs a paid plan (a free account gets `403 creator_access_required`); a free account has a very small chat quota.
-- macOS only so far. No Anthropic Messages or OpenAI Responses API, so Claude Code and Codex CLI do not work directly. No images.
-- With tools, short replies are sent only when complete. Tool calling is emulated; open models sometimes need a retry.
+- The web plan is limited by a daily request quota, not tokens; reported token counts are estimates.
+- macOS only so far. No images. Codex's namespace tools (MCP, multi-agent) and built-in `web_search` do not pass through the adapter.
+- With tools, short replies are sent only when complete. Tool calling is emulated; Venice's fast models are weak at long agentic chains and need their work checked.
 
 ## Links
 
-- [README](https://github.com/nsozturk/venice-bridge/blob/main/README.md): setup, configuration, API, troubleshooting, FAQ
+- [README](https://github.com/nsozturk/venice-bridge/blob/main/README.md): setup, Claude Code, Codex, local models, configuration, API, troubleshooting, FAQ
 - [AGENTS.md](https://github.com/nsozturk/venice-bridge/blob/main/AGENTS.md): contract for coding agents
+- [Tool routing](https://github.com/nsozturk/venice-bridge/blob/main/docs/TOOL_ROUTING.md): tool-name and argument mapping reference
 - [Documentation site](https://nsozturk.github.io/venice-bridge/)
 - [Repository](https://github.com/nsozturk/venice-bridge)

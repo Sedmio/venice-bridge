@@ -15,6 +15,8 @@ import venice_bridge as vb
 # never touch the real persisted Clerk client: every test in this run writes under a temp dir
 STATE_DIR = tempfile.mkdtemp(prefix="vbridge-test-")
 vb.CLIENT_STATE_FILE = os.path.join(STATE_DIR, "venice-bridge-client.json")
+vb.BACKENDS = []  # never the real backends file or the real Ollama / LM Studio on this machine
+vb._CACHE_ENABLED = False  # tests replay byte-identical bodies to exercise the upstream; the response cache would collapse them
 
 
 def events(body: bytes):
@@ -122,28 +124,6 @@ def main() -> None:
         g.feed(ch)
     assert "".join(out) == "<start>" + "y" * 250 + " now the file." and g.rest().startswith("@@WRITE@@<tool_calls>")
 
-    # the model's own markup, as DeepSeek V4.1 Flash writes it on the plain chat route (real reply, 2026-11-19)
-    dsml = ('<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="command" string="true">pwd && ls -la</｜DSML｜ parameter>\n'
-            '</｜DSML｜ invoke>\n</｜DSML｜ calls>')
-    stools = [{"type": "function", "function": {"name": "shell", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "number"}}}}},
-              {"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}, "content": {"type": "string"}}}}}]
-    calls, content, unreadable = vb._read_reply(dsml, stools)
-    assert [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls] == [("shell", {"command": "pwd && ls -la"})]
-    assert content == "" and not unreadable
-    two_native = ('I will write it.\n<｜DSML｜ function_calls>\n<｜DSML｜ invoke name="write">\n<｜DSML｜ parameter name="path" string="true">a.py</｜DSML｜ parameter>\n'
-                  '<｜DSML｜ parameter name="content" string="true">x = "1"\nprint(x)\n</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n'
-                  '<invoke name="bash"><parameter name="command">ls</parameter><parameter name="timeout" string="false">5</parameter></invoke>')
-    calls, content, unreadable = vb._read_reply(two_native, stools)
-    assert [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls] == [
-        ("write", {"filePath": "a.py", "content": 'x = "1"\nprint(x)\n'}), ("shell", {"command": "ls", "timeout": 5})]
-    assert content == "I will write it."  # the markup is never shown
-    assert vb._read_reply('<｜DSML｜ invoke name="', stools) == (None, "", False) or vb._read_reply('<｜DSML｜ invoke name="', stools)[0] is None
-    out = []
-    g = vb._LiveGate(lambda: out.append("<start>"), out.append)
-    for ch in "y" * 250 + ' now.\n<｜DSML｜ invoke name="shell">':
-        g.feed(ch)
-    assert "".join(out) == "<start>" + "y" * 250 + " now.\n" and g.rest().startswith("<｜DSML｜")
-
     # --- gap-fix routing (tool-audit 2026-11-20): OpenCode 2.3.2 tools take `path`, not `filePath` ---
     oc = [{"type": "function", "function": {"name": n, "parameters": {"type": "object", "properties": pr}}} for n, pr in [
         ("read", {"path": {"type": "string"}, "offset": {"type": "number"}}),
@@ -191,6 +171,61 @@ def main() -> None:
     # webfetch: url pulled out of a prompt
     assert g('{"tool_calls":[{"name":"web_fetch","arguments":{"prompt":"read https://example.com/x please"}}]}') == [
         ("webfetch", {"url": "https://example.com/x"})]
+    # --- second gap batch (tool-mapping §6/§7, 2026-11-20) ---
+    q_oc = [{"type": "function", "function": {"name": "question", "parameters": {"type": "object", "properties": {"questions": {"type": "array"}}}}},
+            {"type": "function", "function": {"name": "subagent", "parameters": {"type": "object", "properties": {"agent": {"type": "string"}, "description": {"type": "string"}, "prompt": {"type": "string"}}}}},
+            {"type": "function", "function": {"name": "grep", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}, "include": {"type": "string"}, "limit": {"type": "number"}}}}},
+            {"type": "function", "function": {"name": "shell", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "background": {"type": "boolean"}}}}},
+            {"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}},
+            {"type": "function", "function": {"name": "edit", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "oldString": {"type": "string"}, "newString": {"type": "string"}}}}},
+            {"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+
+    def q(reply):
+        calls = vb._read_reply(reply, q_oc)[0] or []
+        return [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls]
+
+    # AskUserQuestion -> question, a single string becomes questions[], multiSelect -> multiple
+    out = q('{"tool_calls":[{"name":"AskUserQuestion","arguments":{"question":"Pick a branch name"}}]}')
+    assert out[0][0] == "question" and out[0][1]["questions"][0]["question"] == "Pick a branch name"
+    assert out[0][1]["questions"][0]["header"] == "Pick a branch name"[:30] and out[0][1]["questions"][0]["options"] == []
+    out = q('{"tool_calls":[{"name":"question","arguments":{"questions":[{"question":"x","header":"h","options":[1],"multiSelect":true,"junk":9}]}}]}')
+    item = out[0][1]["questions"][0]
+    assert item == {"question": "x", "header": "h", "options": [1], "multiple": True}  # junk/multiSelect gone
+    # Claude sub-agent value map: general-purpose -> general; Explore -> explore
+    out = q('{"tool_calls":[{"name":"Agent","arguments":{"subagent_type":"general-purpose","prompt":"do x"}}]}')
+    assert out[0] == ("subagent", {"agent": "general", "prompt": "do x", "description": "do x"}), out
+    assert q('{"tool_calls":[{"name":"subagent","arguments":{"agent":"Explore","prompt":"y"}}]}')[0][1]["agent"] == "explore"
+    # grep: glob -> include (pattern present), head_limit -> limit; shell: run_in_background -> background
+    assert q('{"tool_calls":[{"name":"grep","arguments":{"pattern":"TODO","glob":"*.py","head_limit":10}}]}') == [
+        ("grep", {"pattern": "TODO", "include": "*.py", "limit": 10})]
+    assert q('{"tool_calls":[{"name":"shell","arguments":{"command":"sleep 1","run_in_background":true}}]}') == [
+        ("shell", {"command": "sleep 1", "background": True})]
+    # edit_file with whole-file content (no oldString) -> write
+    assert q('{"tool_calls":[{"name":"edit_file","arguments":{"path":"a.py","content":"print(1)"}}]}') == [
+        ("write", {"path": "a.py", "content": "print(1)"})]
+    # a real edit (oldString) stays an edit
+    assert q('{"tool_calls":[{"name":"edit","arguments":{"path":"a","oldString":"x","newString":"y"}}]}') == [
+        ("edit", {"path": "a", "oldString": "x", "newString": "y"})]
+    # extra shell names
+    assert q('{"tool_calls":[{"name":"execute_shell","arguments":{"command":"ls"}}]}') == [("shell", {"command": "ls"})]
+    # multi-file / multi-command / unmappable edit payloads are NOT routed -> clean "no such tool"
+    assert q('{"tool_calls":[{"name":"edit_file","arguments":{"path":"a","code_edit":"..."}}]}') == [("edit_file", {"path": "a", "code_edit": "..."})]
+    assert q('{"tool_calls":[{"name":"str_replace_based_edit_tool","arguments":{"command":"view","path":"a"}}]}')[0][0] == "str_replace_based_edit_tool"
+    # new sub-agent names from the survey route to subagent
+    assert q('{"tool_calls":[{"name":"start_sub_agent","arguments":{"prompt":"p"}}]}')[0][0] == "subagent"
+    # one call -> several (MultiEdit / diff / read_many_files)
+    me = q('{"tool_calls":[{"name":"MultiEdit","arguments":{"file_path":"a.py","edits":[{"old_string":"x","new_string":"y"},{"old_string":"a","new_string":"b"}]}}]}')
+    assert me == [("edit", {"path": "a.py", "oldString": "x", "newString": "y"}), ("edit", {"path": "a.py", "oldString": "a", "newString": "b"})], me
+    dq = q('{"tool_calls":[{"name":"replace_in_file","arguments":{"path":"a.py","diff":"<<<<<<< SEARCH\nold1\n=======\nnew1\n>>>>>>> REPLACE\n<<<<<<< SEARCH\nold2\n=======\nnew2\n>>>>>>> REPLACE"}}]}')
+    assert dq == [("edit", {"path": "a.py", "oldString": "old1", "newString": "new1"}), ("edit", {"path": "a.py", "oldString": "old2", "newString": "new2"})], dq
+    rm = q('{"tool_calls":[{"name":"read_many_files","arguments":{"paths":["/x/a","/x/b"]}}]}')
+    assert rm == [("read", {"path": "/x/a"}), ("read", {"path": "/x/b"})], rm
+    # replace_file -> write
+    assert q('{"tool_calls":[{"name":"replace_file","arguments":{"path":"a","content":"x"}}]}') == [("write", {"path": "a", "content": "x"})]
+    # a normal single edit is unaffected by the expander
+    assert q('{"tool_calls":[{"name":"edit","arguments":{"path":"a","oldString":"x","newString":"y"}}]}') == [("edit", {"path": "a", "oldString": "x", "newString": "y"})]
+
+    # unknown keys are dropped (tools are additionalProperties:false): replace_all leftover goes, replaceAll stays
     # unknown keys are dropped (tools are additionalProperties:false): replace_all leftover goes, replaceAll stays
     out = g('{"tool_calls":[{"name":"edit","arguments":{"path":"a","oldString":"x","newString":"y","replace_all":true,"junk":1}}]}')
     assert out == [("edit", {"path": "a", "oldString": "x", "newString": "y", "replaceAll": True})], out
@@ -253,12 +288,21 @@ def main() -> None:
     got = vb._read_reply('{"tool_calls":[{"name":"bash","arguments":{"cmd":"ls"}}]}', desk)[0]
     assert got[0]["function"]["name"] == "shell" and json.loads(got[0]["function"]["arguments"]) == {"command": "ls"}
     assert "run a command with `shell`" in vb._route_hint({"shell": "shell"})
+    # the sub-agent tool is `subagent` there and `task` in the CLI; models call it Agent / Task / agent
+    sub = [{"type": "function", "function": {"name": "subagent", "parameters": {"type": "object", "properties": {
+        "description": {"type": "string"}, "prompt": {"type": "string"}}}}}]
+    for said in ("Agent", "Task", "task", "agent"):
+        got = vb._read_reply('{"tool_calls":[{"name":"%s","arguments":{"description":"d","task":"go"}}]}' % said, sub)[0]
+        assert got[0]["function"]["name"] == "subagent", said
+        assert json.loads(got[0]["function"]["arguments"]) == {"description": "d", "prompt": "go"}, said
+    assert "start a sub-agent with `subagent`" in vb._route_hint({"subagent": "subagent"})
     # Venice's media tool is a file read only when its id is a path; a made-up id is not
     assert routed('{"tool_calls":[{"name":"get_attachment","arguments":{"media_ids":["src/app.py"]}}]}') == [("read", {"filePath": "src/app.py"})]
     assert routed('{"tool_calls":[{"name":"view_media","arguments":{"media_ids":["nope"]}}]}') == [("view_media", {"media_ids": ["nope"]})]
     # the right tool with a wrong argument name is fixed too; a name the tool knows is left alone
     assert routed('{"tool_calls":[{"name":"read","arguments":{"path":"a.txt"}}]}') == [("read", {"filePath": "a.txt"})]
     assert routed('{"tool_calls":[{"name":"grep","arguments":{"query":"x","path":"src"}}]}') == [("grep", {"pattern": "x", "path": "src"})]
+    # `path` is not in this read's schema (it declares filePath) -> dropped (additionalProperties:false)
     assert routed('{"tool_calls":[{"name":"read","arguments":{"filePath":"a","path":"b"}}]}') == [("read", {"filePath": "a"})]
 
     # the retry after a swallowed call names the tools and where they go
@@ -557,8 +601,14 @@ def end_to_end() -> None:
 
     def content_of(out, stream):
         if stream:
-            return "".join(json.loads(line[6:])["choices"][0]["delta"].get("content") or ""
-                           for line in out.splitlines() if line.startswith("data: {"))
+            parts = []
+            for line in out.splitlines():
+                if not line.startswith("data: {"):
+                    continue
+                ch = json.loads(line[6:]).get("choices") or []  # the usage chunk has choices: []
+                if ch:
+                    parts.append(ch[0]["delta"].get("content") or "")
+            return "".join(parts)
         return json.loads(out)["choices"][0]["message"]["content"]
 
     act = lambda reminder: "(act reminder) " + reminder
@@ -722,8 +772,14 @@ def end_to_end() -> None:
 
     # ---- the stream gate: long prose is shown while it is written, a call never is ----
     def said(out):
-        return "".join(json.loads(l[6:])["choices"][0]["delta"].get("content") or ""
-                       for l in out.splitlines() if l.startswith('data: {"id"'))
+        parts = []
+        for l in out.splitlines():
+            if not l.startswith('data: {"id"'):
+                continue
+            ch = json.loads(l[6:]).get("choices") or []  # usage chunk has choices: []
+            if ch:
+                parts.append(ch[0]["delta"].get("content") or "")
+        return "".join(parts)
 
     code, out = ask("long_prose", stream=True, with_tools=True, messages=after_tool)
     assert code == 200 and said(out) == LONG and '"finish_reason": "stop"' in out and out.count('"content"') > 2
@@ -760,6 +816,15 @@ def end_to_end() -> None:
     for ch in '{"tool_calls":[{"name":"read","arguments":{}}]}' + "y" * 300:
         gate.feed(ch)
     assert not gate.live  # a reply that starts as a call is never shown
+    # usage is estimated (Venice gives none) so Claude Code / Codex counters are not 0
+    code, out = ask("ok")
+    u = json.loads(out)["usage"]
+    assert u["prompt_tokens"] > 0 and u["completion_tokens"] >= 1 and u["total_tokens"] == u["prompt_tokens"] + u["completion_tokens"]
+    code, out = ask("ok", stream=True)
+    usage_chunks = [json.loads(l[6:]) for l in out.splitlines() if l.startswith("data: {") and '"usage"' in l]
+    assert usage_chunks and usage_chunks[-1]["usage"]["completion_tokens"] >= 1 and usage_chunks[-1]["choices"] == []
+    code, out = ask("call", stream=True, with_tools=True, messages=after_tool)
+    assert any('"usage"' in l for l in out.splitlines())  # tool-call stream also carries usage
     print("end to end ok")
 
 
@@ -934,11 +999,141 @@ def cookie_file_checks() -> None:
     print("cookie file ok")
 
 
+def local_backend_checks() -> None:
+    """Local OpenAI backends: chosen by the model id's prefix, passed through unchanged and live,
+    listed next to Venice's models; a backend that is down breaks neither the list nor Venice,
+    and a prompt for a local model never goes to Venice."""
+    import socket
+    import urllib.error
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    got = []  # (path, authorization, body) of every chat request the fake backend saw
+    chunk = lambda delta: ("data: %s\n\n" % json.dumps({"choices": [{"index": 0, "delta": delta}]})).encode()
+    CALL = [{"index": 0, "id": "c1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]
+
+    class FakeLocal(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            page = json.dumps({"object": "list", "data": [{"id": "qwen3:8b"}, {"id": "org/model-x"}]}).encode()
+            self.send_response(200 if self.path == "/v1/models" else 404)
+            self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page)
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            got.append((self.path, self.headers.get("Authorization"), body))
+            if body["model"] == "missing":
+                page = b'{"error":{"message":"model not found"}}'
+                self.send_response(404); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page)
+                return
+            if not body.get("stream"):
+                page = json.dumps({"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": CALL}}]}).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page)
+                return
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            self.wfile.write(chunk({"content": "PO"})); self.wfile.flush()
+            time.sleep(0.6)  # the first piece must reach the client before the reply ends
+            self.wfile.write(chunk({"tool_calls": CALL}) + b"data: [DONE]\n\n")
+
+    fake = ThreadingHTTPServer(("127.0.0.1", 0), FakeLocal)
+    bridge = ThreadingHTTPServer(("127.0.0.1", 0), vb.OpenAIBridgeHandler)
+    for srv in (fake, bridge):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    sock = socket.socket(); sock.bind(("127.0.0.1", 0)); dead = sock.getsockname()[1]; sock.close()
+    base = "http://127.0.0.1:%d" % bridge.server_address[1]
+    old = vb.BACKENDS, vb.BACKENDS_FILE, vb.VENICE.list_models, vb._open_upstream, vb.VENICE.quota_until
+    venice_calls = []
+
+    def no_venice(payload, max_time=None):
+        venice_calls.append(payload["modelId"])
+        return None, (502, {"error": {"message": "fake venice", "type": "test"}})
+
+    def post(model, stream=False):
+        req = urllib.request.Request(base + "/v1/chat/completions", json.dumps({
+            "model": model, "stream": stream, "tools": [{"type": "function", "function": {"name": "read"}}],
+            "messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "x"}]}).encode(),
+            {"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    try:
+        vb.BACKENDS = [{"name": "ollama", "base_url": "http://127.0.0.1:%d/v1" % fake.server_address[1], "api_key": "k"},
+                       {"name": "lmstudio", "base_url": "http://127.0.0.1:%d/v1" % dead}]
+        vb._open_upstream = no_venice
+        # the prefix decides, with or without the provider name in front; anything else is Venice's
+        assert vb._resolve_backend("venice-bridge/ollama/qwen3:8b") == (vb.BACKENDS[0], "qwen3:8b")
+        assert vb._resolve_backend("ollama/org/model-x")[1] == "org/model-x"
+        assert vb._resolve_backend("deepseek-v4-1-flash") == (None, "deepseek-v4-1-flash")
+        assert vb._resolve_backend("venice-bridge/ollamax/m") == (None, "ollamax/m")
+
+        # the list: Venice's models and the reachable backend's, prefixed; the dead backend is skipped
+        vb.VENICE.list_models = lambda: [{"id": "venice-m", "object": "model"}]
+        ids = lambda: [m["id"] for m in json.load(urllib.request.urlopen(base + "/v1/models", timeout=10))["data"]]
+        assert ids() == ["venice-auto", "venice-m", "ollama/qwen3:8b", "ollama/org/model-x"]
+        def venice_down():
+            raise RuntimeError("logged out")
+        vb.VENICE.list_models = venice_down  # Venice down: the virtual + local models are still listed
+        assert ids() == ["venice-auto", "ollama/qwen3:8b", "ollama/org/model-x"]
+
+        # passthrough: the request as the client sent it (tools and system message included), only the model id changed
+        vb.VENICE.quota_until = time.time() + 600  # Venice's quota lock does not apply to a local model
+        code, out = post("venice-bridge/ollama/qwen3:8b")
+        path, auth, body = got[-1]
+        assert code == 200 and json.loads(out)["choices"][0]["message"]["tool_calls"] == CALL
+        assert path == "/v1/chat/completions" and auth == "Bearer k" and body["model"] == "qwen3:8b"
+        assert body["tools"][0]["function"]["name"] == "read" and body["messages"][0] == {"role": "system", "content": "S"}
+        assert "[TOOLS]" not in json.dumps(body)  # no tool emulation
+        vb.VENICE.quota_until = 0.0
+        # streamed: relayed while it is written, native tool_calls untouched
+        req = urllib.request.Request(base + "/v1/chat/completions", json.dumps({
+            "model": "ollama/qwen3:8b", "stream": True, "messages": [{"role": "user", "content": "x"}]}).encode(),
+            {"Content-Type": "application/json"})
+        t0, first, lines = time.time(), None, []
+        with urllib.request.urlopen(req, timeout=30) as r:
+            assert r.headers["Content-Type"] == "text/event-stream"
+            for line in r:
+                first = first if first is not None else time.time() - t0
+                lines.append(line)
+        assert first < 0.45 and time.time() - t0 > 0.55, (first, time.time() - t0)
+        assert b"".join(lines) == chunk({"content": "PO"}) + chunk({"tool_calls": CALL}) + b"data: [DONE]\n\n"
+        # the backend's own error reaches the client as it is
+        code, out = post("ollama/missing")
+        assert code == 404 and "model not found" in out
+        # a backend that is down: a 502 that names it, and the prompt never goes to Venice
+        code, out = post("lmstudio/some-model")
+        assert code == 502 and "lmstudio" in out and "local_backend_error" in out
+        assert venice_calls == []
+        # every other model still takes the Venice path
+        assert post("deepseek-v4-1-flash")[0] == 502 and venice_calls == ["deepseek-v4-1-flash"]
+
+        # the backends file: a list or {"backends": [...]}, an empty list = none, no file = the defaults
+        vb.BACKENDS, vb.BACKENDS_FILE = None, os.path.join(STATE_DIR, "backends.json")
+        assert vb._backends() == vb.DEFAULT_BACKENDS
+        open(vb.BACKENDS_FILE, "w").write('{"backends":[{"name":"mlx","base_url":"http://127.0.0.1:8080/v1/"},{"name":"bad"}]}')
+        assert vb._backends() == [{"name": "mlx", "base_url": "http://127.0.0.1:8080/v1", "api_key": None}]
+        open(vb.BACKENDS_FILE, "w").write("[]")
+        assert vb._backends() == [] and vb._resolve_backend("ollama/x") == (None, "ollama/x")
+        open(vb.BACKENDS_FILE, "w").write("{not json")
+        assert vb._backends() == vb.DEFAULT_BACKENDS
+    finally:
+        vb.BACKENDS, vb.BACKENDS_FILE, vb.VENICE.list_models, vb._open_upstream, vb.VENICE.quota_until = old
+        vb.BACKENDS = []
+    print("local backends ok")
+
+
 if __name__ == "__main__":
     cookie_file_checks()
     try:
         session_checks()
         main()
         end_to_end()
+        local_backend_checks()
     finally:
         shutil.rmtree(STATE_DIR, ignore_errors=True)

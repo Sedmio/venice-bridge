@@ -1,41 +1,59 @@
 # venice-bridge
 
-> venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.
+> venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.
 
-Unofficial: not affiliated with, endorsed by, or supported by Venice.ai. It uses undocumented web endpoints and your own logged-in session, which may be against Venice's terms of service. Use your own account only. Version 0.1.0, MIT.
+Unofficial: not affiliated with, endorsed by, or supported by Venice.ai. It uses undocumented web endpoints and your own logged-in session, which may be against Venice's terms of service. Use your own account only. Version 0.2.0, MIT.
 
 ## What it does
 
-- One Python file (`venice_bridge.py`) plus `tolerant_parser.py`; an HTTP server on `127.0.0.1:18891`.
-- Endpoints: `POST /v1/chat/completions` (streaming and non-streaming), `GET /v1/models`, `GET /health`, `POST /reload`.
+- Two local processes. The bridge (`venice_bridge.py` plus `tolerant_parser.py`) serves OpenAI Chat Completions on `127.0.0.1:18891`: `POST /v1/chat/completions` (streaming and non-streaming), `GET /v1/models`, `GET /health`, `POST /reload`.
+- The optional adapter (`venice_adapters.py`, stdlib only) on `127.0.0.1:18892` translates Anthropic Messages (`POST /v1/messages`, `/v1/messages/count_tokens`) and OpenAI Responses (`POST /v1/responses`) to Chat Completions and forwards them to the bridge. That is how Claude Code and Codex CLI work.
 - Forwards to the venice.ai web app's own backend with your browser login (`__client` cookie of `clerk.venice.ai`). No Venice API key. Tested on a paid Venice web plan (Pro).
 - `VENICE_BRIDGE_ROUTE=auto` (default) uses Venice's plain chat route (no Venice agent loop, no swallowed calls) and falls back to the agent route for a model the chat route does not know; `chat` and `agent` force one route.
 - Emulates tool calling in text (Venice's web routes hide client tools) and returns real OpenAI `tool_calls`, with a tolerant parser, native and tagged call readers, tool and argument routing, in-bridge retries, a judge for early stops, and a stream gate.
+- Local models: a model id `<backend>/<model>` (e.g. `ollama/qwen3:8b`, `lmstudio/<id>`) goes straight to that local OpenAI-compatible server, with no Venice login, tool emulation or quota. Backends are configured in `~/.config/venice-bridge/backends.json`.
+- Opt-in Venice web search: model suffix `:web` (web search and URL scraping) or `:xsearch` (X search), or `VENICE_WEB=1` / `VENICE_X_SEARCH=1`. Off by default.
+- Opt-in reasoning on the chat route, only for requests that declare no tools: model suffix `:think` (aliases `:reason`, `:reasoning`; combinable, e.g. `:web:think`), `VENICE_REASONING=1`, or `reasoning_effort` `medium` / `high`. The chain of thought comes back as `reasoning_content` (message field; `delta.reasoning_content` when streaming). With tools, `:think` and `VENICE_REASONING` are ignored, so they have no effect in OpenCode / Claude Code / Codex agent loops; an effort above `low` still sets Venice's reasoning switch there, so leave `reasoning_effort` unset in agent loops.
+- Model list: `GET /v1/models` hides credit models and end-to-end-encrypted `e2ee-*` models; `VENICE_EXCLUDE_MODELS` hides more by glob. Hidden models can still be requested by id.
+- `venice-auto` virtual model (listed first): the first Venice id in `VENICE_AUTO_MODELS` (default `deepseek-v4-1-flash-uncensored,ollama/qwen3:8b`), switching to the first local `<backend>/<model>` while the bridge knows the daily quota is used up. The request that hits the limit still fails once (`403` `venice_quota_exhausted`); the local backend must be running; `POST /reload` clears the over-quota state.
+- Response cache: a byte-identical repeat request is answered from memory without a Venice call (`VENICE_BRIDGE_CACHE=0` disables).
+- `temperature` and `top_p` are forwarded when the client sets them; `max_tokens` is ignored by the Venice route.
 
 ## Install
 
-- Requirements: macOS, Python 3.10+, `pip install curl_cffi`, OpenCode or any OpenAI Chat Completions client.
+- Requirements: macOS, Python 3.10+, `pip install curl_cffi`, and a client: OpenCode, the Claude Code CLI, Codex CLI, or any OpenAI Chat Completions client.
 - Save the `__client` cookie value to `~/.config/venice-bridge/client-cookie.txt` (mode 600).
 - Run `python3 venice_bridge.py`, check `curl -s http://127.0.0.1:18891/health`.
+- For Claude Code or Codex also run `python3 venice_adapters.py`, check `curl -s http://127.0.0.1:18892/health`.
 
 ## Use
 
 - OpenCode: copy the provider block from `examples/opencode.json` into `~/.config/opencode/opencode.json`, then `opencode -m venice-bridge/deepseek-v4-1-flash-uncensored`.
-- Autostart: `examples/com.example.venice-bridge.plist` (launchd template).
-- Offline self-check: `python3 test_venice_bridge.py`.
+- Claude Code: `ln -s "$PWD/claude-venice" ~/.local/bin/claude-venice`, then `claude-venice` or `claude-venice -m <venice-model-id>`. It uses an isolated profile `~/.claude-venice` and, by default, adds `--dangerously-skip-permissions` (Claude Code then runs tools without asking); opt out with `VENICE_CLAUDE_SKIP_PERMS=0` or your own `--permission-mode`.
+- Codex CLI: `VB_KEY=local codex exec --skip-git-repo-check -c 'model_providers.vb={name="vb",base_url="http://127.0.0.1:18892/v1",wire_api="responses",env_key="VB_KEY"}' -c model_provider=vb -m deepseek-v4-1-flash-uncensored "<task>"`. Codex's namespace tools (MCP servers, multi-agent) and its built-in `web_search` do not pass through.
+- Any OpenAI-compatible client: base URL `http://127.0.0.1:18891/v1`, any API key. From a Docker container: `http://host.docker.internal:18891/v1` (measured with Docker Desktop on macOS); no need to bind to 0.0.0.0.
+- Autostart: `examples/com.example.venice-bridge.plist` and `examples/com.example.venice-adapters.plist` (launchd templates).
+- Offline self-checks: `python3 test_venice_bridge.py` and `python3 test_venice_adapters.py`.
+
+## Cost model
+
+- The web plan is limited by a daily request quota, not by tokens. `usage` numbers are estimates (about 4 characters per token; Venice returns no token counts). Fewer requests save quota; shorter prompts do not. `/health` shows `chat_quota.remaining` and `resets_in_min`.
+- The quota is plan-wide: every Venice model shares it. To keep working after it runs out, use `venice-auto` with a local fallback.
 
 ## Limits
 
-- macOS only so far (Linux and Windows untested).
-- No Anthropic Messages (`/v1/messages`) or OpenAI Responses (`/v1/responses`) API, so Claude Code and Codex CLI do not work with it directly.
-- No images. With tools, short replies are sent only when complete. Tool calling is emulated; open models sometimes need a retry.
+- macOS only so far (Linux and Windows untested). No images.
+- With tools, short replies are sent only when complete. Tool calling is emulated; open models sometimes need a retry.
+- Venice's fast models are weak at long agentic chains (measured on one machine, one account): good for cheap exploratory runs, not high-stakes work.
 - The agent route needs a paid plan (a free account gets `403 creator_access_required`); a free account has a very small chat quota.
 
 ## Links
 
 - [Documentation](https://nsozturk.github.io/venice-bridge/): full docs portal
 - [Full docs as plain text](https://nsozturk.github.io/venice-bridge/llms-full.txt)
+- [Tool routing reference](https://github.com/nsozturk/venice-bridge/blob/main/docs/TOOL_ROUTING.md)
 - [Repository](https://github.com/nsozturk/venice-bridge)
 - [README](https://github.com/nsozturk/venice-bridge/blob/main/README.md)
 - [AGENTS.md](https://github.com/nsozturk/venice-bridge/blob/main/AGENTS.md): contract for coding agents
 - [GLOBAL_AGENT_RULE.md](https://github.com/nsozturk/venice-bridge/blob/main/GLOBAL_AGENT_RULE.md): snippet for your own agent's instructions
+- [Releases](https://github.com/nsozturk/venice-bridge/releases)

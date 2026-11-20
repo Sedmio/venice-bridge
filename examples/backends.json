@@ -1,0 +1,17 @@
+{
+  "backends": [
+    {
+      "name": "ollama",
+      "base_url": "http://127.0.0.1:11434/v1"
+    },
+    {
+      "name": "lmstudio",
+      "base_url": "http://127.0.0.1:1234/v1"
+    },
+    {
+      "name": "llamacpp",
+      "base_url": "http://127.0.0.1:8080/v1",
+      "api_key": null
+    }
+  ]
+}

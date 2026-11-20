@@ -3,25 +3,25 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>venice-bridge: Venice web subscription for OpenCode, with tool calls</title>
-<meta name="description" content="venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.">
-<meta name="keywords" content="venice-bridge, venice.ai, venice, opencode, openai-compatible, local proxy, tool calling, coding agent, macos, opencode-venice-web alternative">
+<title>venice-bridge — use a venice.ai web subscription from OpenCode, Claude Code and Codex</title>
+<meta name="description" content="venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.">
+<meta name="keywords" content="venice-bridge, venice.ai, venice, opencode, claude code, codex cli, anthropic messages api, openai responses api, openai-compatible, local proxy, tool calling, coding agent, ollama, lm studio, macos, opencode-venice-web alternative">
 <meta name="robots" content="index, follow">
 <link rel="canonical" href="https://nsozturk.github.io/venice-bridge/">
 
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://nsozturk.github.io/venice-bridge/">
 <meta property="og:site_name" content="venice-bridge documentation">
-<meta property="og:title" content="venice-bridge: use a venice.ai web subscription from OpenCode, with tool calls">
-<meta property="og:description" content="venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.">
+<meta property="og:title" content="venice-bridge: a venice.ai web subscription for OpenCode, Claude Code and Codex">
+<meta property="og:description" content="venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.">
 <meta property="og:image" content="https://nsozturk.github.io/venice-bridge/assets/banner.png">
 <meta property="og:image:width" content="2560">
 <meta property="og:image:height" content="720">
 
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:url" content="https://nsozturk.github.io/venice-bridge/">
-<meta name="twitter:title" content="venice-bridge: use a venice.ai web subscription from OpenCode, with tool calls">
-<meta name="twitter:description" content="venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.">
+<meta name="twitter:title" content="venice-bridge: a venice.ai web subscription for OpenCode, Claude Code and Codex">
+<meta name="twitter:description" content="venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.">
 <meta name="twitter:image" content="https://nsozturk.github.io/venice-bridge/assets/banner.png">
 
 <script type="application/ld+json">
@@ -29,10 +29,10 @@
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
   "name": "venice-bridge",
-  "description": "venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.",
+  "description": "venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.",
   "operatingSystem": "macOS",
   "applicationCategory": "DeveloperApplication",
-  "softwareVersion": "0.1.0",
+  "softwareVersion": "0.2.0",
   "license": "https://opensource.org/licenses/MIT",
   "codeRepository": "https://github.com/nsozturk/venice-bridge",
   "downloadUrl": "https://github.com/nsozturk/venice-bridge",
@@ -63,7 +63,27 @@
     {
       "@type": "Question",
       "name": "Does it work with Claude Code or Codex?",
-      "acceptedAnswer": {"@type": "Answer", "text": "Not directly. The bridge speaks OpenAI Chat Completions (/v1/chat/completions) only. It does not implement the Anthropic Messages API (/v1/messages) or the OpenAI Responses API (/v1/responses), which Claude Code and Codex CLI use."}
+      "acceptedAnswer": {"@type": "Answer", "text": "Yes, through the adapter. Run python3 venice_adapters.py next to the bridge: it serves the Anthropic Messages API (/v1/messages) and the OpenAI Responses API (/v1/responses) on 127.0.0.1:18892 and forwards them to the bridge. For Claude Code the claude-venice launcher sets everything up in an isolated profile (~/.claude-venice) and, by default, skips Claude Code's permission prompts (opt out with VENICE_CLAUDE_SKIP_PERMS=0). Codex CLI is pointed at the adapter with -c model_providers settings; its MCP servers, multi-agent tools and built-in web_search do not pass through."}
+    },
+    {
+      "@type": "Question",
+      "name": "Does it run local models?",
+      "acceptedAnswer": {"@type": "Answer", "text": "Yes. A model id with a backend prefix, such as ollama/qwen3:8b or lmstudio/<id>, is passed straight to that local OpenAI-compatible server, with no Venice login, no tool emulation and no quota. Ollama (127.0.0.1:11434) and LM Studio (127.0.0.1:1234) are the defaults; others such as llama.cpp or MLX servers are added in ~/.config/venice-bridge/backends.json. GET /v1/models lists the models of every reachable local backend next to the Venice models."}
+    },
+    {
+      "@type": "Question",
+      "name": "What happens when my daily Venice quota runs out?",
+      "acceptedAnswer": {"@type": "Answer", "text": "Venice requests answer 403 venice_quota_exhausted with the reset time until the quota resets. The quota is plan-wide, so switching to another Venice model does not help. To keep working, use the virtual model venice-auto: it serves a Venice model normally and a local model (default ollama/qwen3:8b) while the quota is used up. The request that hits the limit still fails once, the local backend must be running, and a local model may differ in quality, speed and context size."}
+    },
+    {
+      "@type": "Question",
+      "name": "Does it cost tokens?",
+      "acceptedAnswer": {"@type": "Answer", "text": "No. The Venice web plan is limited by a daily request quota, not by tokens. The usage numbers the bridge returns are estimates (about 4 characters per token), because Venice returns no token counts. Fewer requests save quota; shorter prompts do not. GET /health shows chat_quota.remaining and resets_in_min, and a byte-identical repeat request is answered from the response cache without a Venice call."}
+    },
+    {
+      "@type": "Question",
+      "name": "Can I use it from Docker?",
+      "acceptedAnswer": {"@type": "Answer", "text": "Yes. A container reaches a bridge bound to 127.0.0.1 on the host through http://host.docker.internal:18891/v1 (measured with Docker Desktop on macOS). Binding the bridge to 0.0.0.0 is not needed and not recommended: the bridge has no authentication of its own."}
     },
     {
       "@type": "Question",
@@ -78,12 +98,12 @@
     {
       "@type": "Question",
       "name": "Where do my chats go?",
-      "acceptedAnswer": {"@type": "Answer", "text": "From your client to the bridge on 127.0.0.1, then to the venice.ai web backend under your own account (clerk.venice.ai for login, outerface.venice.ai for inference), as with the web app. When the judge is on, a short excerpt of the turn is sent to Venice as a second request. The bridge keeps no conversation history: each request body sits in a private temporary folder (mode 0700) only while its upstream call runs and is deleted afterwards. Its log records sizes, timings and outcomes and can include short excerpts of unreadable replies or swallowed tool calls."}
+      "acceptedAnswer": {"@type": "Answer", "text": "From your client to the bridge on 127.0.0.1, then to the venice.ai web backend under your own account (clerk.venice.ai for login, outerface.venice.ai for inference), as with the web app. When the judge is on, a short excerpt of the turn is sent to Venice as a second request. The bridge keeps no conversation history: each request body sits in a private temporary folder (mode 0700) only while its upstream call runs and is deleted afterwards. Its log records sizes, timings and outcomes and can include short excerpts of unreadable replies or swallowed tool calls. Exceptions: a model with a local backend prefix (for example ollama/...) goes only to that local server, never to Venice; successful replies are kept in the in-memory response cache until their time limit (1 hour by default, VENICE_BRIDGE_CACHE=0 turns it off) and are lost when the bridge stops; with a :web or :xsearch suffix Venice also searches the web on its side; and when VENICE_ADAPTER_DUMP is set, the adapter writes every request body to that folder."}
     },
     {
       "@type": "Question",
       "name": "Is it an alternative to opencode-venice-web?",
-      "acceptedAnswer": {"@type": "Answer", "text": "Yes, it is an independent Python implementation of the same idea. opencode-venice-web (Node) is the most mature Venice web proxy and sends the full schema of every tool; venice-bridge is one Python file that sends a tiered tool list within a fixed budget. Its tolerant tool-call parser is a port of the opencode-venice-web parser (MIT)."}
+      "acceptedAnswer": {"@type": "Answer", "text": "Yes, it is an independent Python implementation of the same idea. opencode-venice-web (Node) is the most mature Venice web proxy and sends the full schema of every tool; venice-bridge is a small Python bridge (plus an optional adapter for Claude Code and Codex) that sends a tiered tool list within a fixed budget. Its tolerant tool-call parser is a port of the opencode-venice-web parser (MIT)."}
     }
   ]
 }
@@ -187,6 +207,7 @@ th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom
 th { background: var(--card-bg); color: var(--text-strong); font-weight: 600; white-space: nowrap; }
 tr:last-child td { border-bottom: 0; }
 td.num { white-space: nowrap; }
+td.num code { overflow-wrap: normal; }
 
 /* Callouts and cards */
 .callout { border: 1px solid var(--border); border-left: 4px solid var(--accent); background: var(--card-bg); border-radius: 10px; padding: 14px 18px; margin: 18px 0 22px; }
@@ -255,7 +276,7 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
 <body>
 
 <header class="navbar">
-  <a href="#overview" class="brand">venice-bridge <span class="badge">v0.1.0</span></a>
+  <a href="#overview" class="brand">venice-bridge <span class="badge">v0.2.0</span></a>
   <div class="nav-actions">
     <a href="#quick-start" class="nav-link">Quick start</a>
     <a href="#how-it-works" class="nav-link">How it works</a>
@@ -284,8 +305,24 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
         <a href="#autostart" class="nav-item">Autostart (launchd)</a>
       </div>
       <div class="nav-group">
+        <div class="nav-title">Clients</div>
+        <a href="#claude-code" class="nav-item">Claude Code (claude-venice)</a>
+        <a href="#codex" class="nav-item">Codex CLI</a>
+        <a href="#local-models" class="nav-item">Local models</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-title">Features</div>
+        <a href="#venice-auto" class="nav-item">Model list and venice-auto</a>
+        <a href="#web-search" class="nav-item">Web search (opt-in)</a>
+        <a href="#reasoning" class="nav-item">Reasoning (opt-in)</a>
+        <a href="#response-cache" class="nav-item">Response cache</a>
+        <a href="#quota" class="nav-item">Quota and cost model</a>
+      </div>
+      <div class="nav-group">
         <div class="nav-title">Internals</div>
         <a href="#how-it-works" class="nav-item">How it works</a>
+        <a href="#processes" class="nav-item sub" data-parent="how-it-works">Two processes</a>
+        <a href="#sampling" class="nav-item sub" data-parent="how-it-works">Settings sent to Venice</a>
         <a href="#routes" class="nav-item sub" data-parent="how-it-works">Routes</a>
         <a href="#tool-emulation" class="nav-item sub" data-parent="how-it-works">Tool emulation</a>
         <a href="#tolerant-parser" class="nav-item sub" data-parent="how-it-works">Tolerant parser</a>
@@ -302,7 +339,12 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
       <div class="nav-group">
         <div class="nav-title">Reference</div>
         <a href="#configuration" class="nav-item">Configuration</a>
+        <a href="#config-bridge" class="nav-item sub" data-parent="configuration">Bridge variables</a>
+        <a href="#config-adapter" class="nav-item sub" data-parent="configuration">Adapter variables</a>
         <a href="#api" class="nav-item">API reference</a>
+        <a href="#api-bridge" class="nav-item sub" data-parent="api">Bridge (:18891)</a>
+        <a href="#api-adapter" class="nav-item sub" data-parent="api">Adapter (:18892)</a>
+        <a href="#tests" class="nav-item">Tests</a>
         <a href="#performance" class="nav-item">Measured performance</a>
         <a href="#troubleshooting" class="nav-item">Troubleshooting</a>
       </div>
@@ -318,13 +360,13 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
 
   <main class="content" id="content">
     <div class="banner-hero">
-      <img src="assets/banner.png" onerror="this.src='../assets/banner.png'" alt="venice-bridge banner: a local bridge from OpenCode to a venice.ai web subscription" width="1280" height="360">
+      <img src="assets/banner.png" onerror="this.src='../assets/banner.png'" alt="venice-bridge banner: a local bridge from coding agents to a venice.ai web subscription" width="1280" height="360">
     </div>
 
     <section id="overview">
       <h1>venice-bridge</h1>
-      <p class="lead">venice-bridge is a free, open-source local bridge for macOS that lets OpenCode and other OpenAI-compatible coding agents use a venice.ai web subscription, with working tool calls.</p>
-      <p>It is one Python file (<code>venice_bridge.py</code>, about 1,900 lines) plus <code>tolerant_parser.py</code>. It runs an HTTP server on <code>127.0.0.1:18891</code> that speaks OpenAI Chat Completions, and forwards each request to the backend of the venice.ai <strong>web app</strong>, authenticated with your own browser login. It does not use the paid Venice API and needs no API key.</p>
+      <p class="lead">venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.</p>
+      <p>It is two small local processes. The <strong>bridge</strong> (<code>venice_bridge.py</code>, about 2,400 lines, plus <code>tolerant_parser.py</code>) runs an HTTP server on <code>127.0.0.1:18891</code> that speaks OpenAI Chat Completions, and forwards each request to the backend of the venice.ai <strong>web app</strong>, authenticated with your own browser login. The optional <strong>adapter</strong> (<code>venice_adapters.py</code>, standard library only) runs on <code>127.0.0.1:18892</code> and translates the Anthropic Messages and OpenAI Responses APIs to Chat Completions, so Claude Code and Codex CLI work too. It does not use the paid Venice API and needs no API key.</p>
 
       <div class="callout warn" role="note">
         <div class="callout-title">Disclaimer: unofficial, read before use</div>
@@ -337,10 +379,16 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
       </div>
 
       <div class="grid">
-        <div class="card"><h4>OpenAI-compatible</h4><p><code>POST /v1/chat/completions</code> (streaming and non-streaming), <code>GET /v1/models</code>, <code>GET /health</code>, <code>POST /reload</code>.</p></div>
+        <div class="card"><h4>OpenAI and Anthropic APIs</h4><p>Bridge: <code>POST /v1/chat/completions</code>, <code>GET /v1/models</code>, <code>GET /health</code>, <code>POST /reload</code>. Adapter: <code>POST /v1/messages</code> and <code>POST /v1/responses</code>.</p></div>
         <div class="card"><h4>Working tool calls</h4><p>Venice's web routes hide client tools from the model, so the bridge emulates them in text and returns real OpenAI <code>tool_calls</code>.</p></div>
-        <div class="card"><h4>Web subscription, no API key</h4><p>Uses the <code>__client</code> cookie of <code>clerk.venice.ai</code>. Tested on a paid Venice web plan (Pro).</p></div>
-        <div class="card"><h4>Honest limits</h4><p>macOS only so far. No Anthropic Messages or OpenAI Responses API. No images. With tools, short replies are sent only when complete. Open models sometimes need a retry.</p></div>
+        <div class="card"><h4>Web subscription, no API key</h4><p>Uses the <code>__client</code> cookie of <code>clerk.venice.ai</code>. Tested on a paid Venice web plan (Pro). Limited by requests per day, not tokens.</p></div>
+        <div class="card"><h4>Local models too</h4><p><code>ollama/&lt;model&gt;</code>, <code>lmstudio/&lt;id&gt;</code> or your own backend: passed straight through, no Venice login, no quota.</p></div>
+        <div class="card"><h4>Honest limits</h4><p>macOS only so far. No images. With tools, short replies are sent only when complete. Open models sometimes need a retry.</p></div>
+      </div>
+
+      <div class="callout" role="note">
+        <div class="callout-title">Model quality</div>
+        <p>Venice's fast models are weak at long agentic chains. In a small test of 5 one-tool runs per model through Claude Code, none of the three fast models produced a clean correct final answer every time, and one invented a cited weather report (one machine, one account). Good for cheap exploratory runs, not for high-stakes work.</p>
       </div>
     </section>
 
@@ -348,12 +396,16 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
       <h2>Screenshots</h2>
       <div class="shots">
         <figure>
-          <a href="assets/screenshots/01-health-and-chat.png"><img src="assets/screenshots/01-health-and-chat.png" alt="Terminal: the offline self-check prints cookie file ok, session ok, ok, end to end ok; GET /health returns ok true with the remaining chat quota; a chat completion answers PONG" width="1600" height="1000" loading="lazy"></a>
+          <a href="assets/screenshots/01-health-and-chat.png"><img src="assets/screenshots/01-health-and-chat.png" alt="Terminal: the offline self-check passes; GET /health returns ok true with the remaining chat quota; a chat completion answers PONG" width="1600" height="1000" loading="lazy"></a>
           <figcaption>Self-check, health check with the remaining chat quota, and a first chat completion.</figcaption>
         </figure>
         <figure>
           <a href="assets/screenshots/02-opencode-tool-run.png"><img src="assets/screenshots/02-opencode-tool-run.png" alt="Terminal: a request that declares a read tool; the model's plain-text JSON reply comes back from the bridge as an OpenAI tool_calls message with finish_reason tool_calls" width="1600" height="1000" loading="lazy"></a>
           <figcaption>A model's plain-text reply becomes a real OpenAI <code>tool_calls</code> message.</figcaption>
+        </figure>
+        <figure>
+          <a href="assets/screenshots/03-claude-code-adapter.png"><img src="assets/screenshots/03-claude-code-adapter.png" alt="Terminal: an Anthropic Messages request to the adapter on port 18892 that declares a Read tool comes back as a tool_use block with stop_reason tool_use" width="1600" height="1000" loading="lazy"></a>
+          <figcaption>The adapter answers Claude Code in Anthropic's shape: a <code>tool_use</code> block.</figcaption>
         </figure>
       </div>
     </section>
@@ -364,9 +416,9 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
         <li><strong>macOS.</strong> The bridge streams through the system <code>curl</code>, which passes Cloudflare. Linux and Windows are untested.</li>
         <li><strong>Python 3.10+</strong> and <code>curl_cffi</code> (<code>pip install curl_cffi</code>).</li>
         <li><strong>A venice.ai web account</strong>, logged in in your browser. Everything was tested on a paid plan (Pro). The agent route needs a paid plan (a free account gets <code>403 creator_access_required</code>); a free account has a very small chat quota.</li>
-        <li><strong>OpenCode</strong>, or any client that speaks OpenAI Chat Completions.</li>
+        <li><strong>A client:</strong> OpenCode or any client that speaks OpenAI Chat Completions (bridge only); the Claude Code CLI or Codex CLI (bridge plus adapter).</li>
       </ul>
-      <p>Not supported: the Anthropic Messages API (<code>/v1/messages</code>) and the OpenAI Responses API (<code>/v1/responses</code>), so Claude Code and Codex CLI do not work with it directly.</p>
+      <p>The adapter needs nothing beyond the Python standard library. The <code>claude-venice</code> launcher is a bash script and needs <code>claude</code> and <code>curl</code> on your <code>PATH</code>.</p>
     </section>
 
     <section id="quick-start">
@@ -391,12 +443,16 @@ pip install curl_cffi</code></pre>
       <h3>3. Run the bridge</h3>
       <pre><code>python3 venice_bridge.py                 <span class="c"># default 127.0.0.1:18891</span>
 python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
-      <p>It prints <code>[+] Venice AI Bridge listening on http://127.0.0.1:18891/v1</code>. Logs go to stderr.</p>
+      <p>It prints <code>[+] Venice AI Bridge listening on http://127.0.0.1:18891/v1</code>. Logs go to stderr. <code>VENICE_BRIDGE_HOST</code> sets the bind address too; keep it on <code>127.0.0.1</code>: the bridge has no authentication of its own.</p>
+      <p>For Claude Code or Codex CLI, also start the adapter in a second terminal:</p>
+      <pre><code>python3 venice_adapters.py               <span class="c"># default 127.0.0.1:18892, forwards to the bridge</span></code></pre>
 
       <h3>4. Check it</h3>
       <pre><code>curl -s http://127.0.0.1:18891/health</code></pre>
       <p>A working login answers <code>{"ok": true, "venice_session": "active", "chat_quota": {...}}</code> with the remaining web chat quota. An offline self-check needs no network:</p>
-      <pre><code>python3 test_venice_bridge.py   <span class="c"># prints: cookie file ok, session ok, ok, end to end ok</span></code></pre>
+      <pre><code>python3 test_venice_bridge.py     <span class="c"># prints: cookie file ok, session ok, ok, end to end ok, local backends ok</span>
+python3 test_venice_adapters.py   <span class="c"># prints: messages ok, responses ok</span></code></pre>
+      <p>See <a href="#tests">Tests</a> for what they cover.</p>
 
       <h3>5. Add the provider to OpenCode</h3>
       <p>Copy the provider block from <a href="https://github.com/nsozturk/venice-bridge/blob/main/examples/opencode.json"><code>examples/opencode.json</code></a> into <code>~/.config/opencode/opencode.json</code> (or a project <code>opencode.json</code>). Shortened to one model it looks like this:</p>
@@ -420,10 +476,11 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
     }
   }
 }</code></pre>
-      <p>The example config lists <code>deepseek-v4-1-flash-uncensored</code>, <code>deepseek-v4-1-flash</code>, <code>z-ai-glm-5-3-flash</code>, <code>kimi-k2-5</code>, <code>default</code>, <code>qwen3-coder-480b-a35b-instruct-turbo</code>, <code>qwen3-6-27b</code>, <code>zai-org-glm-5.2</code> and <code>venice-uncensored-1-2</code>. <code>GET /v1/models</code> lists whatever your account's web catalogue offers without credits.</p>
+      <p>The example config lists <code>deepseek-v4-1-flash-uncensored</code>, <code>deepseek-v4-1-flash</code>, <code>z-ai-glm-5-3-flash</code>, <code>kimi-k2-5</code>, <code>default</code>, <code>qwen3-coder-480b-a35b-instruct-turbo</code>, <code>qwen3-6-27b</code>, <code>zai-org-glm-5.2</code> and <code>venice-uncensored-1-2</code>. <code>GET /v1/models</code> lists whatever your account's web catalogue offers without credits, plus the virtual <a href="#venice-auto"><code>venice-auto</code></a> model.</p>
 
       <h3>6. First run</h3>
       <pre><code>opencode -m venice-bridge/deepseek-v4-1-flash-uncensored</code></pre>
+      <p>Any other OpenAI-compatible client works with base URL <code>http://127.0.0.1:18891/v1</code> and any API key. For Claude Code see <a href="#claude-code">Claude Code (claude-venice)</a>, for Codex see <a href="#codex">Codex CLI</a>.</p>
     </section>
 
     <section id="autostart">
@@ -435,6 +492,134 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
         <li>Load it:</li>
       </ol>
       <pre><code>launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.venice-bridge.plist</code></pre>
+      <p>The adapter has its own template, <a href="https://github.com/nsozturk/venice-bridge/blob/main/examples/com.example.venice-adapters.plist"><code>examples/com.example.venice-adapters.plist</code></a>, with the same settings; it logs to <code>venice_adapters.log</code>.</p>
+      <pre><code>launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.venice-adapters.plist</code></pre>
+    </section>
+
+    <section id="claude-code">
+      <h2>Claude Code (claude-venice)</h2>
+      <p><code>claude-venice</code> is a bash launcher in the repository root. It runs the Claude Code CLI against the adapter in an isolated profile, <code>~/.claude-venice</code> (<code>CLAUDE_CONFIG_DIR</code>), so your normal <code>claude</code> install, its login and its settings are not touched. It unsets <code>ANTHROPIC_API_KEY</code>, sets <code>ANTHROPIC_BASE_URL=http://127.0.0.1:18892</code> and a filler <code>ANTHROPIC_AUTH_TOKEN</code>, and points <code>ANTHROPIC_MODEL</code> and the opus/sonnet/haiku default-model variables at the chosen Venice model id.</p>
+
+      <div class="callout warn" role="note">
+        <div class="callout-title">Warning: claude-venice skips permission prompts by default</div>
+        <p>It adds <code>--dangerously-skip-permissions</code> to every run, so <strong>Claude Code runs tools (shell commands, file edits) without asking you</strong>. The reason: Venice's fast models cannot drive Claude Code's auto-mode safety classifier, which then blocks with "Auto mode could not evaluate this action and is blocking it for safety". Run it only in a folder you are ready to lose changes in.</p>
+        <p>To turn it off, set <code>VENICE_CLAUDE_SKIP_PERMS=0</code>, or pass your own <code>--permission-mode</code>; either way the normal prompts or your chosen mode apply.</p>
+      </div>
+
+      <h3>Install</h3>
+      <pre><code>ln -s "$PWD/claude-venice" ~/.local/bin/claude-venice   <span class="c"># or run ./claude-venice from the repository</span></code></pre>
+
+      <h3>Usage</h3>
+      <pre><code>claude-venice                                          <span class="c"># default model deepseek-v4-1-flash-uncensored</span>
+claude-venice -m &lt;venice-model-id&gt;                     <span class="c"># -m must be the first argument</span>
+claude-venice --models                                 <span class="c"># list the model ids the bridge serves</span>
+claude-venice --quota                                  <span class="c"># remaining web quota and cache stats</span>
+VENICE_CLAUDE_MODEL=&lt;venice-model-id&gt; claude-venice
+claude-venice -m deepseek-v4-1-flash-uncensored:web    <span class="c"># with Venice web search, see below</span>
+VENICE_CLAUDE_SKIP_PERMS=0 claude-venice               <span class="c"># keep the permission prompts</span></code></pre>
+      <p>Before it starts Claude Code it checks both <code>/health</code> endpoints (bridge on 18891, adapter on 18892, both fixed in the script) and that the Venice session is active, and warns when fewer than 500 requests of the daily quota are left. Other arguments go to <code>claude</code> unchanged.</p>
+    </section>
+
+    <section id="codex">
+      <h2>Codex CLI</h2>
+      <p>Codex CLI talks to the adapter's <code>/v1/responses</code>. The provider is passed on the command line, so nothing is written to <code>~/.codex</code>:</p>
+      <pre><code>VB_KEY=local codex exec --skip-git-repo-check -c 'model_providers.vb={name="vb",base_url="http://127.0.0.1:18892/v1",wire_api="responses",env_key="VB_KEY"}' -c model_provider=vb -m deepseek-v4-1-flash-uncensored "&lt;task&gt;"</code></pre>
+      <p>Measured with Codex CLI 0.163.0: it ran <code>exec_command</code> and answered. Limits: Codex's namespace tools (MCP servers, multi-agent) and its built-in <code>web_search</code> do not pass through. A model id the bridge does not list (for example a <code>gpt-...</code> id) is replaced by the adapter's default model (<code>VENICE_ADAPTER_MODEL</code>).</p>
+    </section>
+
+    <section id="local-models">
+      <h2>Local models</h2>
+      <p>A model id <code>&lt;backend&gt;/&lt;model&gt;</code>, for example <code>ollama/qwen3:8b</code> or <code>lmstudio/&lt;id&gt;</code>, is passed straight to that local OpenAI-compatible server: no Venice login, no tool emulation, no quota, no response cache. Only the prefix is removed from the model id; a leading <code>venice-bridge/</code> is stripped first. The route is chosen by the prefix alone: a local-prefixed model whose backend is down answers 502 (type <code>local_backend_error</code>) and never falls through to Venice.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Prefix</th><th>Default base URL</th></tr></thead>
+        <tbody>
+          <tr><td><code>ollama/</code></td><td><code>http://127.0.0.1:11434/v1</code></td></tr>
+          <tr><td><code>lmstudio/</code></td><td><code>http://127.0.0.1:1234/v1</code></td></tr>
+        </tbody>
+      </table></div>
+      <p>Add llama.cpp, MLX or other servers in <code>~/.config/venice-bridge/backends.json</code> (path override <code>VENICE_BRIDGE_BACKENDS</code>). A file <strong>replaces</strong> the defaults, so list them again if you want them; an empty list turns local backends off. The file is read per request. <a href="https://github.com/nsozturk/venice-bridge/blob/main/examples/backends.json"><code>examples/backends.json</code></a> is a starting point:</p>
+      <pre><code>{"backends": [
+  {"name": "ollama",   "base_url": "http://127.0.0.1:11434/v1"},
+  {"name": "lmstudio", "base_url": "http://127.0.0.1:1234/v1"},
+  {"name": "llamacpp", "base_url": "http://127.0.0.1:8080/v1", "api_key": null}
+]}</code></pre>
+      <p><code>GET /v1/models</code> returns the Venice models plus the models of every reachable local backend (as <code>&lt;backend&gt;/&lt;id&gt;</code>, <code>owned_by</code> the backend name). A backend that is down is skipped and never breaks the list.</p>
+    </section>
+
+    <section id="venice-auto">
+      <h2>Model list and venice-auto</h2>
+      <p><code>GET /v1/models</code> lists only the Venice models your web subscription covers. Models that cost credits (<code>usesCredits: true</code> in Venice's catalogue) are hidden, and end-to-end-encrypted models (<code>e2ee-*</code>) are always hidden, because they need client-side keys the bridge does not handle. <code>VENICE_EXCLUDE_MODELS</code> hides more, as comma-separated glob patterns (for example <code>qwen3-vl-*,venice-uncensored-*</code>). The filter only changes the list: a hidden model can still be requested by its id.</p>
+      <p>The list starts with one virtual id, <code>venice-auto</code>. It resolves to the first Venice id in <code>VENICE_AUTO_MODELS</code> (comma-separated, default <code>deepseek-v4-1-flash-uncensored,ollama/qwen3:8b</code>). While the bridge knows the daily web quota is used up, it resolves to the first local <code>&lt;backend&gt;/&lt;model&gt;</code> entry instead, until the reset time Venice reports. The fallback is local only because the web quota is plan-wide: every Venice model shares it, so another Venice model would fail the same way.</p>
+      <pre><code>opencode -m venice-bridge/venice-auto      # add "venice-auto" to the models block of your OpenCode config
+claude-venice -m venice-auto               # works through the adapter, because venice-auto is in the model list</code></pre>
+      <ul>
+        <li>The bridge learns that the quota is gone from a failed request, so the request that hits the limit still fails once (403 <code>venice_quota_exhausted</code>); the requests after it go to the local model.</li>
+        <li>The local backend must be running, or the request answers 502 (<code>local_backend_error</code>). Without a local entry in <code>VENICE_AUTO_MODELS</code> there is no fallback and the quota error stays.</li>
+        <li>A suffix (<code>venice-auto:think</code>, <code>venice-auto:web</code>) is kept for the Venice model and dropped for the local one.</li>
+        <li>The over-quota state lives in memory. <code>POST /reload</code> and a restart clear it; when Venice reports no reset time, the bridge asks again after about a minute.</li>
+        <li>A local model is not a Venice model: expect different quality, speed and context size.</li>
+      </ul>
+    </section>
+
+    <section id="web-search">
+      <h2>Web search (opt-in)</h2>
+      <p>Venice can search the web server-side on the plain chat route. It is <strong>off by default</strong>, because Venice runs it on its side and it can compete with the client's own tools in an agent loop.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>How</th><th>Scope</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td>Model suffix <code>:web</code> (also <code>:scrape</code>)</td><td>one request</td><td>Venice web search and URL scraping</td></tr>
+          <tr><td>Model suffix <code>:xsearch</code> (also <code>:xweb</code>, <code>:x</code>)</td><td>one request</td><td>X search</td></tr>
+          <tr><td><code>VENICE_WEB=1</code> in the bridge's environment</td><td>whole process</td><td>web search and URL scraping on every request</td></tr>
+          <tr><td><code>VENICE_X_SEARCH=1</code> in the bridge's environment</td><td>whole process</td><td>X search on every request</td></tr>
+        </tbody>
+      </table></div>
+      <p>Suffixes combine (<code>deepseek-v4-1-flash-uncensored:web:xsearch</code>) and are removed before the id reaches Venice. The adapter keeps the suffix when the base id is valid, so <code>claude-venice -m &lt;id&gt;:web</code> works. Measured: a <code>:web</code> request returned a current fact with <code>^1^</code>-style citation markers.</p>
+      <pre><code>curl -s http://127.0.0.1:18891/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4-1-flash-uncensored:web","messages":[{"role":"user","content":"What is the latest Python release?"}]}'</code></pre>
+    </section>
+
+    <section id="reasoning">
+      <h2>Reasoning (opt-in)</h2>
+      <p>Venice's reasoning models can return their chain of thought. It is <strong>off by default</strong>, and a thinking turn is made only on the chat route and only for requests that declare <strong>no tools</strong>.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>How</th><th>Scope</th></tr></thead>
+        <tbody>
+          <tr><td>Model suffix <code>:think</code> (also <code>:reason</code>, <code>:reasoning</code>), combinable: <code>deepseek-v4-1-flash-uncensored:web:think</code></td><td>one request</td></tr>
+          <tr><td><code>VENICE_REASONING=1</code> in the bridge's environment</td><td>whole process</td></tr>
+          <tr><td><code>reasoning_effort</code> <code>medium</code> or <code>high</code> (<code>none</code>, <code>minimal</code>, <code>low</code> or unset = off)</td><td>one request</td></tr>
+        </tbody>
+      </table></div>
+      <p>The chain of thought comes back as OpenAI <code>reasoning_content</code>: a field on the message (non-stream) and <code>delta.reasoning_content</code> chunks (stream), sent before the normal <code>content</code>. On a thinking turn the bridge also lets Venice include its own system prompt, as the official web client does; without it the chat route returns no reasoning.</p>
+      <p>With tools in the request, <code>:think</code> and <code>VENICE_REASONING=1</code> are ignored, because a reasoning turn makes the model expect its <code>reasoning_content</code> passed back on the next turn, which coding agents do not do (HTTP 400). OpenCode, Claude Code and Codex always send tools, so <code>:think</code> has no effect in their agent loops; it is for plain chat and scripts. A <code>reasoning_effort</code> above <code>low</code> makes no thinking turn there either, but it still sets Venice's reasoning switch on the request, so leave it unset in agent loops. The adapter does not forward a reasoning effort.</p>
+      <pre><code>curl -s http://127.0.0.1:18891/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4-1-flash-uncensored:think","messages":[{"role":"user","content":"Is 1001 prime?"}]}'</code></pre>
+    </section>
+
+    <section id="response-cache">
+      <h2>Response cache</h2>
+      <p>A byte-identical repeat request (same model, messages, tools and parameters; <code>stream</code> aside) is answered from an in-memory LRU cache with a time limit, without a Venice call. Only clean successes (a real answer or a tool call) are stored. A stored non-stream result can replay as a stream and the reverse. The hit rate is modest by design: agent turns rarely repeat verbatim, so it mostly catches exact retries. Requests to local backends are not cached.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>VENICE_BRIDGE_CACHE</code></td><td>on</td><td><code>0</code> disables the cache.</td></tr>
+          <tr><td><code>VENICE_BRIDGE_CACHE_MAX</code></td><td><code>256</code></td><td>Maximum entries.</td></tr>
+          <tr><td><code>VENICE_BRIDGE_CACHE_TTL</code></td><td><code>3600</code></td><td>Seconds an entry stays valid.</td></tr>
+        </tbody>
+      </table></div>
+      <p><code>GET /health</code> reports <code>cache: {hits, misses, stores, entries, enabled}</code>; a hit is logged as <code>cache hit (no Venice call spent)</code>.</p>
+    </section>
+
+    <section id="quota">
+      <h2>Quota and cost model</h2>
+      <p>The Venice web plan is limited by a <strong>daily request quota, not by tokens</strong>. Fewer requests save quota; shorter prompts do not.</p>
+      <ul>
+        <li><code>usage</code> numbers are an estimate of about 4 characters per token, because Venice returns no token counts. The adapter's <code>/v1/messages/count_tokens</code> uses the same estimate, and the adapter reports <code>cached_tokens: 0</code>.</li>
+        <li><code>GET /health</code> shows <code>chat_quota.remaining</code> and <code>resets_in_min</code>; <code>claude-venice --quota</code> prints them with the cache stats.</li>
+        <li>In-bridge retries and the judge are extra requests; the response cache saves one on an exact repeat.</li>
+        <li>When the quota is used up the bridge answers 403 <code>venice_quota_exhausted</code> with the reset time, without calling Venice (see <a href="#error-mapping">Error mapping</a>).</li>
+        <li>The quota is plan-wide: every Venice model shares it. To keep working after it runs out, use <a href="#venice-auto"><code>venice-auto</code></a> with a local fallback.</li>
+      </ul>
+      <pre><code>curl -s http://127.0.0.1:18891/health</code></pre>
     </section>
 
     <section id="how-it-works">
@@ -442,7 +627,7 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
       <div class="flow" role="img" aria-label="Request flow: the client sends OpenAI Chat Completions to the bridge on 127.0.0.1:18891; the bridge gets a session JWT from clerk.venice.ai, mints a client attestation and streams the reply from outerface.venice.ai on the chat route by default or on the agent route as fallback, reads the calls in the reply, then returns an OpenAI response with tool_calls.">
         <div class="flow-node">
           <h4>Your client</h4>
-          <div class="where">OpenCode or any OpenAI client</div>
+          <div class="where">OpenCode, any OpenAI client, or the adapter</div>
           <ul><li>Sends messages and declared tools</li><li>Runs the returned <code>tool_calls</code></li></ul>
         </div>
         <div class="flow-arrow"><span class="arr arr-h">&#8644;</span><span class="arr arr-v">&#8645;</span>Chat Completions</div>
@@ -466,7 +651,47 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
         </div>
       </div>
       <p class="flow-caption">Request flow. Both inference routes are routes of the venice.ai web app itself; <code>VENICE_BRIDGE_ROUTE</code> chooses between them.</p>
-      <p>The bridge reads the <code>__client</code> cookie, finds the active Clerk session, mints a short-lived session JWT and a client attestation, and streams the reply from the Venice route chosen by <code>VENICE_BRIDGE_ROUTE</code>. A 401 from Venice is retried once with a fresh JWT and attestation.</p>
+      <p>The bridge reads the <code>__client</code> cookie, finds the active Clerk session, mints a short-lived session JWT and a client attestation, and streams the reply from the Venice route chosen by <code>VENICE_BRIDGE_ROUTE</code>. A 401 from Venice is retried once with a fresh JWT and attestation. A model id with a local backend prefix skips all of this and goes to that backend (see <a href="#local-models">Local models</a>).</p>
+
+      <h3 id="processes">Two processes</h3>
+      <p>Two processes: the bridge does all the Venice work; the optional adapter only translates APIs for clients that do not speak Chat Completions.</p>
+      <div class="flow" role="img" aria-label="Two processes: Claude Code sends Anthropic Messages and Codex CLI sends OpenAI Responses to the adapter on 127.0.0.1:18892; the adapter translates them to Chat Completions and forwards them to the bridge on 127.0.0.1:18891, which talks to the venice.ai web backend or to a local backend.">
+        <div class="upstreams">
+          <div class="flow-node">
+            <h4>Claude Code</h4>
+            <div class="where">POST /v1/messages</div>
+            <ul><li>via <code>claude-venice</code></li></ul>
+          </div>
+          <div class="flow-node">
+            <h4>Codex CLI</h4>
+            <div class="where">POST /v1/responses</div>
+            <ul><li>via <code>-c model_providers</code></li></ul>
+          </div>
+        </div>
+        <div class="flow-arrow"><span class="arr arr-h">&#8644;</span><span class="arr arr-v">&#8645;</span>Anthropic / Responses</div>
+        <div class="flow-node">
+          <h4>Adapter</h4>
+          <div class="where">127.0.0.1:18892 · venice_adapters.py</div>
+          <ul><li>Messages, tool declarations, tool calls and results, stream events</li><li>Standard library only</li><li>Nothing Venice-specific</li></ul>
+        </div>
+        <div class="flow-arrow"><span class="arr arr-h">&#8644;</span><span class="arr arr-v">&#8645;</span>Chat Completions</div>
+        <div class="flow-node main">
+          <h4>Bridge</h4>
+          <div class="where">127.0.0.1:18891 · venice_bridge.py</div>
+          <ul><li>Venice login, routes, tool emulation</li><li>Response cache</li><li>Local backends by prefix</li></ul>
+        </div>
+      </div>
+      <p class="flow-caption">OpenCode and other OpenAI clients talk to the bridge directly; the adapter's upstream (<code>VENICE_ADAPTER_UPSTREAM</code>) can be any Chat Completions server.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Process</th><th>File</th><th>Default address</th><th>Speaks</th></tr></thead>
+        <tbody>
+          <tr><td>Bridge</td><td class="num"><code>venice_bridge.py</code></td><td class="num"><code>127.0.0.1:18891</code></td><td>OpenAI Chat Completions <code>POST /v1/chat/completions</code>, <code>GET /v1/models</code>, <code>GET /health</code>, <code>POST /reload</code></td></tr>
+          <tr><td>Adapter (optional)</td><td class="num"><code>venice_adapters.py</code></td><td class="num"><code>127.0.0.1:18892</code></td><td>Anthropic Messages <code>POST /v1/messages</code> (+ <code>/v1/messages/count_tokens</code>), OpenAI Responses <code>POST /v1/responses</code>, <code>GET /v1/models</code>, <code>GET /health</code></td></tr>
+        </tbody>
+      </table></div>
+
+      <h3 id="sampling">Settings sent to Venice</h3>
+      <p>On the plain chat route, <code>temperature</code> and <code>top_p</code> are forwarded when the client sets them; otherwise Venice's own defaults apply. <code>max_tokens</code> is ignored by the route. Reasoning is off by default. A thinking turn is made only when asked for (<code>:think</code>, <code>VENICE_REASONING=1</code> or <code>reasoning_effort</code> <code>medium</code> / <code>high</code>) and only when the request declares no tools (see <a href="#reasoning">Reasoning</a>), because reasoning models want <code>reasoning_content</code> passed back on tool turns, which most clients do not do, and Venice then answers HTTP 400. Leave <code>reasoning_effort</code> unset in agent loops. Always sent: large-context chat on. Venice's own system prompt is off, except on a thinking turn.</p>
 
       <h3 id="routes">Routes</h3>
       <p>Routes: <code>VENICE_BRIDGE_ROUTE</code> is <code>auto</code> (default), <code>chat</code> or <code>agent</code>. The chat route is the default path because Venice runs no agent loop there and gives the model no tools of its own, so nothing collides with the client's tools and no call is swallowed.</p>
@@ -517,6 +742,7 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
         </tbody>
       </table></div>
       <p>The tool block in the prompt also tells the model that Venice's own tools and built-in function calling do not reach this computer, and which client tool does which job (read a file, run a command, search the web, fetch a web page).</p>
+      <p>The table above shows the common cases. The full alias lists (tool names, argument names, Venice server-tool names mapped back to the client's tools, and what is deliberately not routed) are in <a href="https://github.com/nsozturk/venice-bridge/blob/main/docs/TOOL_ROUTING.md"><code>docs/TOOL_ROUTING.md</code></a>.</p>
 
       <h3 id="argument-fitting">Argument fitting</h3>
       <p>Argument fitting renames arguments the model named differently: <code>path</code> / <code>file_path</code> / <code>filename</code> → <code>filePath</code>, <code>cmd</code> / <code>script</code> → <code>command</code>, <code>old_str</code> → <code>oldString</code>, <code>new_str</code> → <code>newString</code>, <code>contents</code> / <code>text</code> → <code>content</code>, <code>query</code> / <code>regex</code> → <code>pattern</code>, <code>link</code> → <code>url</code>. This happens only when the tool expects that name, did not get it, and does not know the other name.</p>
@@ -559,14 +785,16 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
       <div class="table-wrap"><table>
         <thead><tr><th>Option</th><th>Default</th><th>Meaning</th></tr></thead>
         <tbody>
-          <tr><td><code>--host</code></td><td><code>127.0.0.1</code></td><td>Address to listen on.</td></tr>
-          <tr><td><code>--port</code></td><td><code>18891</code></td><td>Port to listen on.</td></tr>
+          <tr><td><code>--host</code></td><td><code>VENICE_BRIDGE_HOST</code>, else <code>127.0.0.1</code></td><td>Address the bridge listens on.</td></tr>
+          <tr><td><code>--port</code></td><td><code>18891</code></td><td>Port the bridge listens on.</td></tr>
         </tbody>
       </table></div>
-      <h3>Environment variables</h3>
+      <p>The adapter has no command-line options; it is configured with the environment variables below.</p>
+      <h3 id="config-bridge">Bridge environment variables</h3>
       <div class="table-wrap"><table>
         <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
         <tbody>
+          <tr><td><code>VENICE_BRIDGE_HOST</code></td><td><code>127.0.0.1</code></td><td>Bind address (<code>--host</code> wins). The bridge has no authentication of its own: keep it on <code>127.0.0.1</code>.</td></tr>
           <tr><td><code>VENICE_BRIDGE_ROUTE</code></td><td><code>auto</code></td><td>Venice web route: <code>auto</code> (chat route; agent route for a model the chat route does not know), <code>chat</code> (chat route only), <code>agent</code> (agent route only; needs a paid plan). See <a href="#routes">Routes</a>.</td></tr>
           <tr><td><code>VENICE_BRIDGE_COOKIE_FILE</code></td><td><code>~/.config/venice-bridge/client-cookie.txt</code></td><td>Text file with the <code>__client</code> cookie value.</td></tr>
           <tr><td><code>VENICE_BRIDGE_SESSION_DIR</code></td><td>unset</td><td>Folder with a local session daemon's <code>client.py</code> exposing <code>get_session(domain)</code>.</td></tr>
@@ -575,16 +803,45 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
           <tr><td><code>VENICE_BRIDGE_JUDGE</code></td><td>on</td><td><code>0</code> turns the judge off.</td></tr>
           <tr><td><code>VENICE_BRIDGE_JUDGE_MODEL</code></td><td><code>qwen3-5-35b-a3b</code></td><td>Model used as the judge.</td></tr>
           <tr><td><code>VENICE_BRIDGE_JUDGE_RETRIES</code></td><td><code>1</code></td><td>Extra attempts the judge may trigger.</td></tr>
+          <tr><td><code>VENICE_WEB</code></td><td>off</td><td><code>1</code> turns on Venice web search and URL scraping for every request. See <a href="#web-search">Web search</a>.</td></tr>
+          <tr><td><code>VENICE_X_SEARCH</code></td><td>off</td><td><code>1</code> turns on Venice X search for every request.</td></tr>
+          <tr><td><code>VENICE_REASONING</code></td><td>off</td><td><code>1</code> turns on reasoning for every request that declares no tools. See <a href="#reasoning">Reasoning</a>.</td></tr>
+          <tr><td><code>VENICE_EXCLUDE_MODELS</code></td><td>unset</td><td>Comma-separated glob patterns hidden from <code>GET /v1/models</code> (on top of credit models and <code>e2ee-*</code>), for example <code>qwen3-vl-*,venice-uncensored-*</code>.</td></tr>
+          <tr><td><code>VENICE_AUTO_MODELS</code></td><td><code>deepseek-v4-1-flash-uncensored,ollama/qwen3:8b</code></td><td>Candidates for <code>venice-auto</code>: the first Venice id normally, the first local <code>&lt;backend&gt;/&lt;model&gt;</code> while the quota is used up. See <a href="#venice-auto">venice-auto</a>.</td></tr>
+          <tr><td><code>VENICE_BRIDGE_BACKENDS</code></td><td><code>~/.config/venice-bridge/backends.json</code></td><td>Local backends file. See <a href="#local-models">Local models</a>.</td></tr>
+          <tr><td><code>VENICE_BRIDGE_CACHE</code></td><td>on</td><td><code>0</code> disables the response cache. See <a href="#response-cache">Response cache</a>.</td></tr>
+          <tr><td><code>VENICE_BRIDGE_CACHE_MAX</code></td><td><code>256</code></td><td>Maximum cache entries.</td></tr>
+          <tr><td><code>VENICE_BRIDGE_CACHE_TTL</code></td><td><code>3600</code></td><td>Seconds a cache entry stays valid.</td></tr>
+        </tbody>
+      </table></div>
+      <h3 id="config-adapter">Adapter environment variables</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>VENICE_ADAPTER_HOST</code></td><td><code>127.0.0.1</code></td><td>Address the adapter listens on.</td></tr>
+          <tr><td><code>VENICE_ADAPTER_PORT</code></td><td><code>18892</code></td><td>Port the adapter listens on.</td></tr>
+          <tr><td><code>VENICE_ADAPTER_UPSTREAM</code></td><td><code>http://127.0.0.1:18891/v1</code></td><td>The Chat Completions server it forwards to (the bridge by default).</td></tr>
+          <tr><td><code>VENICE_ADAPTER_MODEL</code></td><td><code>deepseek-v4-1-flash-uncensored</code></td><td>Used when the client asks for a model the upstream does not list (for example <code>claude-...</code> or <code>gpt-...</code>).</td></tr>
+          <tr><td><code>VENICE_ADAPTER_DUMP</code></td><td>unset</td><td>A folder: saves every request body there. Debugging only: the bodies contain your prompts.</td></tr>
+        </tbody>
+      </table></div>
+      <h3>claude-venice variables</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>VENICE_CLAUDE_MODEL</code></td><td><code>deepseek-v4-1-flash-uncensored</code></td><td>Venice model id (<code>-m</code> wins).</td></tr>
+          <tr><td><code>VENICE_CLAUDE_SKIP_PERMS</code></td><td><code>1</code></td><td><code>0</code> keeps Claude Code's permission prompts. See the <a href="#claude-code">warning</a>.</td></tr>
         </tbody>
       </table></div>
     </section>
 
     <section id="api">
       <h2>API reference</h2>
-      <p>Base URL <code>http://127.0.0.1:18891</code>. Errors use the OpenAI shape <code>{"error": {"message", "type"}}</code>; upstream errors also carry <code>code</code>, while 404 and invalid-JSON errors carry only <code>message</code>. <code>/health</code> uses its own shape. Unknown paths answer 404.</p>
+      <h3 id="api-bridge">Bridge (127.0.0.1:18891)</h3>
+      <p>Bridge: base URL <code>http://127.0.0.1:18891</code>. Errors use the OpenAI shape <code>{"error": {"message", "type"}}</code>; upstream errors also carry <code>code</code>, while 404 and invalid-JSON errors carry only <code>message</code>. <code>/health</code> uses its own shape. Unknown paths answer 404.</p>
 
       <h3><code>POST /v1/chat/completions</code></h3>
-      <p>OpenAI Chat Completions, streaming (<code>"stream": true</code>, server-sent events ending with <code>data: [DONE]</code>) and non-streaming. Declared <code>tools</code> come back as <code>tool_calls</code> with <code>finish_reason: "tool_calls"</code>; reasoning text, when the model sends it, arrives as <code>reasoning_content</code> deltas. If <code>model</code> is missing, <code>qwen3-coder-480b-a35b-instruct-turbo</code> is used.</p>
+      <p>OpenAI Chat Completions, streaming (<code>"stream": true</code>, server-sent events ending with <code>data: [DONE]</code>) and non-streaming. Declared <code>tools</code> come back as <code>tool_calls</code> with <code>finish_reason: "tool_calls"</code>; when the model returns reasoning (see <a href="#reasoning">Reasoning</a>), it arrives as <code>reasoning_content</code> (a message field, or <code>delta.reasoning_content</code> chunks when streaming). <code>venice-auto</code> is resolved to a concrete model first (see <a href="#venice-auto">venice-auto</a>). If <code>model</code> is missing, <code>qwen3-coder-480b-a35b-instruct-turbo</code> is used. <code>temperature</code> and <code>top_p</code> are forwarded when set; <code>max_tokens</code> is ignored (see <a href="#sampling">Settings sent to Venice</a>). A <code>:web</code> / <code>:xsearch</code> suffix turns on Venice web search for that request; a local backend prefix (<code>ollama/...</code>) sends the request to that backend unchanged. <code>usage</code> is an estimate (about 4 characters per token).</p>
       <pre><code>curl -s http://127.0.0.1:18891/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v4-1-flash-uncensored","messages":[{"role":"user","content":"Reply with PONG"}]}'</code></pre>
       <div class="table-wrap"><table>
@@ -596,21 +853,58 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
           <tr><td class="num">402</td><td>Plan or credits do not cover the model</td></tr>
           <tr><td class="num">403</td><td>Chat quota used up; type <code>venice_quota_exhausted</code></td></tr>
           <tr><td class="num">429</td><td>Passing rate limit; type <code>venice_rate_limited</code></td></tr>
-          <tr><td class="num">502</td><td>Upstream failure, Cloudflare challenge, empty or cut reply</td></tr>
+          <tr><td class="num">502</td><td>Upstream failure, Cloudflare challenge, empty or cut reply; a local backend that did not answer (type <code>local_backend_error</code>)</td></tr>
         </tbody>
       </table></div>
 
       <h3><code>GET /v1/models</code></h3>
-      <p>Lists the models of your account's web catalogue that do not use credits (<code>owned_by: "venice-web"</code>). Answers 502 (<code>bridge_error</code>) when the catalogue cannot be read.</p>
+      <p>Lists the virtual <code>venice-auto</code> first (<code>owned_by: "venice-bridge"</code>), then the models of your account's web catalogue that do not use credits (<code>owned_by: "venice-web"</code>; <code>e2ee-*</code> and <code>VENICE_EXCLUDE_MODELS</code> patterns hidden), followed by the models of every reachable local backend (<code>&lt;backend&gt;/&lt;id&gt;</code>, <code>owned_by</code> the backend name). A local backend that is down is skipped. When Venice cannot be read, the local models are still listed; it answers 502 (<code>bridge_error</code>) only when Venice fails and no local model is listed.</p>
       <pre><code>curl -s http://127.0.0.1:18891/v1/models</code></pre>
 
       <h3><code>GET /health</code></h3>
-      <p>200 <code>{"ok": true, "venice_session": "active", "chat_quota": {"reset_at", "remaining", "resets_in_min"}}</code> when a session JWT can be minted; <code>chat_quota</code> is <code>null</code> when the quota cannot be read. 503 <code>{"ok": false, "error": "..."}</code> when the login does not work.</p>
+      <p>200 <code>{"ok": true, "venice_session": "active", "chat_quota": {"reset_at", "remaining", "resets_in_min"}, "cache": {"hits", "misses", "stores", "entries", "enabled"}}</code> when a session JWT can be minted; <code>chat_quota</code> is <code>null</code> when the quota cannot be read. 503 <code>{"ok": false, "error": "..."}</code> when the login does not work.</p>
       <pre><code>curl -s http://127.0.0.1:18891/health</code></pre>
 
       <h3><code>POST /reload</code></h3>
-      <p>Drops the cached auth (Clerk cookie, session, JWT, attestation) and the quota lock. Answers 200 <code>{"ok": true}</code>.</p>
+      <p>Drops the cached auth (Clerk cookie, session, JWT, attestation) and the quota lock (also the over-quota state of <code>venice-auto</code>). Answers 200 <code>{"ok": true}</code>.</p>
       <pre><code>curl -s -X POST http://127.0.0.1:18891/reload</code></pre>
+
+      <h3 id="api-adapter">Adapter (127.0.0.1:18892)</h3>
+      <p>Adapter: base URL <code>http://127.0.0.1:18892</code>. It ignores authentication headers and forwards every model call to its upstream's <code>/chat/completions</code>. An upstream error status is passed on before any stream starts, so the client sees the real status; an upstream that does not answer gives 502.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Endpoint</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>POST /v1/messages</code></td><td>Anthropic Messages (streaming and non-streaming), with tool declarations, <code>tool_use</code> / <code>tool_result</code> blocks and stream events translated to and from Chat Completions. A query string such as <code>?beta=true</code> is ignored.</td></tr>
+          <tr><td><code>POST /v1/messages/count_tokens</code></td><td>Answers <code>{"input_tokens": N}</code>, an estimate of about 4 characters per token. No upstream call.</td></tr>
+          <tr><td><code>POST /v1/responses</code></td><td>OpenAI Responses (streaming and non-streaming), with function calls and their outputs translated. <code>usage</code> carries <code>cached_tokens: 0</code>.</td></tr>
+          <tr><td><code>GET /v1/models</code></td><td>The upstream's model list, unchanged.</td></tr>
+          <tr><td><code>GET /health</code></td><td>200 <code>{"ok": true, "upstream": "...", "default_model": "..."}</code>. It does not check the upstream.</td></tr>
+        </tbody>
+      </table></div>
+      <pre><code>curl -s http://127.0.0.1:18892/health
+curl -s http://127.0.0.1:18892/v1/messages -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4-1-flash-uncensored","max_tokens":256,"messages":[{"role":"user","content":"Reply with PONG"}]}'</code></pre>
+    </section>
+
+    <section id="tests">
+      <h2>Tests</h2>
+      <p>Both self-checks run offline: they use temporary files and fake servers on localhost, never the real Venice endpoints. Success prints the lines below and exits with status 0; a failure stops with an <code>AssertionError</code> traceback and a non-zero exit status.</p>
+      <h3>1. Bridge</h3>
+      <pre><code>python3 test_venice_bridge.py</code></pre>
+      <pre><code>cookie file ok
+session ok
+ok
+end to end ok
+local backends ok</code></pre>
+      <h3>2. Adapter</h3>
+      <pre><code>python3 test_venice_adapters.py</code></pre>
+      <pre><code>messages ok
+responses ok</code></pre>
+      <h3>3. Live check (both processes running)</h3>
+      <p>Not a self-check: it needs your login and spends no model request.</p>
+      <pre><code>curl -s http://127.0.0.1:18891/health   <span class="c"># {"ok": true, "venice_session": "active", ...}</span>
+curl -s http://127.0.0.1:18892/health   <span class="c"># {"ok": true, "upstream": "http://127.0.0.1:18891/v1", ...}</span>
+claude-venice --quota                   <span class="c"># Venice web quota  remaining=...  resets_in_min=...</span></code></pre>
     </section>
 
     <section id="performance">
@@ -645,7 +939,7 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
           <tr><td>Connection refused on port 18891</td><td>The bridge is not running.</td><td>Start <code>python3 venice_bridge.py</code>, or check <code>venice_bridge.log</code> when launchd runs it.</td></tr>
           <tr><td><code>/health</code> answers 503</td><td>No cookie, or Clerk no longer accepts it.</td><td>Copy a fresh <code>__client</code> value into the cookie file, then <code>POST /reload</code>.</td></tr>
           <tr><td>403 with <code>creator_access_required</code> (type <code>venice_upstream_error</code>)</td><td>The request went to the agent route on a free Venice account.</td><td>The agent route needs a paid Venice web plan (Pro); with <code>VENICE_BRIDGE_ROUTE=agent</code>, try <code>auto</code>.</td></tr>
-          <tr><td>403 with type <code>venice_quota_exhausted</code></td><td>Web chat quota used up.</td><td>Wait for the reset time in the message; <code>/health</code> shows <code>resets_in_min</code>.</td></tr>
+          <tr><td>403 with type <code>venice_quota_exhausted</code></td><td>Web chat quota used up.</td><td>Wait for the reset time in the message; <code>/health</code> shows <code>resets_in_min</code>. To keep working meanwhile, use <a href="#venice-auto"><code>venice-auto</code></a> with a local fallback.</td></tr>
           <tr><td>429 with type <code>venice_rate_limited</code></td><td>Venice is rate limiting briefly; quota is left.</td><td>Retry after a short wait.</td></tr>
           <tr><td>502 "Cloudflare challenged the request"</td><td>Cloudflare wants a browser check.</td><td>Open venice.ai in your browser, refresh the cookie file (or sync your session daemon), and try again.</td></tr>
           <tr><td>400 <code>context_length_exceeded</code></td><td>The request is larger than Venice accepts.</td><td>Start a new session or compact the conversation; declare fewer tools.</td></tr>
@@ -654,6 +948,12 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
           <tr><td>Short replies appear all at once in tools mode</td><td>The stream gate holds replies under 200 characters until they are complete.</td><td>Expected behaviour.</td></tr>
           <tr><td>The model says its tools are unavailable, or "Tool not found" (for example "the tool layer is down — shell, execute and read all return Tool not found")</td><td>The request went through the agent route (check <code>route=</code> in the log).</td><td>Use <code>VENICE_BRIDGE_ROUTE=auto</code> or <code>chat</code>, or pick a model that exists on the chat route. In an existing conversation the model may keep believing its tools are broken: tell it they work now, or start a new session.</td></tr>
           <tr><td>502 "Venice answered HTTP 400: … modelNotFound" with <code>VENICE_BRIDGE_ROUTE=chat</code></td><td>That model exists only on the agent route.</td><td>Use <code>VENICE_BRIDGE_ROUTE=auto</code>.</td></tr>
+          <tr><td><code>claude-venice</code>: "venice-adapters (http://127.0.0.1:18892) is down"</td><td>The adapter is not running.</td><td>Start <code>python3 venice_adapters.py</code>, or load its launchd template.</td></tr>
+          <tr><td><code>claude-venice</code>: "Venice web session is not active"</td><td>The bridge is up but the login expired.</td><td>Copy a fresh <code>__client</code> value into the cookie file, then <code>POST /reload</code>.</td></tr>
+          <tr><td>Claude Code: "Auto mode could not evaluate this action and is blocking it for safety"</td><td>Venice's fast models cannot drive Claude Code's auto-mode classifier.</td><td>That is why <code>claude-venice</code> skips permission prompts by default; with <code>VENICE_CLAUDE_SKIP_PERMS=0</code>, use another <code>--permission-mode</code>.</td></tr>
+          <tr><td>502 with type <code>local_backend_error</code></td><td>The local backend for that model prefix is not running or not reachable.</td><td>Start Ollama, LM Studio or your server, or check <code>base_url</code> in <code>backends.json</code>. The request is never sent to Venice instead.</td></tr>
+          <tr><td>A local model is missing from <code>GET /v1/models</code></td><td>Its backend is down, or a <code>backends.json</code> file replaced the defaults.</td><td>Start the backend; list every backend you want in the file.</td></tr>
+          <tr><td>Claude Code or Codex answers with a different model than asked</td><td>The adapter replaces ids the bridge does not list (<code>claude-...</code>, <code>gpt-...</code>) with <code>VENICE_ADAPTER_MODEL</code>.</td><td>Pass a Venice id from <code>GET /v1/models</code> (<code>claude-venice -m &lt;id&gt;</code>).</td></tr>
         </tbody>
       </table></div>
     </section>
@@ -670,7 +970,23 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
       </details>
       <details class="faq">
         <summary>Does it work with Claude Code or Codex?</summary>
-        <p>Not directly. The bridge speaks OpenAI Chat Completions (<code>/v1/chat/completions</code>) only. It does not implement the Anthropic Messages API (<code>/v1/messages</code>) or the OpenAI Responses API (<code>/v1/responses</code>), which Claude Code and Codex CLI use.</p>
+        <p>Yes, through the adapter. Run <code>python3 venice_adapters.py</code> next to the bridge: it serves the Anthropic Messages API (<code>/v1/messages</code>) and the OpenAI Responses API (<code>/v1/responses</code>) on <code>127.0.0.1:18892</code> and forwards them to the bridge. For Claude Code the <code>claude-venice</code> launcher sets everything up in an isolated profile (<code>~/.claude-venice</code>) and, by default, skips Claude Code's permission prompts (opt out with <code>VENICE_CLAUDE_SKIP_PERMS=0</code>; see <a href="#claude-code">the warning</a>). Codex CLI is pointed at the adapter with <code>-c model_providers</code> settings (see <a href="#codex">Codex CLI</a>); its MCP servers, multi-agent tools and built-in <code>web_search</code> do not pass through.</p>
+      </details>
+      <details class="faq">
+        <summary>Does it run local models?</summary>
+        <p>Yes. A model id with a backend prefix, such as <code>ollama/qwen3:8b</code> or <code>lmstudio/&lt;id&gt;</code>, is passed straight to that local OpenAI-compatible server, with no Venice login, no tool emulation and no quota. Ollama (<code>127.0.0.1:11434</code>) and LM Studio (<code>127.0.0.1:1234</code>) are the defaults; others such as llama.cpp or MLX servers are added in <code>~/.config/venice-bridge/backends.json</code>. <code>GET /v1/models</code> lists the models of every reachable local backend next to the Venice models. See <a href="#local-models">Local models</a>.</p>
+      </details>
+      <details class="faq">
+        <summary>What happens when my daily Venice quota runs out?</summary>
+        <p>Venice requests answer 403 <code>venice_quota_exhausted</code> with the reset time until the quota resets. The quota is plan-wide, so switching to another Venice model does not help. To keep working, use the virtual model <code>venice-auto</code>: it serves a Venice model normally and a local model (default <code>ollama/qwen3:8b</code>) while the quota is used up. The request that hits the limit still fails once, the local backend must be running, and a local model may differ in quality, speed and context size. See <a href="#venice-auto">Model list and venice-auto</a>.</p>
+      </details>
+      <details class="faq">
+        <summary>Does it cost tokens?</summary>
+        <p>No. The Venice web plan is limited by a daily request quota, not by tokens. The <code>usage</code> numbers the bridge returns are estimates (about 4 characters per token), because Venice returns no token counts. Fewer requests save quota; shorter prompts do not. <code>GET /health</code> shows <code>chat_quota.remaining</code> and <code>resets_in_min</code>, and a byte-identical repeat request is answered from the response cache without a Venice call. See <a href="#quota">Quota and cost model</a>.</p>
+      </details>
+      <details class="faq">
+        <summary>Can I use it from Docker?</summary>
+        <p>Yes. A container reaches a bridge bound to <code>127.0.0.1</code> on the host through <code>http://host.docker.internal:18891/v1</code> (measured with Docker Desktop on macOS). Binding the bridge to <code>0.0.0.0</code> is not needed and not recommended: the bridge has no authentication of its own.</p>
       </details>
       <details class="faq">
         <summary>Does it work on Linux or Windows?</summary>
@@ -682,11 +998,11 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
       </details>
       <details class="faq">
         <summary>Where do my chats go?</summary>
-        <p>From your client to the bridge on <code>127.0.0.1</code>, then to the venice.ai web backend under your own account (<code>clerk.venice.ai</code> for login, <code>outerface.venice.ai</code> for inference), as with the web app. When the judge is on, a short excerpt of the turn is sent to Venice as a second request. The bridge keeps no conversation history: each request body sits in a private temporary folder (mode 0700) only while its upstream call runs and is deleted afterwards. Its log records sizes, timings and outcomes and can include short excerpts of unreadable replies or swallowed tool calls.</p>
+        <p>From your client to the bridge on <code>127.0.0.1</code>, then to the venice.ai web backend under your own account (<code>clerk.venice.ai</code> for login, <code>outerface.venice.ai</code> for inference), as with the web app. When the judge is on, a short excerpt of the turn is sent to Venice as a second request. The bridge keeps no conversation history: each request body sits in a private temporary folder (mode 0700) only while its upstream call runs and is deleted afterwards. Its log records sizes, timings and outcomes and can include short excerpts of unreadable replies or swallowed tool calls. Exceptions: a model with a local backend prefix (for example <code>ollama/...</code>) goes only to that local server, never to Venice; successful replies are kept in the in-memory <a href="#response-cache">response cache</a> until their time limit (1 hour by default, <code>VENICE_BRIDGE_CACHE=0</code> turns it off) and are lost when the bridge stops; with a <code>:web</code> or <code>:xsearch</code> suffix Venice also searches the web on its side; and when <code>VENICE_ADAPTER_DUMP</code> is set, the adapter writes every request body to that folder.</p>
       </details>
       <details class="faq">
         <summary>Is it an alternative to opencode-venice-web?</summary>
-        <p>Yes, it is an independent Python implementation of the same idea. opencode-venice-web (Node) is the most mature Venice web proxy and sends the full schema of every tool; venice-bridge is one Python file that sends a tiered tool list within a fixed budget. Its tolerant tool-call parser is a port of the opencode-venice-web parser (MIT).</p>
+        <p>Yes, it is an independent Python implementation of the same idea. opencode-venice-web (Node) is the most mature Venice web proxy and sends the full schema of every tool; venice-bridge is a small Python bridge (plus an optional adapter for Claude Code and Codex) that sends a tiered tool list within a fixed budget. Its tolerant tool-call parser is a port of the opencode-venice-web parser (MIT).</p>
       </details>
     </section>
 
@@ -701,10 +1017,11 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
 
     <section id="ai-agents">
       <h2>AI agent integration</h2>
-      <p>Two files in the repository are written for coding agents:</p>
+      <p>These files in the repository are written for coding agents:</p>
       <ul>
         <li><a href="https://github.com/nsozturk/venice-bridge/blob/main/AGENTS.md"><code>AGENTS.md</code></a>: the contract for agents that work on or with this repository: how to start, stop and check the bridge, endpoints, environment variables, tests, rules and common failures.</li>
         <li><a href="https://github.com/nsozturk/venice-bridge/blob/main/GLOBAL_AGENT_RULE.md"><code>GLOBAL_AGENT_RULE.md</code></a>: a standalone snippet you can paste into your own agent's instructions so it knows how to start, check and use the bridge.</li>
+        <li><a href="https://github.com/nsozturk/venice-bridge/blob/main/docs/TOOL_ROUTING.md"><code>docs/TOOL_ROUTING.md</code></a>: the tool-name and argument-name routing reference.</li>
       </ul>
       <p>For LLM ingestion this site also serves <a href="llms.txt"><code>llms.txt</code></a> and <a href="llms-full.txt"><code>llms-full.txt</code></a>.</p>
     </section>
@@ -713,13 +1030,13 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
       <h2>License and credits</h2>
       <p>MIT License, Copyright (c) 2026 venice-bridge contributors. See <a href="https://github.com/nsozturk/venice-bridge/blob/main/LICENSE"><code>LICENSE</code></a>.</p>
       <p><code>tolerant_parser.py</code> is a Python port of the tolerant tool-call parser of <a href="https://github.com/CanArslanDev/opencode-venice-web">opencode-venice-web</a>, and the real malformed replies in <code>test_fixtures_real_replies.json</code> come from its test fixtures; several reminder texts and the judge prompt are adapted from the same project. All are used under the MIT License; see <a href="https://github.com/nsozturk/venice-bridge/blob/main/NOTICE.md"><code>NOTICE.md</code></a>.</p>
-      <p>Venice and venice.ai are names of their owner, used here only to describe compatibility.</p>
+      <p>Venice and venice.ai are trademarks of their respective holder, used here only to describe compatibility.</p>
     </section>
 
     <div class="no-results" id="noResults">No section matches your search.</div>
 
     <footer>
-      <p>venice-bridge v0.1.0 · MIT · <a href="https://github.com/nsozturk/venice-bridge">github.com/nsozturk/venice-bridge</a> · Unofficial, not affiliated with Venice.ai.</p>
+      <p>venice-bridge v0.2.0 · MIT · <a href="https://github.com/nsozturk/venice-bridge">github.com/nsozturk/venice-bridge</a> · Unofficial, not affiliated with Venice.ai.</p>
     </footer>
   </main>
 </div>

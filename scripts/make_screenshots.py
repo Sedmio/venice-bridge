@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the two terminal screenshots in docs/assets/screenshots/ from REAL output.
+"""Render the three terminal screenshots in docs/assets/screenshots/ from REAL output.
 
 Run from anywhere:  python3 scripts/make_screenshots.py [--keep-svg]
 
@@ -7,7 +7,7 @@ What is real: the offline self-check (test_venice_bridge.py) is run as a subproc
 captured; the bridge's own HTTP handler is started on localhost and answers real HTTP requests.
 What is demo data: the upstream is a small fake Venice on localhost (as in the self-check), and the
 session / quota are stubbed. No cookie file is read, no account, token or network request is involved.
-Writes only the two PNGs (plus sibling SVGs with --keep-svg). Stdlib only; needs one SVG renderer
+Writes only the three PNGs (plus sibling SVGs with --keep-svg). Stdlib only; needs one SVG renderer
 (rsvg-convert, magick, inkscape or Google Chrome) already installed.
 """
 import json
@@ -96,11 +96,26 @@ def capture_bridge():
                      "name": "read", "description": "Read a file",
                      "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}},
                                     "required": ["filePath"]}}}]}
+    import venice_adapters as va  # the adapter in front of the demo bridge: what Claude Code talks to
+    va.UPSTREAM = base + "/v1"
+    adapter = ThreadingHTTPServer(("127.0.0.1", 0), va.Handler)
+    threading.Thread(target=adapter.serve_forever, daemon=True).start()
+    msg_req = {"model": model, "max_tokens": 1024,
+               "messages": [{"role": "user", "content": "Read README.md"}],
+               "tools": [{"name": "Read", "description": "Read a file",
+                          "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}},
+                                           "required": ["file_path"]}}]}
     try:
         got = _collect(call, chat_req, tools_req)
+        answers["tools"] = reply(json.dumps({"tool_calls": [{"name": "Read", "arguments": {"file_path": "README.md"}}]}))
+        req = urllib.request.Request("http://127.0.0.1:%d/v1/messages" % adapter.server_address[1],
+                                     json.dumps(msg_req).encode(), {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            got["msg"] = json.loads(r.read())
+        got["msg_req"] = msg_req
     finally:
         sys.stderr = real_stderr
-        for srv in (fake, bridge):
+        for srv in (fake, bridge, adapter):
             srv.shutdown()
     return got
 
@@ -135,7 +150,13 @@ def screens(g, cols):
     s1 = [[("p", "$ "), ("c", "python3 test_venice_bridge.py")]]
     s1 += [[("o", l)] for l in g["selfcheck"]]
     s1 += [[], [("p", "$ "), ("c", "curl -s %s/health | python3 -m json.tool" % url)]]
-    s1 += [[("o", l)] for l in pretty(g["health"], cols)]
+    health = dict(g["health"])
+    cache = health.pop("cache", None)  # shown on one line so the screen stays readable
+    hl = pretty(health, cols)
+    if cache is not None:
+        hl[-2] += ","
+        hl.insert(-1, '  "cache": ' + json.dumps(cache))
+    s1 += [[("o", l)] for l in hl]
     s1 += [[], [("p", "$ "), ("c", "curl -s %s/v1/chat/completions %s \\" % (url, hdr))]]
     s1 += [[("c", "    -d '%s'" % json.dumps(g["chat_req"], separators=(",", ":")))]]
     s1 += [[("o", l)] for l in pretty(g["chat"], cols)]
@@ -150,7 +171,17 @@ def screens(g, cols):
            [("d", "#   " + g["upstream_text"])],
            [("d", "# the bridge parses that text and returns a real OpenAI tool_calls message:")]]
     s2 += [[("o", l)] for l in pretty(g["tools"], cols)]
-    return s1, s2
+
+    aurl = "127.0.0.1:18892"
+    s3 = [[("d", "# venice_adapters.py speaks Anthropic Messages (Claude Code) and OpenAI Responses (Codex CLI)")],
+          [("p", "$ "), ("c", "curl -s %s/v1/messages %s \\" % (aurl, hdr))]]
+    ws = wrap(json.dumps(g["msg_req"], separators=(",", ":")), cols - 8, "")
+    s3 += [[("c", "    " + ("-d '" if i == 0 else "    ") + w + ("'" if i == len(ws) - 1 else ""))]
+           for i, w in enumerate(ws)]
+    s3 += [[], [("d", "# the adapter forwards to the bridge and answers in Anthropic's shape: a tool_use block")]]
+    s3 += [[("o", l)] for l in pretty(g["msg"], cols)]
+    s3 += [[], [("p", "$ "), ("c", "claude-venice              "), ("d", "# Claude Code CLI on this adapter, isolated profile")]]
+    return s1, s2, s3
 
 
 # ---------------------------------------------------------------- 3. SVG + PNG
@@ -203,7 +234,8 @@ def main():
     name, cmd = find_renderer()
     with tempfile.TemporaryDirectory() as tmp:
         for fname, title, pick in [("01-health-and-chat", "venice-bridge — health and chat", 0),
-                                   ("02-opencode-tool-run", "venice-bridge — a model reply becomes a real tool call", 1)]:
+                                   ("02-opencode-tool-run", "venice-bridge — a model reply becomes a real tool call", 1),
+                                   ("03-claude-code-adapter", "venice-adapters — Anthropic Messages for Claude Code", 2)]:
             size = 22
             while True:  # largest font where every line fits the window width and the canvas height
                 cols = int((W - 80 - 72) / (size * CHAR_W))
@@ -213,7 +245,7 @@ def main():
                     break
                 except AssertionError:
                     size -= 1
-                    assert size >= 15, "content too long for a readable screenshot"
+                    assert size >= 13, "content too long for a readable screenshot"
             svg_path = os.path.join(OUT if keep else tmp, fname + ".svg")
             with open(svg_path, "w") as f:
                 f.write(text)

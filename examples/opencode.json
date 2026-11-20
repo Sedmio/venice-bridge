@@ -8,6 +8,21 @@
         "apiKey": "local"
       },
       "models": {
+        "venice-auto": {
+          "name": "Venice Auto (Venice, local model when the web quota is used up)",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 131072,
+            "output": 32768
+          }
+        },
         "qwen3-coder-480b-a35b-instruct-turbo": {
           "name": "Qwen 3 Coder 480B Turbo (Venice Web)",
           "modalities": {
