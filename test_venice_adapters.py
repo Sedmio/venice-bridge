@@ -155,6 +155,11 @@ def main():
         {"type": "custom_tool_call_output", "call_id": "c9", "output": {"content": "ok"}}]})
     assert chat["messages"][0]["tool_calls"][0]["function"] == {"name": "apply_patch", "arguments": "{\"input\": \"P\"}"}
     assert chat["messages"][1] == {"role": "tool", "tool_call_id": "c9", "content": "ok"}
+    # ---- _pick_model: a local backend id (contains "/") passes through, never silently the default Venice model
+    assert va._pick_model("ollama/qwen3:8b") == "ollama/qwen3:8b"      # upstream lists only ["m1"]; must NOT become m1
+    assert va._pick_model("venice-bridge/ollama/x") == "venice-bridge/ollama/x"
+    assert va._pick_model("m1") == "m1" and va._pick_model("claude-x") == "m1"  # known passes, unknown -> default
+    print("pick_model ok")
     print("responses ok")
 
 

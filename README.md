@@ -186,8 +186,8 @@ What the launcher does:
   install, its login and its settings are not touched.
 - Unsets `ANTHROPIC_API_KEY`, sets `ANTHROPIC_BASE_URL=http://127.0.0.1:18892` and a filler
   `ANTHROPIC_AUTH_TOKEN`, and points `ANTHROPIC_MODEL` and the opus / sonnet / haiku default-model variables at
-  the chosen Venice id. Any other model id that the bridge does not list is replaced by the adapter with
-  `VENICE_ADAPTER_MODEL`.
+  the chosen Venice id. A model id that the bridge does not list (such as `claude-...`) is replaced by the
+  adapter with `VENICE_ADAPTER_MODEL`; an id with a `/` (a local `backend/model`) is passed through as is.
 - Checks before it starts: both `/health` endpoints answer and the Venice session is active. It warns when fewer
   than 500 requests are left in the web quota.
 - The ports `18891` and `18892` are fixed in the script. If you run either process on another port, edit the
@@ -243,10 +243,8 @@ off. The file is read on every request, so edits apply without a restart.
   are still listed.
 - A request to the bridge for a local-prefixed model whose backend is down answers `502` (`local_backend_error`)
   and never falls through to Venice.
-- Through the adapter it is different: the adapter replaces a model id that is not in the bridge's model list
-  (refreshed every 5 minutes) with `VENICE_ADAPTER_MODEL`, a Venice model. If the backend was down when the list
-  was read, a request for a local model through Claude Code or Codex can go to Venice instead. Start the backend
-  first, or restart the adapter after starting it.
+- The same holds through the adapter: it passes any id that contains a `/` straight to the bridge, so a local
+  model asked from Claude Code or Codex reaches its backend or fails with `502`; it is never sent to Venice.
 
 ## Model list and venice-auto
 
@@ -312,9 +310,8 @@ no reasoning.
 With tools in the request, `:think` and `VENICE_REASONING=1` are ignored, because a reasoning turn makes the
 model expect its `reasoning_content` passed back on the next turn, which coding agents do not do (HTTP 400).
 OpenCode, Claude Code and Codex always send tools, so `:think` has no effect in their agent loops; it is for plain
-chat and scripts. A `reasoning_effort` above `low` makes no thinking turn there either, but it still sets Venice's
-reasoning switch on the request, so leave it unset in agent loops. The adapter does not forward a reasoning
-effort.
+chat and scripts. The same holds for `reasoning_effort`: with tools in the request it is ignored and nothing
+about reasoning is sent to Venice. The adapter does not forward a reasoning effort.
 
 ## Response cache
 
@@ -418,7 +415,7 @@ forwarded; Venice's own `get_attachment` / `view_media` run there with made-up i
 - Reasoning is **off** by default. A thinking turn is made only when asked for (`:think`, `VENICE_REASONING=1`
   or `reasoning_effort` `medium` / `high`) and only when the request declares no tools; see
   [Reasoning](#reasoning-opt-in). Reasoning models want their `reasoning_content` passed back on tool turns, which
-  most clients do not do, and that ends in HTTP 400, so leave `reasoning_effort` unset in agent loops. The adapter
+  most clients do not do (HTTP 400), so a request with tools never gets reasoning, whatever it asks for. The adapter
   does not forward `temperature`, `top_p` or a reasoning effort, so Claude Code and Codex always run with
   reasoning off.
 - Always sent: large-context chat on. Venice's own system prompt is off, except on a thinking turn.
@@ -617,9 +614,7 @@ work, check what it produces, and do not use it for high-stakes changes.
 | `claude-venice`: "Venice web session is not active" | The login cookie expired. | Save a fresh cookie as in [Quick start](#1-save-your-veniceai-login-cookie), then `POST /reload`. |
 | Claude Code: "Auto mode could not evaluate this action and is blocking it for safety" | Auto mode's safety classifier needs a model that Venice's fast models cannot replace. | Leave the launcher's default (`VENICE_CLAUDE_SKIP_PERMS=1`), or pass a `--permission-mode <mode>` other than `auto` to be asked before tools run. |
 | `502` with `local_backend_error` "Local backend '…' (…) did not answer" | The local server for that model prefix is not running, or its URL is wrong. | Start it; check `~/.config/venice-bridge/backends.json`. |
-| A local model asked through Claude Code or Codex is answered by a Venice model | The local backend was down when the adapter last read the model list, so the adapter used `VENICE_ADAPTER_MODEL`. | Start the backend, then restart the adapter (or wait up to 5 minutes). |
 | Log line "backends.json is not valid JSON; using the default backends" | A syntax error in the backends file. | Fix the JSON; it is read again on the next request. |
-| `400` on a tool turn after setting a reasoning effort | Reasoning models want `reasoning_content` passed back, which most clients do not send. | Leave reasoning effort unset (or `low`). |
 | Codex cannot use MCP servers, multi-agent tools or `web_search` | Namespace tools and Codex's built-in `web_search` do not pass through the adapter. | Use function tools only, or the bridge's opt-in [web search](#web-search-opt-in). |
 
 The bridge logs to stderr (or to `venice_bridge.log` under the launchd template). Lines start with
@@ -729,6 +724,7 @@ session ok
 ok
 end to end ok
 local backends ok
+reasoning + venice-auto prefix ok
 ```
 
 ```bash
@@ -737,6 +733,7 @@ python3 test_venice_adapters.py
 
 ```text
 messages ok
+pick_model ok
 responses ok
 ```
 

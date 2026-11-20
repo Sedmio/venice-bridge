@@ -450,8 +450,8 @@ python3 venice_bridge.py --host 127.0.0.1 --port 18891</code></pre>
       <h3>4. Check it</h3>
       <pre><code>curl -s http://127.0.0.1:18891/health</code></pre>
       <p>A working login answers <code>{"ok": true, "venice_session": "active", "chat_quota": {...}}</code> with the remaining web chat quota. An offline self-check needs no network:</p>
-      <pre><code>python3 test_venice_bridge.py     <span class="c"># prints: cookie file ok, session ok, ok, end to end ok, local backends ok</span>
-python3 test_venice_adapters.py   <span class="c"># prints: messages ok, responses ok</span></code></pre>
+      <pre><code>python3 test_venice_bridge.py     <span class="c"># prints: cookie file ok, session ok, ok, end to end ok, local backends ok, reasoning + venice-auto prefix ok</span>
+python3 test_venice_adapters.py   <span class="c"># prints: messages ok, pick_model ok, responses ok</span></code></pre>
       <p>See <a href="#tests">Tests</a> for what they cover.</p>
 
       <h3>5. Add the provider to OpenCode</h3>
@@ -524,7 +524,7 @@ VENICE_CLAUDE_SKIP_PERMS=0 claude-venice               <span class="c"># keep th
       <h2>Codex CLI</h2>
       <p>Codex CLI talks to the adapter's <code>/v1/responses</code>. The provider is passed on the command line, so nothing is written to <code>~/.codex</code>:</p>
       <pre><code>VB_KEY=local codex exec --skip-git-repo-check -c 'model_providers.vb={name="vb",base_url="http://127.0.0.1:18892/v1",wire_api="responses",env_key="VB_KEY"}' -c model_provider=vb -m deepseek-v4-1-flash-uncensored "&lt;task&gt;"</code></pre>
-      <p>Measured with Codex CLI 0.163.0: it ran <code>exec_command</code> and answered. Limits: Codex's namespace tools (MCP servers, multi-agent) and its built-in <code>web_search</code> do not pass through. A model id the bridge does not list (for example a <code>gpt-...</code> id) is replaced by the adapter's default model (<code>VENICE_ADAPTER_MODEL</code>).</p>
+      <p>Measured with Codex CLI 0.163.0: it ran <code>exec_command</code> and answered. Limits: Codex's namespace tools (MCP servers, multi-agent) and its built-in <code>web_search</code> do not pass through. A model id the bridge does not list (for example a <code>gpt-...</code> id) is replaced by the adapter's default model (<code>VENICE_ADAPTER_MODEL</code>); an id with a <code>/</code> (a local <code>backend/model</code>) is passed through and never falls back to Venice.</p>
     </section>
 
     <section id="local-models">
@@ -590,7 +590,7 @@ claude-venice -m venice-auto               # works through the adapter, because 
         </tbody>
       </table></div>
       <p>The chain of thought comes back as OpenAI <code>reasoning_content</code>: a field on the message (non-stream) and <code>delta.reasoning_content</code> chunks (stream), sent before the normal <code>content</code>. On a thinking turn the bridge also lets Venice include its own system prompt, as the official web client does; without it the chat route returns no reasoning.</p>
-      <p>With tools in the request, <code>:think</code> and <code>VENICE_REASONING=1</code> are ignored, because a reasoning turn makes the model expect its <code>reasoning_content</code> passed back on the next turn, which coding agents do not do (HTTP 400). OpenCode, Claude Code and Codex always send tools, so <code>:think</code> has no effect in their agent loops; it is for plain chat and scripts. A <code>reasoning_effort</code> above <code>low</code> makes no thinking turn there either, but it still sets Venice's reasoning switch on the request, so leave it unset in agent loops. The adapter does not forward a reasoning effort.</p>
+      <p>With tools in the request, <code>:think</code> and <code>VENICE_REASONING=1</code> are ignored, because a reasoning turn makes the model expect its <code>reasoning_content</code> passed back on the next turn, which coding agents do not do (HTTP 400). OpenCode, Claude Code and Codex always send tools, so <code>:think</code> has no effect in their agent loops; it is for plain chat and scripts. The same holds for <code>reasoning_effort</code>: with tools in the request it is ignored and nothing about reasoning is sent to Venice. The adapter does not forward a reasoning effort.</p>
       <pre><code>curl -s http://127.0.0.1:18891/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v4-1-flash-uncensored:think","messages":[{"role":"user","content":"Is 1001 prime?"}]}'</code></pre>
     </section>
@@ -691,7 +691,7 @@ claude-venice -m venice-auto               # works through the adapter, because 
       </table></div>
 
       <h3 id="sampling">Settings sent to Venice</h3>
-      <p>On the plain chat route, <code>temperature</code> and <code>top_p</code> are forwarded when the client sets them; otherwise Venice's own defaults apply. <code>max_tokens</code> is ignored by the route. Reasoning is off by default. A thinking turn is made only when asked for (<code>:think</code>, <code>VENICE_REASONING=1</code> or <code>reasoning_effort</code> <code>medium</code> / <code>high</code>) and only when the request declares no tools (see <a href="#reasoning">Reasoning</a>), because reasoning models want <code>reasoning_content</code> passed back on tool turns, which most clients do not do, and Venice then answers HTTP 400. Leave <code>reasoning_effort</code> unset in agent loops. Always sent: large-context chat on. Venice's own system prompt is off, except on a thinking turn.</p>
+      <p>On the plain chat route, <code>temperature</code> and <code>top_p</code> are forwarded when the client sets them; otherwise Venice's own defaults apply. <code>max_tokens</code> is ignored by the route. Reasoning is off by default. A thinking turn is made only when asked for (<code>:think</code>, <code>VENICE_REASONING=1</code> or <code>reasoning_effort</code> <code>medium</code> / <code>high</code>) and only when the request declares no tools (see <a href="#reasoning">Reasoning</a>), because reasoning models want <code>reasoning_content</code> passed back on tool turns, which most clients do not do (HTTP 400), so a request with tools never gets reasoning, whatever it asks for. Always sent: large-context chat on. Venice's own system prompt is off, except on a thinking turn.</p>
 
       <h3 id="routes">Routes</h3>
       <p>Routes: <code>VENICE_BRIDGE_ROUTE</code> is <code>auto</code> (default), <code>chat</code> or <code>agent</code>. The chat route is the default path because Venice runs no agent loop there and gives the model no tools of its own, so nothing collides with the client's tools and no call is swallowed.</p>
@@ -895,10 +895,12 @@ curl -s http://127.0.0.1:18892/v1/messages -H 'Content-Type: application/json' \
 session ok
 ok
 end to end ok
-local backends ok</code></pre>
+local backends ok
+reasoning + venice-auto prefix ok</code></pre>
       <h3>2. Adapter</h3>
       <pre><code>python3 test_venice_adapters.py</code></pre>
       <pre><code>messages ok
+pick_model ok
 responses ok</code></pre>
       <h3>3. Live check (both processes running)</h3>
       <p>Not a self-check: it needs your login and spends no model request.</p>

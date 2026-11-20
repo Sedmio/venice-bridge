@@ -1128,6 +1128,29 @@ def local_backend_checks() -> None:
     print("local backends ok")
 
 
+def reasoning_auto_checks() -> None:
+    # Fix 2: reasoning must stay OFF on a tool turn, even with reasoning_effort high (400 trap otherwise).
+    tool = [{"type": "function", "function": {"name": "read"}}]
+    p, has = vb.openai_to_venice_chat({"model": "m", "reasoning_effort": "high",
+                                       "messages": [{"role": "user", "content": "hi"}], "tools": tool})
+    assert has is True and "_think" not in p and p["reasoningMode"] == "disabled"
+    chat = vb._to_chat_payload(p)
+    assert chat["reasoning"] is False and not any(t["content"].startswith("/think") for t in chat["prompt"])
+    # no tools + effort high still reasons
+    p2, _ = vb.openai_to_venice_chat({"model": "m", "reasoning_effort": "high", "messages": [{"role": "user", "content": "hi"}]})
+    assert p2.get("_think") is True and vb._to_chat_payload(p2)["reasoning"] is True
+
+    # Fix 3: venice-auto resolves even behind the OpenCode `venice-bridge/` provider prefix.
+    old_q = vb.VENICE.quota_until
+    vb.VENICE.quota_until = 0.0
+    try:
+        assert vb._resolve_auto("venice-bridge/venice-auto") == "deepseek-v4-1-flash-uncensored"
+        assert vb._resolve_auto("venice-bridge/venice-auto:think") == "deepseek-v4-1-flash-uncensored:think"
+    finally:
+        vb.VENICE.quota_until = old_q
+    print("reasoning + venice-auto prefix ok")
+
+
 if __name__ == "__main__":
     cookie_file_checks()
     try:
@@ -1135,5 +1158,6 @@ if __name__ == "__main__":
         main()
         end_to_end()
         local_backend_checks()
+        reasoning_auto_checks()
     finally:
         shutil.rmtree(STATE_DIR, ignore_errors=True)

@@ -38,9 +38,9 @@ run `curl -s -X POST http://127.0.0.1:18891/reload`.
   the repo README).
 - Local models: model id `ollama/<model>` or `lmstudio/<model>` goes to that local server, with no Venice quota.
 - Venice web search is off; add `:web` to a model id to turn it on for one request.
-- Reasoning is off; add `:think` to a model id for one request. It is ignored when tools are declared, so it
-  helps plain chat and scripts, not agent loops; the chain of thought comes back as `reasoning_content`. Do not
-  set `reasoning_effort` in an agent loop.
+- Reasoning is off; add `:think` to a model id for one request. It (and `reasoning_effort`) is ignored when tools
+  are declared, so it helps plain chat and scripts, not agent loops; the chain of thought comes back as
+  `reasoning_content`.
 - `/v1/models` lists only models the web subscription covers (no credit or `e2ee-*` models); a hidden id can
   still be requested.
 - Model `venice-auto`: a Venice model normally, a local model (default `ollama/qwen3:8b`) once the daily quota is

@@ -820,7 +820,9 @@ def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         "messages": prompt,
         "tools": [],  # Venice server tools; OpenCode's tools travel in the system prompt instead
         "clientTools": [],
-        "reasoningMode": "disabled" if effort in (None, "none", "minimal", "low") else "enabled",
+        # reasoning only on a no-tools turn (a reasoning turn wants reasoning_content passed back -> 400 on
+        # a tool call); _think already encodes this, and _to_chat_payload also reads reasoningMode, so gate both.
+        "reasoningMode": "enabled" if (effort in ("medium", "high") and not has_tools) else "disabled",
     }  # max_tokens is ignored by the route
     # temperature / top_p ARE honoured by the plain chat route (the official web client sends them,
     # venice.ai-normalChat.har); _to_chat_payload forwards them. Pass only what the client set.
@@ -1901,6 +1903,8 @@ DEFAULT_AUTO_MODELS = "deepseek-v4-1-flash-uncensored,ollama/qwen3:8b"
 
 def _resolve_auto(model: str) -> str:
     """Resolve `venice-auto` (optionally `venice-auto:think`/`:web`) to a concrete model id."""
+    if model.startswith("venice-bridge/"):  # OpenCode sends the provider prefix; strip it before matching
+        model = model.split("/", 1)[1]
     base, _, suffix = model.partition(":")
     if base != "venice-auto":
         return model

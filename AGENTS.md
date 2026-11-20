@@ -111,8 +111,7 @@ request declares no tools. The chain of thought comes back as `reasoning_content
 `delta.reasoning_content` chunks before `content` when streaming). Chat route only. With tools, `:think` and
 `VENICE_REASONING` are ignored: reasoning models want `reasoning_content` passed back on the next tool turn, which
 agents do not do (HTTP 400). So `:think` has no effect in OpenCode / Claude Code / Codex agent loops. A
-`reasoning_effort` above `low` makes no thinking turn with tools but still sets Venice's reasoning switch; do not
-set it there.
+`reasoning_effort` is ignored with tools too: nothing about reasoning reaches Venice on a tool request.
 
 `venice-auto` (virtual model) resolves to the first Venice id in `VENICE_AUTO_MODELS`; while the bridge knows the
 web quota is used up, to the first local `<backend>/<model>` entry, until the reset Venice reports. The request
@@ -134,10 +133,10 @@ over-quota state. Use: `opencode -m venice-bridge/venice-auto` (list it in the O
 
 The adapter forwards tool declarations, tool calls and results, `max_tokens` (`max_output_tokens` for Responses)
 and the stream flag. It does not forward `temperature`, `top_p` or a reasoning effort. Freeform Responses tools
-(such as `apply_patch`) become a function with one `input` string. A model id the upstream does not list (checked
-against a model list refreshed every 5 minutes) is replaced with `VENICE_ADAPTER_MODEL`; a `:web` / `:xsearch`
-suffix is kept when the base id is listed. Consequence: a local-prefixed model whose backend was down at the last
-list read goes to the Venice default model instead of failing. Images and documents are replaced by a short
+(such as `apply_patch`) become a function with one `input` string. An id that contains a `/` (a local `backend/model`, or
+`venice-bridge/...`) is passed through unchanged, so a local model never falls back to Venice; any other id the
+upstream does not list (checked against a model list refreshed every 5 minutes) is replaced with
+`VENICE_ADAPTER_MODEL`; a `:web` / `:xsearch` suffix is kept when the base id is listed. Images and documents are replaced by a short
 "omitted" note. `usage` reports `cached_tokens: 0`.
 
 ## Environment variables
@@ -200,10 +199,12 @@ session ok
 ok
 end to end ok
 local backends ok
+reasoning + venice-auto prefix ok
 ```
 
 ```text
 messages ok
+pick_model ok
 responses ok
 ```
 
@@ -269,8 +270,6 @@ Live check of a running setup: `claude-venice --quota` prints `Venice web quota 
 | Model claims its tools are unavailable / "Tool not found" | The request used the agent route (check `route=` in the log), where Venice swallows native tool calls. Use `VENICE_BRIDGE_ROUTE=auto` or `chat`, or a model that exists on the chat route; in an existing conversation tell the model its tools work now, or start a new session. |
 | `502` "Venice answered HTTP 400: … modelNotFound" with `VENICE_BRIDGE_ROUTE=chat` | The model exists only on the agent route. Use `auto`. |
 | `502` `local_backend_error` | The local server for that prefix is down or misconfigured in `backends.json`. Start it; do not retry against Venice. |
-| Local model through the adapter answered by a Venice model | The backend was down at the adapter's last model-list read. Start the backend and restart the adapter. |
-| `400` on a tool turn with a reasoning effort set | Leave `reasoning_effort` unset or `low`. |
 | `claude-venice` exits "… is down" / "session is not active" | Start the bridge and adapter / ask the user for a fresh cookie. |
 | Claude Code "Auto mode could not evaluate this action" | Auto mode cannot work with these models; use the launcher default or a `--permission-mode <mode>` other than `auto`. |
 | `Address already in use` on start | A process is already running on that port; check `/health` instead of starting another. |

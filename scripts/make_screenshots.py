@@ -147,8 +147,8 @@ def pretty(obj, width):
 def screens(g, cols):
     url = BRIDGE_PORT_LABEL
     hdr = "-H 'Content-Type: application/json'"
-    s1 = [[("p", "$ "), ("c", "python3 test_venice_bridge.py")]]
-    s1 += [[("o", l)] for l in g["selfcheck"]]
+    s1 = [[("p", "$ "), ("c", "python3 test_venice_bridge.py | tail -n 3")]]
+    s1 += [[("o", l)] for l in g["selfcheck"][-3:]]
     s1 += [[], [("p", "$ "), ("c", "curl -s %s/health | python3 -m json.tool" % url)]]
     health = dict(g["health"])
     cache = health.pop("cache", None)  # shown on one line so the screen stays readable

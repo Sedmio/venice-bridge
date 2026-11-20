@@ -56,6 +56,8 @@ def _pick_model(asked: Any) -> str:
     # keep a per-request web suffix (deepseek-...:web / :xsearch) when the BASE model is valid, so the
     # bridge can parse it; a bare valid id passes through; anything else falls back to the default.
     if isinstance(asked, str):
+        if "/" in asked.split(":")[0]:
+            return asked  # a local backend id (ollama/...): let the bridge route it or 502, never silently Venice
         if asked in _MODELS[1]:
             return asked
         if asked.split(":")[0] in _MODELS[1]:
