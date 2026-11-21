@@ -3,6 +3,20 @@
 All notable changes to venice-bridge. Versions follow [Semantic Versioning](https://semver.org/).
 Releases: <https://github.com/nsozturk/venice-bridge/releases> · PyPI: <https://pypi.org/project/venice-bridge/>
 
+## 0.2.5 — 2026-11-21
+
+### Fixed
+
+- **Explicit `webEnabled: false`, `webScrapeEnabled: false`, `xSearchEnabled: false` by default.** Previously omitting these keys caused Venice `/api/inference/chat` to default to `auto` web search and inject unrelated web articles into coding turns unless `:web` / `:xsearch` was requested. Setting them explicitly to `false` eliminates web-search hijacking on tool-calling turns.
+- **Claude Code `2.1.329` tool-schema parity (`ARG_ALIASES` & `SAME_TOOL`).** Added Claude Code's snake_case argument names (`file_path`, `old_string`, `new_string`, `replace_all`, `run_in_background`, `skill`) to `ARG_ALIASES` (fixing dropped `path`/`filePath` arguments on `Read`/`Edit`/`Write`) and added `"agent"` to `SAME_TOOL["task"]`.
+- **New `_route_call` aliases for hallucinated and deferred tools:**
+  - `SQL_ALIASES` (`sql_query`, `sqlite_query`, `db_query`, `execute_sql`, `run_sql`, `query_db`, `sql`, etc.) → read-only `sqlite3 -readonly <db> <sql>` via `Bash`/`shell` when both database path and SQL query are provided.
+  - `DATE_ALIASES` (`get_current_date`, `get_date`, `current_date`, `get_time`, `current_time`, `get_current_time`, `date`) → `date -u '+%Y-%m-%d %H:%M:%S UTC'` via `Bash`/`shell`.
+  - Deferred `grep`/`search` and `glob`/`find_files` (when `Grep`/`Glob` are deferred and absent from declared tools) → bounded `grep -rn ... | head -n 50` and `find ... | head -n 50` via `Bash`/`shell`.
+- **Double-encoded `command` unwrap in `_fit_arguments`.** Unwraps `{"command": '{"command": "..."}'}` and salvaged `{"content": '{"command": "..."}'}` payloads so shells no longer fail with `command not found: command:`.
+- **`TOOL_REMINDER` cleanup.** Removed the literal `"example_tool"` placeholder from the reminder prompt so models stop hallucinating `example_tool` calls.
+- **`claude-venice` `bypassPermissions` on resumed sessions.** The launcher now passes `--permission-mode bypassPermissions` alongside `--dangerously-skip-permissions` by default (and pairs `--dangerously-skip-permissions` whenever `--permission-mode bypassPermissions` is explicitly passed), so `--resume <id>` sessions originally saved in `default` mode do not fall back to interactive permission prompts.
+
 ## 0.2.4 — 2026-11-21
 
 ### Added

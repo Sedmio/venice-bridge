@@ -108,12 +108,23 @@ command -v claude >/dev/null 2>&1 || die "'claude' command not found on PATH"
 # It adds --dangerously-skip-permissions UNLESS you already passed a permission flag, or opt out with
 # VENICE_CLAUDE_SKIP_PERMS=0 (then normal prompts / your chosen --permission-mode apply).
 add_skip="${VENICE_CLAUDE_SKIP_PERMS:-1}"
+has_dsp=0
+want_bypass=0
+prev=""
 for a in "$@"; do
   case "$a" in
-    --dangerously-skip-permissions|--permission-mode|--permission-mode=*) add_skip=0 ;;
+    --dangerously-skip-permissions) add_skip=0; has_dsp=1 ;;
+    --permission-mode=bypassPermissions) add_skip=0; want_bypass=1 ;;
+    --permission-mode|--permission-mode=*) add_skip=0 ;;
   esac
+  if [ "$prev" = "--permission-mode" ] && [ "$a" = "bypassPermissions" ]; then
+    want_bypass=1
+  fi
+  prev="$a"
 done
 if [ "$add_skip" = "1" ]; then
+  set -- --dangerously-skip-permissions --permission-mode bypassPermissions "$@"
+elif [ "$want_bypass" = "1" ] && [ "$has_dsp" = "0" ]; then
   set -- --dangerously-skip-permissions "$@"
 fi
 

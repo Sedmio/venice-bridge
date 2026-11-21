@@ -179,15 +179,18 @@ Then use the `claude-venice` launcher from this folder:
 
 ```bash
 ln -s "$PWD/claude-venice" ~/.local/bin/claude-venice    # or run ./claude-venice
+ln -s "$PWD/claude-venice" ~/.local/bin/cv               # optional short alias (defaults to bypassPermissions)
 claude-venice                                             # default model deepseek-v4-1-flash-uncensored
+claude-venice --lean                                      # disable MCP servers (--strict-mcp-config)
 claude-venice -m <venice-model-id>                        # another Venice model
 VENICE_CLAUDE_MODEL=<venice-model-id> claude-venice       # same, from the environment
 claude-venice -m deepseek-v4-1-flash-uncensored:web       # with Venice web search (see below)
+claude-venice --resume <session-id>                       # resumes in bypassPermissions mode
 claude-venice --models                                    # list the model ids the bridge serves
 claude-venice --quota                                     # remaining web quota and cache counters
 ```
 
-`-m`, `--models` and `--quota` must be the first argument; everything else is passed to `claude`.
+`-m` and `--lean` may appear anywhere before `--`; `--models` and `--quota` must be the first argument. Everything else is passed to `claude`.
 
 What the launcher does:
 
@@ -203,14 +206,14 @@ What the launcher does:
   `BRIDGE` and `ADAPTER` lines at the top of `claude-venice`.
 
 > [!WARNING]
-> **`claude-venice` adds `--dangerously-skip-permissions` by default.** Claude Code then runs every tool
-> (shell commands, file writes) **without asking you first**. The reason: Venice's fast models cannot drive
+> **`claude-venice` adds `--dangerously-skip-permissions --permission-mode bypassPermissions` by default.** Claude Code then runs every tool
+> (shell commands, file writes) **without asking you first** — including when resuming an older session with `--resume` that was originally saved in `default` mode. The reason: Venice's fast models cannot drive
 > Claude Code's auto-mode safety classifier, which then blocks with "Auto mode could not evaluate this action and
 > is blocking it for safety". Shell commands run with your full user permissions and are not confined to the
 > working folder, and these models make mistakes: use it only on a machine and with files you can afford to have
 > changed or deleted. To get permission prompts back,
 > set `VENICE_CLAUDE_SKIP_PERMS=0`, or pass your own `--permission-mode <mode>` (any permission flag you pass
-> turns the default off).
+> turns the default off; passing `--permission-mode bypassPermissions` still pairs it with `--dangerously-skip-permissions`).
 
 ## Use it with Codex CLI
 

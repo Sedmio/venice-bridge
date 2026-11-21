@@ -320,9 +320,8 @@ def main() -> None:
     plain = 'Here is the message:\n{"content": "hi", "role": "user"}'
     assert vb._read_reply(plain, tools) == (None, plain, False)
 
-    # the reminder's one example is a real call when nothing is declared, and prose when real tools are
-    example = vb.TOOL_REMINDER[vb.TOOL_REMINDER.index('{"tool_calls":[{"name":"example_tool"'):].split("} ", 1)[0] + "}"
-    assert len(vb.TOOL_REMINDER) < 700 and names(example) == ["example_tool"]
+    # the reminder's format placeholder stays under 700 chars and is never misread as a real call when tools are declared
+    assert len(vb.TOOL_REMINDER) < 700
     assert names(vb.TOOL_REMINDER, tools) == []
 
     # request translation: system joined, tool result and assistant call kept, reminder last
@@ -1199,6 +1198,14 @@ def nested_arguments_unwrap_checks():
     props_with_input = {"input": {"type": "object"}}
     out = vb._coerce_arguments(vb._fit_arguments({"input": {"a": 1}}, props_with_input), props_with_input)
     assert out == {"input": {"a": 1}}, out
+    # 6. Double-encoded {"command": '{"command": "cd /tmp && ls"}'} and salvaged {"content": '{"command": "..."}'}
+    out = vb._fit_arguments({"command": '{"command": "cd /tmp && ls", "timeout": 5000}'}, props, ["command"])
+    assert out == {"command": "cd /tmp && ls", "timeout": 5000}, out
+    out = vb._fit_arguments({"content": '{"command": "echo hi"}'}, props, ["command"])
+    assert out == {"command": "echo hi"}, out
+    # Negative: valid bash brace group '{ echo hi; }' must stay untouched
+    out = vb._fit_arguments({"command": "{ echo hi; }"}, props, ["command"])
+    assert out == {"command": "{ echo hi; }"}, out
     print("nested arguments unwrap ok")
 
 
@@ -1229,7 +1236,29 @@ def bare_string_content_checks():
     # phase-0c: qwen-3-8-27b called the shell as `bash_tool`; it must reach the declared bash / shell tool
     assert vb._route_call("bash_tool", {"command": "ls"}, {"bash": "bash"}) == ("bash", {"command": "ls"})
     assert vb._route_call("bash_tool", {"command": "ls"}, {"shell": "shell"}) == ("shell", {"command": "ls"})
-    print("bash_tool alias ok")
+    # SQL tool hallucinations (sql_query / query_sql / execute_sql) -> read-only sqlite3 via bash
+    assert vb._route_call("sql_query", {"db": "/tmp/a.db", "query": "SELECT 1"}, {"bash": "Bash"}) == (
+        "Bash", {"command": "sqlite3 -readonly /tmp/a.db 'SELECT 1'"})
+    assert vb._route_call("execute_sql", {"database": "/tmp/a.db", "sql": "SELECT COUNT(*) FROM t"}, {"shell": "shell"}) == (
+        "shell", {"command": "sqlite3 -readonly /tmp/a.db 'SELECT COUNT(*) FROM t'"})
+    assert vb._route_call("sql_query", {"query": "SELECT 1"}, {"bash": "Bash"}) is None  # missing db -> do not guess
+    # Date & deferred-grep/glob hallucinations -> Bash; Claude Code 2.1.329 snake_case ARG_ALIASES & Agent
+    assert vb._route_call("get_current_date", {}, {"bash": "Bash"}) == ("Bash", {"command": "date -u '+%Y-%m-%d %H:%M:%S UTC'"})
+    assert vb._route_call("search", {"pattern": "TODO", "path": "/tmp/x"}, {"bash": "Bash"}) == (
+        "Bash", {"command": "grep -rn -- TODO /tmp/x | head -n 50"})
+    assert vb._route_call("find_files", {"pattern": "*.py", "path": "/tmp/x"}, {"bash": "Bash"}) == (
+        "Bash", {"command": "find /tmp/x -name '*.py' | head -n 50"})
+    assert vb._have("task", {"agent": "Agent"}) == "Agent"
+    assert vb._fit_arguments({"path": "/tmp/a.txt"}, {"file_path": {"type": "string"}}) == {"file_path": "/tmp/a.txt"}
+    assert vb._fit_arguments({"filePath": "/tmp/a.txt", "oldString": "a", "newString": "b"},
+                             {"file_path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}}) == {
+        "file_path": "/tmp/a.txt", "old_string": "a", "new_string": "b"}
+    # _to_chat_payload must explicitly send webEnabled=False / xSearchEnabled=False when off (prevents Venice auto web search)
+    p_plain, _ = vb.openai_to_venice_chat({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    cp = vb._to_chat_payload(p_plain)
+    assert cp.get("webEnabled") is False and cp.get("webScrapeEnabled") is False and cp.get("xSearchEnabled") is False, cp
+    assert "example_tool" not in vb.TOOL_REMINDER
+    print("bash_tool + sql_query + date + deferred_grep + explicit_web_false ok")
     # P1-4: where a runaway reply is cut
     one = '{"tool_calls":[{"name":"Bash","arguments":{"command":"echo %d"}}]}\n'
     calls41 = "".join(one % i for i in range(41))

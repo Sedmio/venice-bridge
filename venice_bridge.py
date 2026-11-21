@@ -213,12 +213,11 @@ def _to_chat_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         out["temperature"] = payload["temperature"]
     if isinstance(payload.get("topP"), (int, float)):
         out["topP"] = payload["topP"]
-    # opt-in Venice server-side web (see _parse_web_tags); off unless asked.
-    if payload.get("_webEnabled"):
-        out["webEnabled"] = True
-        out["webScrapeEnabled"] = True
-    if payload.get("_xSearch"):
-        out["xSearchEnabled"] = True
+    # Explicitly send False when off: omitting webEnabled lets Venice default to auto web search,
+    # injecting unrelated web search results into coding/tool turns (measured 2026-11-21).
+    out["webEnabled"] = bool(payload.get("_webEnabled"))
+    out["webScrapeEnabled"] = bool(payload.get("_webEnabled"))
+    out["xSearchEnabled"] = bool(payload.get("_xSearch"))
     return out
 
 
@@ -1042,12 +1041,10 @@ def _build_tool_instructions(
 # the format goes last, after the conversation.
 TOOL_REMINDER = (
     "(format reminder) Only a JSON object makes anything happen on the user's computer: code blocks and "
-    "described commands are never run. To use a tool, reply now with ONLY "
-    '{"tool_calls":[{"name":"<exact tool name>","arguments":{...}}]}, for example '
-    '{"tool_calls":[{"name":"example_tool","arguments":{"path":"notes.txt"}}]} '
-    "(example_tool is only an illustration; use the real tool names). Put parameters directly in arguments "
-    "(never nest arguments inside arguments); for multi-line SQL/Python use heredoc. After sending calls, "
-    "stop and wait for the tool result. If the task is finished, reply with normal text."
+    "described commands are never run. To use a declared tool, reply now with ONLY "
+    '{"tool_calls":[{"name":"<exact tool name from [TOOLS]>","arguments":{...}}]}. '
+    "Put parameters directly in arguments (never nest arguments inside arguments); for multi-line SQL/Python "
+    "use heredoc. After sending calls, stop and wait for the tool result. If the task is finished, reply with normal text."
 )
 
 
@@ -1441,7 +1438,7 @@ TOOL_ALIASES = {  # client tool -> names models use for it
                  "ask_question", "clarify"),
 }
 # The same client tool under the names different OpenCode versions give it (CLI: bash, desktop app: shell).
-SAME_TOOL = {"bash": ("bash", "shell"), "glob": ("glob", "find"), "task": ("task", "subagent")}
+SAME_TOOL = {"bash": ("bash", "shell"), "glob": ("glob", "find"), "task": ("task", "subagent", "agent")}
 
 
 def _have(target: str, declared: Dict[str, str]) -> Optional[str]:
@@ -1452,19 +1449,25 @@ def _have(target: str, declared: Dict[str, str]) -> Optional[str]:
 LISTING_ALIASES = ("ls", "list_files", "list_dir", "list_directory", "listdir", "dir", "list", "tree", "list_dir_tree")
 ARG_ALIASES = {  # argument name of the client tool -> names models use for it
     "filePath": ("path", "file", "file_path", "filepath", "filename", "file_name", "target_file"),
+    "file_path": ("filePath", "path", "file", "filepath", "filename", "file_name", "target_file"),
     "path": ("filePath", "file_path", "file", "filepath", "filename", "file_name", "target_file",
              "absolute_path", "relative_path", "notebook_path", "dir", "directory", "folder", "cwd"),
     "workdir": ("cwd", "dir", "directory", "working_directory", "working_dir"),
     "include": ("glob", "file_pattern", "include_pattern", "globs", "file_glob"),
     "background": ("run_in_background", "run_async", "detach"),
+    "run_in_background": ("background", "run_async", "detach"),
     "limit": ("head_limit", "max_results", "max", "count"),
     "replaceAll": ("replace_all", "all", "global"),
+    "replace_all": ("replaceAll", "all", "global"),
     "caseSensitive": ("case_sensitive",),
     "agent": ("subagent_type", "agent_type", "subagent", "agent_name", "role", "mode"),
     "id": ("skill_id", "skill_name", "skill", "name"),
+    "skill": ("id", "skill_id", "skill_name", "name"),
     "command": ("cmd", "script", "code", "shell_command", "input", "expression"),
     "oldString": ("old_string", "old_str", "old", "old_text", "search", "find"),
+    "old_string": ("oldString", "old_str", "old", "old_text", "search", "find"),
     "newString": ("new_string", "new_str", "new", "new_text", "replace", "replacement"),
+    "new_string": ("newString", "new_str", "new", "new_text", "replace", "replacement"),
     "content": ("contents", "text", "file_text", "data", "body"),
     "pattern": ("query", "regex", "glob", "q", "search", "name"),
     "query": ("q", "search", "pattern", "text", "prompt"),
@@ -1484,9 +1487,31 @@ def _fit_arguments(args: Any, props: Dict[str, Any], required: Any = ()) -> Any:
         return args
     args = dict(args)
     if (list(args) == ["content"] and "content" not in props and isinstance(args["content"], str)):
-        req_strings = [k for k in (required or []) if k in props and props[k].get("type") in ("string", None)]
-        if len(req_strings) == 1:
-            return {req_strings[0]: args["content"]}
+        s = args["content"].strip()
+        if s.startswith("{"):
+            try:
+                parsed, _ = read_lenient(s, 0)
+                if isinstance(parsed, dict) and any(k in props for k in parsed):
+                    args = parsed
+            except Exception:
+                pass
+        if list(args) == ["content"] and "content" not in props:
+            req_strings = [k for k in (required or []) if k in props and props[k].get("type") in ("string", None)]
+            if len(req_strings) == 1:
+                args = {req_strings[0]: args["content"]}
+    # Models occasionally double-encode the primary string argument itself as JSON, e.g.
+    # {"command": '{"command": "cd ..."}'} -> zsh tries to execute '{"command":' and fails with exit 127.
+    if "command" in props and isinstance(args.get("command"), str) and args["command"].lstrip().startswith("{"):
+        try:
+            parsed, _ = read_lenient(args["command"].lstrip(), 0)
+            if isinstance(parsed, dict) and isinstance(parsed.get("command"), str):
+                for k, v in parsed.items():
+                    if k == "command":
+                        args["command"] = v
+                    elif k in props and k not in args:
+                        args[k] = v
+        except Exception:
+            pass
     # Models frequently double-wrap tool inputs as {"arguments": {...}} or {"name": "...", "arguments": {...}}
     # or Anthropic-style {"input": {...}}. Unwrap before schema pruning so commands are not dropped.
     for _ in range(3):
@@ -1620,6 +1645,10 @@ def _expand_call(name: str, args: Any, declared: Dict[str, str]) -> Optional[Lis
     return None
 
 
+SQL_ALIASES = ("sql_query", "query_sql", "execute_sql", "run_sql", "sqlite_query", "sqlite", "db_query", "query_db", "sql")
+DATE_ALIASES = ("get_current_date", "get_date", "current_date", "get_time", "current_time", "get_current_time", "date")
+
+
 def _route_call(name: str, args: Any, declared: Dict[str, str]) -> Optional[Tuple[str, Any]]:
     """(client tool, arguments) for a call to a tool the client does not have, or None."""
     low = _PREFIX_RE.sub("", name).lower()  # functions.shell / default_api.read -> the bare name
@@ -1634,6 +1663,27 @@ def _route_call(name: str, args: Any, declared: Dict[str, str]) -> Optional[Tupl
             return declared["list"], {"path": where}
         if _have("bash", declared):
             return _have("bash", declared), {"command": "ls -la " + shlex.quote(where)}
+        return None
+    if low in DATE_ALIASES and _have("bash", declared):
+        return _have("bash", declared), {"command": "date -u '+%Y-%m-%d %H:%M:%S UTC'"}
+    if low in SQL_ALIASES and _have("bash", declared):
+        sql = next((args[k] for k in ("query", "sql", "statement", "command") if isinstance(args.get(k), str) and args[k].strip()), None)
+        db = next((args[k] for k in ("db", "database", "db_path", "database_path", "path", "file", "file_path", "filepath")
+                   if isinstance(args.get(k), str) and args[k].strip()), None)
+        if sql and db:
+            return _have("bash", declared), {"command": f"sqlite3 -readonly {shlex.quote(db)} {shlex.quote(sql)}"}
+        return None
+    if (low == "grep" or low in TOOL_ALIASES["grep"]) and not _have("grep", declared) and _have("bash", declared):
+        pat = next((args[k] for k in ("pattern", "query", "q", "regex", "search", "text") if isinstance(args.get(k), str) and args[k].strip()), None)
+        where = next((args[k] for k in ("path", "dir", "directory", "file", "filePath", "file_path") if isinstance(args.get(k), str) and args[k].strip()), ".")
+        if pat:
+            return _have("bash", declared), {"command": f"grep -rn -- {shlex.quote(pat)} {shlex.quote(where)} | head -n 50"}
+        return None
+    if (low == "glob" or low in TOOL_ALIASES["glob"]) and not _have("glob", declared) and _have("bash", declared):
+        pat = next((args[k] for k in ("pattern", "glob", "name", "query") if isinstance(args.get(k), str) and args[k].strip()), None)
+        where = next((args[k] for k in ("path", "dir", "directory") if isinstance(args.get(k), str) and args[k].strip()), ".")
+        if pat:
+            return _have("bash", declared), {"command": f"find {shlex.quote(where)} -name {shlex.quote(pat)} | head -n 50"}
         return None
     if low in ("view_media", "get_attachment", "hydrate_content"):
         # Venice's media tools take ids; such a call is a file read only when the id is a file path

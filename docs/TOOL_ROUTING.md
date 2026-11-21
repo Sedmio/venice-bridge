@@ -1,7 +1,7 @@
 # Tool routing — Claude Code / OpenCode / Codex → Venice
 
 How a client's tools reach the Venice web model and how the model's tool calls are mapped back.
-Source of truth is the code (`venice_bridge.py`, `venice_adapters.py`); this page describes v0.2.4.
+Source of truth is the code (`venice_bridge.py`, `venice_adapters.py`); this page describes v0.2.5.
 
 ## TL;DR
 
@@ -53,10 +53,17 @@ each request sent.
 | `skill` | use_skill, load_skill, run_skill, invoke_skill |
 | `question` | askuserquestion, ask_user, ask_followup_question, ask, clarify … |
 | listing (`ls`, `list_files`, `dir`, `tree` …) | to a declared `list` tool, else `bash: ls -la <path>` |
+| SQL (`sql_query`, `sqlite_query`, `db_query`, `execute_sql`, `run_sql`, `sql` …) | `bash: sqlite3 -readonly <db> <sql>` (when both database path and SQL query are given) |
+| date/time (`get_current_date`, `get_date`, `current_date`, `get_time`, `date` …) | `bash: date -u '+%Y-%m-%d %H:%M:%S UTC'` |
+| deferred `grep` / `glob` (when absent from declared tools) | `bash: grep -rn -- <pat> <where> \| head -n 50` / `find <where> -name <pat> \| head -n 50` |
 
 Mapping only fires when the client **does not** declare that exact name; a declared name always wins and
 is left alone. `SAME_TOOL` resolves the same role across client versions (CLI `bash` vs desktop
-`shell`).
+`shell`, `task` vs `agent`), and `ARG_ALIASES` maps camelCase/generic keys to Claude Code's snake_case
+parameters (`file_path`, `old_string`, `new_string`, `replace_all`, `run_in_background`, `skill`).
+Unless `:web` or `:xsearch` is requested, `_to_chat_payload` explicitly sends `webEnabled: false`,
+`webScrapeEnabled: false`, and `xSearchEnabled: false` so Venice does not inject automatic web-search
+results into tool-calling turns.
 
 ## 4. Venice's own server tools → client tool, `VENICE_SERVER_TOOLS` (`venice_bridge.py`)
 

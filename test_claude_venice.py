@@ -80,9 +80,14 @@ def main():
 
         # 7. Zero args and bare --lean do not trip bash set -u on empty PASS_ARGS
         r = run_launcher(bindir, [])
-        assert r["argv"] == ["--dangerously-skip-permissions"], r
+        assert r["argv"] == ["--dangerously-skip-permissions", "--permission-mode", "bypassPermissions"], r
         r = run_launcher(bindir, ["--lean"])
         assert "--strict-mcp-config" in r["argv"] and "--lean" not in r["argv"], r
+        # 8. Explicit --permission-mode bypassPermissions still gets --dangerously-skip-permissions; other modes do not
+        r = run_launcher(bindir, ["--permission-mode", "bypassPermissions", "-p", "hi"])
+        assert "--dangerously-skip-permissions" in r["argv"], r
+        r = run_launcher(bindir, ["--permission-mode", "plan", "-p", "hi"])
+        assert "--dangerously-skip-permissions" not in r["argv"], r
 
     print("claude-venice --lean tests ok")
 

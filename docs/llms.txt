@@ -2,7 +2,7 @@
 
 > venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.
 
-Unofficial: not affiliated with, endorsed by, or supported by Venice.ai. It uses undocumented web endpoints and your own logged-in session, which may be against Venice's terms of service. Use your own account only. Version 0.2.4, MIT.
+Unofficial: not affiliated with, endorsed by, or supported by Venice.ai. It uses undocumented web endpoints and your own logged-in session, which may be against Venice's terms of service. Use your own account only. Version 0.2.5, MIT.
 
 ## What it does
 

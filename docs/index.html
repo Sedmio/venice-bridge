@@ -32,7 +32,7 @@
   "description": "venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.",
   "operatingSystem": "macOS",
   "applicationCategory": "DeveloperApplication",
-  "softwareVersion": "0.2.4",
+  "softwareVersion": "0.2.5",
   "license": "https://opensource.org/licenses/MIT",
   "codeRepository": "https://github.com/nsozturk/venice-bridge",
   "downloadUrl": "https://github.com/nsozturk/venice-bridge",
@@ -276,7 +276,7 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
 <body>
 
 <header class="navbar">
-  <a href="#overview" class="brand">venice-bridge <span class="badge">v0.2.4</span></a>
+  <a href="#overview" class="brand">venice-bridge <span class="badge">v0.2.5</span></a>
   <div class="nav-actions">
     <a href="#quick-start" class="nav-link">Quick start</a>
     <a href="#how-it-works" class="nav-link">How it works</a>
@@ -396,6 +396,13 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
     <section id="whats-new">
       <h2>What's new</h2>
       <p>Full history: <a href="https://github.com/nsozturk/venice-bridge/blob/main/CHANGELOG.md">CHANGELOG.md</a> · <a href="https://github.com/nsozturk/venice-bridge/releases">Releases</a> · <a href="https://pypi.org/project/venice-bridge/">PyPI</a></p>
+      <h3>v0.2.5 <small>2026-11-21</small></h3>
+      <ul>
+        <li><strong>No more auto web-search hijacking:</strong> explicitly sends <code>webEnabled: false</code>, <code>webScrapeEnabled: false</code>, and <code>xSearchEnabled: false</code> unless <code>:web</code> / <code>:xsearch</code> is requested.</li>
+        <li><strong>Claude Code 2.1.329 tool-schema parity:</strong> maps snake_case arguments (<code>file_path</code>, <code>old_string</code>, <code>new_string</code>, <code>replace_all</code>, <code>run_in_background</code>, <code>skill</code>) and <code>Agent</code> alongside <code>Task</code>.</li>
+        <li><strong>New tool routing aliases:</strong> <code>sql_query</code> / <code>sqlite_query</code> → read-only <code>sqlite3</code> on <code>Bash</code>, <code>get_current_date</code> → <code>date -u</code>, deferred <code>grep</code>/<code>glob</code> → <code>Bash</code>, plus double-encoded <code>command</code> unwrapping and removal of literal <code>example_tool</code> from the reminder prompt.</li>
+        <li><strong><code>claude-venice</code> <code>--resume</code> fix:</strong> pairs <code>--dangerously-skip-permissions</code> with <code>--permission-mode bypassPermissions</code> so resumed sessions stay autonomous (optional short alias: <code>cv</code>).</li>
+      </ul>
       <h3>v0.2.4 <small>2026-11-21</small></h3>
       <ul>
         <li><strong>Images and documents</strong> in chat (OpenAI, Anthropic and Responses formats, base64 only, 17 file types).</li>
@@ -541,7 +548,7 @@ python3 test_venice_adapters.py   <span class="c"># prints: messages ok, pick_mo
 
       <div class="callout warn" role="note">
         <div class="callout-title">Warning: claude-venice skips permission prompts by default</div>
-        <p>It adds <code>--dangerously-skip-permissions</code> to every run, so <strong>Claude Code runs tools (shell commands, file edits) without asking you</strong>. The reason: Venice's fast models cannot drive Claude Code's auto-mode safety classifier, which then blocks with "Auto mode could not evaluate this action and is blocking it for safety". Run it only in a folder you are ready to lose changes in.</p>
+        <p>It adds <code>--dangerously-skip-permissions --permission-mode bypassPermissions</code> to every run (including <code>--resume</code> sessions previously saved in <code>default</code> mode), so <strong>Claude Code runs tools (shell commands, file edits) without asking you</strong>. The reason: Venice's fast models cannot drive Claude Code's auto-mode safety classifier, which then blocks with "Auto mode could not evaluate this action and is blocking it for safety". Run it only in a folder you are ready to lose changes in.</p>
         <p>To turn it off, set <code>VENICE_CLAUDE_SKIP_PERMS=0</code>, or pass your own <code>--permission-mode</code>; either way the normal prompts or your chosen mode apply.</p>
       </div>
 
@@ -550,7 +557,9 @@ python3 test_venice_adapters.py   <span class="c"># prints: messages ok, pick_mo
 
       <h3>Usage</h3>
       <pre><code>claude-venice                                          <span class="c"># default model deepseek-v4-1-flash-uncensored</span>
-claude-venice -m &lt;venice-model-id&gt;                     <span class="c"># -m must be the first argument</span>
+claude-venice --lean                                   <span class="c"># disable MCP servers (--strict-mcp-config)</span>
+claude-venice -m &lt;venice-model-id&gt;                     <span class="c"># -m and --lean work anywhere before --</span>
+claude-venice --resume &lt;session-id&gt;                    <span class="c"># resumes in bypassPermissions mode</span>
 claude-venice --models                                 <span class="c"># list the model ids the bridge serves</span>
 claude-venice --quota                                  <span class="c"># remaining web quota and cache stats</span>
 VENICE_CLAUDE_MODEL=&lt;venice-model-id&gt; claude-venice
@@ -1088,7 +1097,7 @@ claude-venice --quota                   <span class="c"># Venice web quota  rema
     <div class="no-results" id="noResults">No section matches your search.</div>
 
     <footer>
-      <p>venice-bridge v0.2.4 · MIT · <a href="https://github.com/nsozturk/venice-bridge">github.com/nsozturk/venice-bridge</a> · Unofficial, not affiliated with Venice.ai.</p>
+      <p>venice-bridge v0.2.5 · MIT · <a href="https://github.com/nsozturk/venice-bridge">github.com/nsozturk/venice-bridge</a> · Unofficial, not affiliated with Venice.ai.</p>
     </footer>
   </main>
 </div>
