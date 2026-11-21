@@ -1,13 +1,34 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "venice-bridge"
 version = "0.2.1"
 description = "Local OpenAI- and Anthropic-compatible bridge that lets OpenCode, Claude Code, Codex CLI and other coding agents use a venice.ai web subscription, with working tool calls."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE", "NOTICE.md", "THIRD_PARTY_LICENSE-opencode-venice-web.txt"]
+authors = [{ name = "nsozturk" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console",
+    "Topic :: Software Development",
+]
 dependencies = ["curl_cffi>=0.7"]
 keywords = ["venice", "venice-ai", "opencode", "openai-compatible", "llm-proxy", "tool-calling", "coding-agent", "claude-code", "codex", "anthropic-compatible", "ollama", "local-bridge", "macos"]
 
 [project.urls]
 Homepage = "https://nsozturk.github.io/venice-bridge/"
 Repository = "https://github.com/nsozturk/venice-bridge"
+
+[project.scripts]
+venice-bridge = "venice_bridge:main"
+venice-adapters = "venice_adapters:main"
+
+[tool.setuptools]
+py-modules = ["venice_bridge", "venice_adapters", "tolerant_parser"]
+script-files = ["claude-venice"]
