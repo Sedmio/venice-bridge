@@ -479,6 +479,12 @@ def end_to_end() -> None:
         "long_with_braces": b"".join(text(p) for p in LONG_PARTS) + text(' Use {"name": "x"} or { y } here.') + done,
         # a first-turn reply that writes the command as a code block instead of calling the shell (phase-0 T1)
         "code": text("```python\nimport sqlite3\nprint(1)\n```") + done,
+        # runaway loops (deepseek-v4-1-flash-uncensored, 2026-11-21): calls that never stop, and a tag loop;
+        # neither ever sends response.completed here, so only the cut can end them
+        "runaway_calls": b"".join(text('{"tool_calls":[{"name":"read","arguments":{"filePath":"f%d"}}]}\n' % i)
+                                  for i in range(120)),
+        "many_calls_ok": b"".join(text('{"tool_calls":[{"name":"read","arguments":{"filePath":"f%d"}}]}\n' % i)
+                                  for i in range(38)) + done,
     }
     own_step = frame("veniceai:tool_call_generation.in_progress", {"detected_tools": [{"type": "Recognized", "tool": "get_attachment"}]})
     static["own_tool_recovered"] = own_step + call  # one step with Venice's tool, then our format: left alone
@@ -683,6 +689,15 @@ def end_to_end() -> None:
     code, out = ask("prose", with_tools=True, messages=after_tool + [
         {"role": "assistant", "content": "done"}, {"role": "user", "content": "thanks, what next?"}])
     assert code == 200 and len(seen["prose"]) == 1 and judged == []
+    # a runaway reply is cut after LOOP_MAX_CALLS calls at a call boundary; 38 calls are left alone
+    vb.JUDGE_MODEL = "judge-finished"
+    code, out = ask("runaway_calls", with_tools=True)
+    got = calls_of(out, False)
+    assert code == 200 and len(got) == vb.LOOP_MAX_CALLS and set(got) == {"read"}, (code, len(got))
+    assert len(seen["runaway_calls"]) == 1  # cut, not retried
+    code, out = ask("many_calls_ok", with_tools=True)
+    assert code == 200 and len(calls_of(out, False)) == 38
+    vb.JUDGE_MODEL = "judge-stopped"
     # first turn, a code block instead of a call while a shell tool is declared: the judge is asked
     with_bash = tools + [{"type": "function", "function": {"name": "bash"}}]
     for stream in (False, True):
@@ -1215,6 +1230,17 @@ def bare_string_content_checks():
     assert vb._route_call("bash_tool", {"command": "ls"}, {"bash": "bash"}) == ("bash", {"command": "ls"})
     assert vb._route_call("bash_tool", {"command": "ls"}, {"shell": "shell"}) == ("shell", {"command": "ls"})
     print("bash_tool alias ok")
+    # P1-4: where a runaway reply is cut
+    one = '{"tool_calls":[{"name":"Bash","arguments":{"command":"echo %d"}}]}\n'
+    calls41 = "".join(one % i for i in range(41))
+    assert vb._runaway_cut(calls41) == calls41.index(one % 40)  # the start of call 41
+    assert vb._runaway_cut("".join(one % i for i in range(40))) is None
+    assert vb._runaway_cut("<tool_calls>\n" * 20000) == vb.LOOP_MAX_CHARS  # a tag loop: the char limit
+    write = '{"tool_calls":[{"name":"write","arguments":{"filePath":"a.json","content":"' + '{\\"name\\": \\"x\\"},' * 500 + '"}}]}'
+    assert vb._runaway_cut(write) is None  # "name" keys inside file content are not calls
+    native = "".join('<｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="command" string="true">ls</｜DSML｜ parameter></｜DSML｜ invoke>' for _ in range(41))
+    assert vb._runaway_cut(native) is not None
+    print("runaway cut ok")
 
 
 if __name__ == "__main__":

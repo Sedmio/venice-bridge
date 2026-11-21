@@ -1705,10 +1705,33 @@ class _LiveGate:
         return self.buf[self.sent:]
 
 
+# A runaway reply: deepseek-v4-1-flash-uncensored sometimes keeps emitting tool calls (75 to 2143 in one
+# reply) or tags for 5-9 minutes, 274k-482k chars (15 of 7,167 streams, measured 2026-11-21). Normal replies
+# in the same log: at most 38 calls and 68k chars. Past either limit the rest is not read.
+LOOP_MAX_CALLS = int(os.environ.get("VENICE_BRIDGE_LOOP_MAX_CALLS", "40"))
+LOOP_MAX_CHARS = int(os.environ.get("VENICE_BRIDGE_LOOP_MAX_CHARS", "150000"))
+LOOP_CHECK_EVERY = 4000  # chars between two counts
+# a call object ("name" then "arguments") or a native invoke; a "name" key inside file content is not one. A
+# <tool_call> tag is not counted: it holds a call object already. A loop of bare tags is caught by the char limit.
+_CALL_START = re.compile(r'"name"\s*:\s*"[^"\n]{1,80}"\s*,\s*"(?:arguments|input|parameters)"\s*:|invoke\s+name="', re.I)
+
+
+def _runaway_cut(text: str) -> Optional[int]:
+    """Where to cut a runaway reply (the start of call LOOP_MAX_CALLS + 1, or LOOP_MAX_CHARS), or None."""
+    for n, m in enumerate(_CALL_START.finditer(text), 1):
+        if n > LOOP_MAX_CALLS:
+            start = m.start()
+            env = text.rfind('"tool_calls"', max(0, start - 60), start)  # back to the call's envelope, if it has one
+            brace = text.rfind("{", max(0, start - 60), env if env >= 0 else start)
+            return brace if brace >= 0 else start
+    return LOOP_MAX_CHARS if len(text) > LOOP_MAX_CHARS else None
+
+
 def _drain(handle, gate: Optional[_LiveGate] = None, tools_mode: bool = False) -> Dict[str, Any]:
     """Read one upstream reply to its end: {text, reasoning, failure: None | (transport|server_loop, message)}.
     A reply counts only when Venice said response.completed: a stream cut in the middle of a write
-    call would otherwise become a write of half the file."""
+    call would otherwise become a write of half the file. In tools mode a runaway reply (too many calls
+    or chars, see LOOP_MAX_*) is cut at a call boundary and counts as complete."""
     proc = handle[0]
     text: List[str] = []
     reasoning: List[str] = []
@@ -1716,6 +1739,7 @@ def _drain(handle, gate: Optional[_LiveGate] = None, tools_mode: bool = False) -
     done, failure = False, None
     venice: Dict[str, List[str]] = {}
     t0, first = time.time(), None
+    size, next_check, cut_at = 0, LOOP_CHECK_EVERY, None
     try:
         for kind, delta in _iter_chat_events(proc, unread, venice, cut_server_tools=tools_mode):
             if first is None and kind in ("text", "reasoning"):
@@ -1731,6 +1755,17 @@ def _drain(handle, gate: Optional[_LiveGate] = None, tools_mode: bool = False) -
                 text.append(delta)
                 if gate:
                     gate.feed(delta)
+                size += len(delta)
+                if tools_mode and size >= next_check:
+                    next_check = size + LOOP_CHECK_EVERY
+                    joined = "".join(text)
+                    cut_at = _runaway_cut(joined)
+                    if cut_at is not None:
+                        text, done = [joined[:cut_at]], True
+                        sys.stderr.write("[venice-bridge] runaway reply cut at %d chars (%s)\n" % (
+                            cut_at, "over %d calls" % LOOP_MAX_CALLS if cut_at != LOOP_MAX_CHARS else "char limit"))
+                        proc.kill()
+                        break
         if not failure and not done:
             failure = ("transport", "the Venice stream ended before the reply was complete" if text
                        else f"Venice sent no content. Unread lines: {unread or 'none'}")

@@ -7,6 +7,9 @@ Releases: <https://github.com/nsozturk/venice-bridge/releases> · PyPI: <https:/
 
 ### Fixed
 
+- **Runaway repetition loops cut early.** In tool mode, replies exceeding 40 tool-call envelopes or 150,000
+  characters are cut at the 41st envelope / cap and parsed as complete instead of hanging for minutes
+  (`VENICE_BRIDGE_LOOP_MAX_CALLS`, `VENICE_BRIDGE_LOOP_MAX_CHARS`).
 - **Code written instead of run.** A reply with no tool call that holds a fenced code block while a shell tool
   is declared now goes to the judge, which can ask the model to run the command instead of showing it.
 - `bash_tool` is routed to the client's shell tool.
