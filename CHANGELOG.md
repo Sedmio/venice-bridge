@@ -5,6 +5,10 @@ Releases: <https://github.com/nsozturk/venice-bridge/releases> · PyPI: <https:/
 
 ## Unreleased
 
+### Added
+
+- **`claude-venice --lean`** launcher flag: disables all MCP servers via `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` to keep the `[TOOLS]` block compact when a project carries `.mcp.json` (default behavior unchanged).
+
 ### Fixed
 
 - **Runaway repetition loops cut early.** In tool mode, replies exceeding 40 tool-call envelopes or 150,000

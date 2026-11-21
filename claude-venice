@@ -6,7 +6,7 @@
 # Isolated profile ~/.claude-venice: the official `claude`/Opus install and its auth stay untouched.
 # Default model is `deepseek-v4-1-flash-uncensored`; override with -m <id>, VENICE_CLAUDE_MODEL, or /model.
 #
-# Usage:  claude-venice [-m <venice-model-id>] [claude args...]
+# Usage:  claude-venice [-m <venice-model-id>] [--lean] [claude args...]
 #         claude-venice --models     # list Venice model ids the bridge serves
 set -euo pipefail
 
@@ -14,10 +14,34 @@ ADAPTER="http://127.0.0.1:18892"
 BRIDGE="http://127.0.0.1:18891"
 PROFILE="$HOME/.claude-venice"
 MODEL="${VENICE_CLAUDE_MODEL:-deepseek-v4-1-flash-uncensored}"
+LEAN=0
 
-# -m <model> picks a different Venice id (bridge passes it through verbatim).
-if [ "${1:-}" = "-m" ] && [ -n "${2:-}" ]; then
-  MODEL="$2"; shift 2
+# Parse launcher-owned flags anywhere before `--`: -m <model> and --lean.
+PASS_ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -m)
+      if [ "$#" -ge 2 ]; then
+        MODEL="$2"; shift 2
+      else
+        PASS_ARGS+=("$1"); shift
+      fi
+      ;;
+    --lean)
+      LEAN=1; shift
+      ;;
+    --)
+      PASS_ARGS+=("$@"); break
+      ;;
+    *)
+      PASS_ARGS+=("$1"); shift
+      ;;
+  esac
+done
+if [ "${#PASS_ARGS[@]}" -gt 0 ]; then
+  set -- "${PASS_ARGS[@]}"
+else
+  set --
 fi
 
 if [ "${1:-}" = "--models" ]; then
@@ -93,11 +117,26 @@ if [ "$add_skip" = "1" ]; then
   set -- --dangerously-skip-permissions "$@"
 fi
 
+if [ "$LEAN" = "1" ]; then
+  has_mcp_cfg=0
+  for a in "$@"; do
+    case "$a" in
+      --mcp-config|--mcp-config=*) has_mcp_cfg=1 ;;
+    esac
+  done
+  if [ "$has_mcp_cfg" = "1" ]; then
+    set -- --strict-mcp-config "$@"
+  else
+    set -- --strict-mcp-config --mcp-config '{"mcpServers":{}}' "$@"
+  fi
+fi
+
 if [ -t 1 ]; then
   echo "🜂 Claude Code on Venice — model: $MODEL"
   echo "   adapter: $ADAPTER   profile: $PROFILE   (official claude/Opus untouched)"
   [ -n "$Q_REM" ] && echo "   web quota remaining: $Q_REM   (bridge response-cache on; 'claude-venice --quota' for details)"
   [ "$add_skip" = "1" ] && echo "   permissions: skipped — no prompts (set VENICE_CLAUDE_SKIP_PERMS=0 to restore)"
+  [ "$LEAN" = "1" ] && echo "   mode: --lean (MCP servers disabled via --strict-mcp-config)"
   echo ""
 fi
 
