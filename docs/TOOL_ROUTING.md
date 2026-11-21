@@ -1,7 +1,7 @@
 # Tool routing — Claude Code / OpenCode / Codex → Venice
 
 How a client's tools reach the Venice web model and how the model's tool calls are mapped back.
-Source of truth is the code (`venice_bridge.py`, `venice_adapters.py`); this page describes v0.2.0.
+Source of truth is the code (`venice_bridge.py`, `venice_adapters.py`); this page describes v0.2.1.
 
 ## TL;DR
 
@@ -70,6 +70,8 @@ A call Venice **swallows** (runs itself) arrives with the name only, no argument
 forwarded — it is asked for again by name, in the right format.
 
 ## 5. Argument-name aliasing — `ARG_ALIASES` / `_fit_arguments` (`venice_bridge.py`)
+
+Before renaming, `_fit_arguments` unwraps envelopes the model adds around the real arguments: `{"arguments": {...}}`, `{"name": ..., "arguments": {...}}`, a JSON string in `arguments`, and `{"input": {...}}` / `{"parameters": {...}}`, up to three levels and only when the tool's own schema has no field of that name. Keys already present at the outer level win.
 
 | Expected arg | Names the model may use |
 |---|---|

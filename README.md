@@ -1,7 +1,7 @@
 <p align="center"><img src="assets/banner.png" alt="venice-bridge — use your venice.ai web subscription from OpenCode, Claude Code and Codex CLI" width="100%"></p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2.0-8b5cf6" alt="Version 0.2.0">
+  <img src="https://img.shields.io/badge/version-0.2.1-8b5cf6" alt="Version 0.2.1">
   <img src="https://img.shields.io/badge/python-3.10%2B-3776ab?logo=python&logoColor=white" alt="Python 3.10+">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/Venice%20API%20key-not%20needed-0ea5e9" alt="No Venice API key needed">
