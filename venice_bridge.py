@@ -90,6 +90,8 @@ DEFAULT_PORT = 18891
 #          and Venice's "default"): that model is remembered and sent to the agent route.
 ROUTE = os.environ.get("VENICE_BRIDGE_ROUTE", "auto")
 AGENT_ONLY_MODELS: set = set()
+# Background JWT refresh when fewer than PROACTIVE_REFRESH_S seconds remain (hard refresh is at 15s).
+PROACTIVE_REFRESH_S = int(os.environ.get("VENICE_BRIDGE_PROACTIVE_REFRESH_S", "30"))
 
 
 def _uses_chat_route(model: Any) -> bool:
@@ -303,6 +305,7 @@ class VeniceClient:
         self._attest_token: Optional[str] = None
         self._attest_exp: float = 0.0
         self._attest_gen: int = 0
+        self._refreshing: bool = False
         self.quota_until: float = 0.0  # epoch seconds; chat is answered locally until then
 
     def _load_clerk_client(self) -> str:
@@ -434,10 +437,27 @@ class VeniceClient:
         self._jwt_exp = _jwt_exp(jwt_tok) or (now + 55)
         return jwt_tok
 
+    def _proactive_refresh_bg(self) -> None:
+        try:
+            with self._lock:
+                now = time.time()
+                if self._jwt and now < (self._jwt_exp - PROACTIVE_REFRESH_S):
+                    return
+                self._load_clerk_client()
+                self._mint_jwt(now)
+            STATS.record_event("proactive_jwt_refreshes")
+        except Exception as exc:
+            sys.stderr.write(f"[venice-bridge] proactive JWT refresh skipped: {type(exc).__name__}\n")
+        finally:
+            self._refreshing = False
+
     def get_jwt(self, force: bool = False) -> str:
         with self._lock:  # not re-entrant: the fallback retry is the loop below, never a recursive call
             now = time.time()
             if not force and self._jwt and now < (self._jwt_exp - 15):
+                if PROACTIVE_REFRESH_S > 15 and now >= (self._jwt_exp - PROACTIVE_REFRESH_S) and not self._refreshing:
+                    self._refreshing = True
+                    threading.Thread(target=self._proactive_refresh_bg, daemon=True).start()
                 return self._jwt
             if force:
                 self._session_id = None
@@ -1762,6 +1782,7 @@ def _drain(handle, gate: Optional[_LiveGate] = None, tools_mode: bool = False) -
                     cut_at = _runaway_cut(joined)
                     if cut_at is not None:
                         text, done = [joined[:cut_at]], True
+                        STATS.record_event("runaway_cuts")
                         sys.stderr.write("[venice-bridge] runaway reply cut at %d chars (%s)\n" % (
                             cut_at, "over %d calls" % LOOP_MAX_CALLS if cut_at != LOOP_MAX_CHARS else "char limit"))
                         proc.kill()
@@ -1901,6 +1922,7 @@ def _complete_with_tools(body: Dict[str, Any], payload: Dict[str, Any], handle,
             if format_left < 1 or (trigger == "transport" and transport_left < 1):
                 break
             format_left -= 1
+            STATS.record_event("format_retries")
             if trigger == "transport":
                 transport_left -= 1
                 nxt = last  # resent as it was, reminder included
@@ -1917,6 +1939,7 @@ def _complete_with_tools(body: Dict[str, Any], payload: Dict[str, Any], handle,
             if verdict not in JUDGE_REMINDERS or time.time() < VENICE.quota_until:
                 break
             judge_left -= 1
+            STATS.record_event("judge_retries")
             replace, from_judge = verdict == "missing_result", True
             nxt = dict(payload, messages=payload["messages"] + [
                 _message("user", "(act reminder) " + JUDGE_REMINDERS[verdict])])
@@ -2118,6 +2141,101 @@ def _cache_put(key: Optional[str], entry: Dict[str, Any]) -> None:
             _CACHE.popitem(last=False)
 
 
+class _BridgeStats:
+    """In-memory runtime counters for GET /stats (no prompts, replies, cookies, or tokens)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._started = time.time()
+        self._requests = {"total": 0, "ok": 0, "error": 0, "cached": 0, "local": 0}
+        self._events = {"format_retries": 0, "judge_retries": 0, "runaway_cuts": 0, "proactive_jwt_refreshes": 0}
+        self._models: Dict[str, Dict[str, float]] = {}
+
+    def record_event(self, name: str, delta: int = 1) -> None:
+        with self._lock:
+            if name in self._events:
+                self._events[name] += delta
+
+    def record_request(self, model: str, ok: bool, total_s: float = 0.0, ttft_s: Optional[float] = None,
+                       cached: bool = False, local: bool = False) -> None:
+        with self._lock:
+            self._requests["total"] += 1
+            self._requests["ok" if ok else "error"] += 1
+            if cached:
+                self._requests["cached"] += 1
+            if local:
+                self._requests["local"] += 1
+            if model:
+                m = self._models.setdefault(model, {"requests": 0, "errors": 0, "total_sum_s": 0.0, "ttft_sum_s": 0.0, "ttft_count": 0})
+                m["requests"] += 1
+                if not ok:
+                    m["errors"] += 1
+                m["total_sum_s"] += max(0.0, float(total_s))
+                if ttft_s is not None and ttft_s >= 0:
+                    m["ttft_sum_s"] += float(ttft_s)
+                    m["ttft_count"] += 1
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            models_out: Dict[str, Any] = {}
+            for name, m in sorted(self._models.items()):
+                req_n = int(m["requests"])
+                ttft_n = int(m["ttft_count"])
+                models_out[name] = {
+                    "requests": req_n,
+                    "errors": int(m["errors"]),
+                    "avg_total_s": round(m["total_sum_s"] / req_n, 2) if req_n else None,
+                    "avg_ttft_s": round(m["ttft_sum_s"] / ttft_n, 2) if ttft_n else None,
+                }
+            return {
+                "uptime_s": round(time.time() - self._started, 1),
+                "requests": dict(self._requests),
+                "retries": {
+                    "format": self._events["format_retries"],
+                    "judge": self._events["judge_retries"],
+                    "runaway_cuts": self._events["runaway_cuts"],
+                },
+                "auth": {"proactive_jwt_refreshes": self._events["proactive_jwt_refreshes"]},
+                "cache": {**_CACHE_STATS, "entries": len(_CACHE), "enabled": _CACHE_ENABLED},
+                "chat_quota": VENICE.chat_quota(),
+                "models": models_out,
+            }
+
+
+STATS = _BridgeStats()
+
+
+def _stats_html(snap: Dict[str, Any]) -> str:
+    import html as _html
+    rows = []
+    for name, m in snap.get("models", {}).items():
+        rows.append(
+            f"<tr><td>{_html.escape(name)}</td><td>{m['requests']}</td><td>{m['errors']}</td>"
+            f"<td>{m['avg_ttft_s'] if m['avg_ttft_s'] is not None else '-'}</td>"
+            f"<td>{m['avg_total_s'] if m['avg_total_s'] is not None else '-'}</td></tr>"
+        )
+    table = "\n".join(rows) or "<tr><td colspan='5'>No requests yet</td></tr>"
+    req = snap["requests"]
+    ret = snap["retries"]
+    cache = snap["cache"]
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'><title>venice-bridge stats</title>"
+        "<style>body{font-family:system-ui,sans-serif;background:#0f1115;color:#e6edf3;max-width:900px;margin:24px auto;padding:0 16px}"
+        "h1{font-size:20px;margin:0 0 16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px}"
+        ".card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}.k{font-size:12px;color:#8b949e}.v{font-size:20px;font-weight:600;margin-top:4px}"
+        "table{width:100%;border-collapse:collapse;background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}"
+        "th,td{text-align:left;padding:8px 12px;border-bottom:1px solid #21262d;font-size:13px}th{color:#8b949e}</style></head><body>"
+        f"<h1>venice-bridge stats <small style='color:#8b949e;font-weight:400'>uptime {snap['uptime_s']}s</small></h1>"
+        "<div class='grid'>"
+        f"<div class='card'><div class='k'>Requests (ok / err)</div><div class='v'>{req['total']} ({req['ok']} / {req['error']})</div></div>"
+        f"<div class='card'><div class='k'>Cache (hits / entries)</div><div class='v'>{cache['hits']} / {cache['entries']}</div></div>"
+        f"<div class='card'><div class='k'>Retries (fmt / judge / cut)</div><div class='v'>{ret['format']} / {ret['judge']} / {ret['runaway_cuts']}</div></div>"
+        f"<div class='card'><div class='k'>Proactive JWT Refreshes</div><div class='v'>{snap['auth']['proactive_jwt_refreshes']}</div></div>"
+        "</div><table><thead><tr><th>Model</th><th>Requests</th><th>Errors</th><th>Avg TTFT (s)</th><th>Avg Total (s)</th></tr></thead>"
+        f"<tbody>{table}</tbody></table></body></html>"
+    )
+
+
 class OpenAIBridgeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -2191,6 +2309,20 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                                       "cache": {**_CACHE_STATS, "entries": len(_CACHE), "enabled": _CACHE_ENABLED}})
             except Exception as exc:
                 self._send_json(503, {"ok": False, "error": str(exc)})
+            return
+
+        if path == "/stats":
+            snap = STATS.snapshot()
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            if (qs.get("format") or [""])[0].lower() == "html":
+                raw = _stats_html(snap).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            self._send_json(200, snap)
             return
 
         if path == "/v1/models":
@@ -2274,14 +2406,18 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             body["model"] = _resolve_auto(str(body.get("model") or ""))  # venice-auto -> a concrete id
         backend, local_model = _resolve_backend(str(body.get("model") or "")) if isinstance(body, dict) else (None, "")
         if backend:  # before anything Venice: its quota, login and prompt rewriting do not apply
+            t_local = time.time()
             self._passthrough(backend, local_model, body)
+            STATS.record_request(f"{backend['name']}/{local_model}", ok=True, total_s=time.time() - t_local, local=True)
             return
 
         if time.time() < VENICE.quota_until:  # known to be over quota: do not spend an upstream call
             code, message = _quota_error()
+            STATS.record_request(str(body.get("model") or ""), ok=False)
             self._send_json(code, {"error": {"message": message, "type": "venice_quota_exhausted", "code": 429}})
             return
 
+        req_started = time.time()
         stream = bool(body.get("stream", False))
         model = _parse_web_tags(str(body.get("model") or "qwen3-coder-480b-a35b-instruct-turbo"))[0]
         cache_key = _cache_key(body)
@@ -2289,6 +2425,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
         if cached is not None:
             sys.stderr.write("[venice-bridge] cache hit (no Venice call spent)\n")
             self._serve_cached(cached, stream, model)
+            STATS.record_request(model, ok=True, total_s=time.time() - req_started, ttft_s=0.0, cached=True)
             return
         venice_payload, has_tools = openai_to_venice_chat(body)
         prompt_chars = (len(venice_payload["systemPrompt"]["instructions"])
@@ -2304,10 +2441,12 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
 
         handle, failure = _open_upstream(venice_payload)
         if failure:
+            STATS.record_request(model, ok=False, total_s=time.time() - req_started)
             self._send_json(*failure)
             return
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
+        first_token_at: List[Optional[float]] = [None]
 
         def start_stream() -> None:
             self.send_response(200)
@@ -2317,6 +2456,8 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
         def emit(delta: Dict[str, Any], finish: Optional[str] = None) -> None:
+            if first_token_at[0] is None and (delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls")):
+                first_token_at[0] = time.time() - req_started
             chunk = {
                 "id": chat_id,
                 "object": "chat.completion.chunk",
@@ -2349,6 +2490,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                         err = {"error": {"message": best["problem"], "type": "venice_upstream_error"}}
                         self.wfile.write(f"data: {json.dumps(err, ensure_ascii=False)}\n\n".encode("utf-8"))
                         self.wfile.flush()
+                        STATS.record_request(model, ok=False, total_s=time.time() - req_started, ttft_s=first_token_at[0])
                         return
                     if calls:
                         emit({"tool_calls": calls})  # the held-back tail was the call
@@ -2361,12 +2503,14 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                                            "finish": "tool_calls" if calls else "stop", "prompt_chars": prompt_chars})
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
+                    STATS.record_request(model, ok=True, total_s=time.time() - req_started, ttft_s=first_token_at[0])
                 finally:
                     self.close_connection = True
                 return
             if not calls and not content.strip():
                 if best["trigger"] != "unreadable":
                     sys.stderr.write(f"[venice-bridge] upstream failed: {best['problem']}\n")
+                    STATS.record_request(model, ok=False, total_s=time.time() - req_started)
                     self._send_json(502, {"error": {"message": best["problem"], "type": "venice_upstream_error"}})
                     return
                 content = "(the model sent a tool call that could not be read)"  # never the raw envelope
@@ -2378,6 +2522,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 _cache_put(cache_key, {"content": content or "", "reasoning": best["reasoning"],
                                        "tool_calls": message_obj.get("tool_calls"),
                                        "finish": "tool_calls" if calls else "stop", "prompt_chars": prompt_chars})
+                STATS.record_request(model, ok=True, total_s=time.time() - req_started)
                 self._send_json(200, {
                     "id": chat_id,
                     "object": "chat.completion",
@@ -2400,6 +2545,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 send_usage((content or "") + "".join(c["function"]["arguments"] for c in (calls or [])))
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
+                STATS.record_request(model, ok=True, total_s=time.time() - req_started, ttft_s=first_token_at[0])
             finally:
                 self.close_connection = True
             return
@@ -2417,6 +2563,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             else:
                 message = f"Venice sent no content. Unread lines: {unread or 'none'}"
             sys.stderr.write(f"[venice-bridge] upstream gave no content: {message}\n")
+            STATS.record_request(model, ok=False, total_s=time.time() - req_started)
             self._send_json(502, {"error": {"message": message, "type": "venice_upstream_error"}})
             return
         events = itertools.chain([first], events)
@@ -2449,6 +2596,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 _cleanup(handle)
             if problem:
                 sys.stderr.write(f"[venice-bridge] upstream failed mid-reply: {problem}\n")
+                STATS.record_request(model, ok=False, total_s=time.time() - req_started)
                 self._send_json(502, {"error": {"message": problem, "type": "venice_upstream_error"}})
                 return
             reasoning = "".join(reason_parts) or None  # surfaced when the model reasoned (`/think`)
@@ -2457,6 +2605,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 message_obj["reasoning_content"] = reasoning
             _cache_put(cache_key, {"content": full_text or "", "reasoning": reasoning, "tool_calls": None,
                                    "finish": "stop", "prompt_chars": prompt_chars})
+            STATS.record_request(model, ok=True, total_s=time.time() - req_started)
             self._send_json(200, {
                 "id": chat_id,
                 "object": "chat.completion",
@@ -2481,6 +2630,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 err = {"error": {"message": problem, "type": "venice_upstream_error"}}
                 self.wfile.write(f"data: {json.dumps(err, ensure_ascii=False)}\n\n".encode("utf-8"))
                 self.wfile.flush()
+                STATS.record_request(model, ok=False, total_s=time.time() - req_started, ttft_s=first_token_at[0])
                 return
             emit({}, "stop")
             _cache_put(cache_key, {"content": full_text or "", "reasoning": "".join(reason_parts) or None,
@@ -2488,6 +2638,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             send_usage(full_text)
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
+            STATS.record_request(model, ok=True, total_s=time.time() - req_started, ttft_s=first_token_at[0])
         finally:
             _cleanup(handle)
             self.close_connection = True

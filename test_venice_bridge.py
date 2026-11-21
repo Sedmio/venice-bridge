@@ -1243,6 +1243,59 @@ def bare_string_content_checks():
     print("runaway cut ok")
 
 
+def m1_resilience_and_stats_checks():
+    # 1. Proactive Clerk JWT refresh: returns current token immediately and refreshes in background
+    cli = vb.VeniceClient()
+    cli._clerk_client = "fake_client"
+    cli._jwt = "old_jwt"
+    cli._jwt_exp = time.time() + 25  # inside PROACTIVE_REFRESH_S (30), outside hard 15s
+    minted = threading.Event()
+    calls = []
+    cli._load_clerk_client = lambda: "fake_client"
+    def fake_mint(now):
+        calls.append(now)
+        cli._jwt = "new_jwt"
+        cli._jwt_exp = now + 60
+        minted.set()
+        return "new_jwt"
+    cli._mint_jwt = fake_mint
+    old_pro = vb.PROACTIVE_REFRESH_S
+    vb.PROACTIVE_REFRESH_S = 30
+    try:
+        tok = cli.get_jwt()
+        assert tok == "old_jwt", tok  # non-blocking: immediate return
+        assert minted.wait(2.0), "background refresh did not run"
+        assert cli.get_jwt() == "new_jwt"
+        assert len(calls) == 1  # fresh token (>30s left) must NOT trigger another refresh
+    finally:
+        vb.PROACTIVE_REFRESH_S = old_pro
+    print("proactive jwt refresh ok")
+
+    # 2. GET /stats (JSON + HTML)
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    vb.STATS.record_request("test-model", ok=True, total_s=1.2, ttft_s=0.4)
+    vb.STATS.record_event("runaway_cuts")
+    srv = vb.ThreadingHTTPServer(("127.0.0.1", 0), vb.OpenAIBridgeHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        with opener.open(base + "/stats", timeout=10) as r:
+            assert r.status == 200 and "application/json" in r.headers["Content-Type"]
+            st = json.loads(r.read().decode())
+        assert st["requests"]["total"] >= 1 and st["retries"]["runaway_cuts"] >= 1, st
+        assert "test-model" in st["models"] and st["models"]["test-model"]["avg_ttft_s"] is not None, st
+        assert "cache" in st and "uptime_s" in st, st
+        with opener.open(base + "/stats?format=html", timeout=10) as r:
+            assert r.status == 200 and "text/html" in r.headers["Content-Type"]
+            html = r.read().decode()
+        assert "<html" in html.lower() and "test-model" in html, html[:300]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    print("stats endpoint ok")
+
+
 if __name__ == "__main__":
     cookie_file_checks()
     try:
@@ -1253,5 +1306,6 @@ if __name__ == "__main__":
         reasoning_auto_checks()
         nested_arguments_unwrap_checks()
         bare_string_content_checks()
+        m1_resilience_and_stats_checks()
     finally:
         shutil.rmtree(STATE_DIR, ignore_errors=True)
