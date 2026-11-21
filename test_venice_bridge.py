@@ -1342,6 +1342,29 @@ def m2_tool_choice_and_structured_checks():
     print("m2 tool_choice + parallel + response_format ok")
 
 
+def m3_stop_sequences_checks():
+    assert vb._parse_stop("END") == ["END"]
+    assert vb._parse_stop(["END", "", "STOP", "END"]) == ["END", "STOP"]
+    assert vb._parse_stop(None) == []
+    # Split across chunks: "THREE" spans chunk 1 ("TH") and chunk 2 ("REE")
+    sm = vb._StopMatcher(["THREE", "FIVE"])
+    out = []
+    for ch in ("ONE ", "TWO TH", "REE FOUR", " FIVE"):
+        piece = sm.feed(ch)
+        if piece:
+            out.append(piece)
+        if sm.matched:
+            break
+    if not sm.matched:
+        out.append(sm.flush())
+    assert "".join(out) == "ONE TWO " and sm.matched == "THREE", (out, sm.matched)
+    # No match: flush returns remaining tail intact
+    sm2 = vb._StopMatcher(["ZZZ"])
+    got = sm2.feed("hello ") + sm2.feed("world") + sm2.flush()
+    assert got == "hello world" and sm2.matched is None, (got, sm2.matched)
+    print("m3 stop_sequences ok")
+
+
 if __name__ == "__main__":
     cookie_file_checks()
     try:
@@ -1354,5 +1377,6 @@ if __name__ == "__main__":
         bare_string_content_checks()
         m1_resilience_and_stats_checks()
         m2_tool_choice_and_structured_checks()
+        m3_stop_sequences_checks()
     finally:
         shutil.rmtree(STATE_DIR, ignore_errors=True)

@@ -27,7 +27,13 @@ class Upstream(http.server.BaseHTTPRequestHandler):
             raw = json.dumps({"error": {"message": "quota used up"}}).encode()
             self.send_response(429); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
             return
-        if last["role"] == "tool":  # second turn: answer with text
+        stop_seq = None
+        if "think_test" in str(last.get("content")):
+            msg, finish = {"role": "assistant", "reasoning_content": "step 1", "content": "answer 42"}, "stop"
+        elif req.get("stop"):
+            stop_seq = req["stop"][0]
+            msg, finish = {"role": "assistant", "content": "ONE TWO "}, "stop"
+        elif last["role"] == "tool":  # second turn: answer with text
             msg, finish = {"role": "assistant", "content": "done: " + last["content"]}, "stop"
         else:  # first turn: text + one call to the first declared tool
             name = req["tools"][0]["function"]["name"]
@@ -35,17 +41,28 @@ class Upstream(http.server.BaseHTTPRequestHandler):
             msg, finish = {"role": "assistant", "content": "looking", "tool_calls": [
                 {"index": 0, "id": "call_1", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]}, "tool_calls"
         if not req.get("stream"):
-            raw = json.dumps({"choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+            choice = {"index": 0, "message": msg, "finish_reason": finish}
+            if stop_seq:
+                choice["stop_sequence"] = stop_seq
+            raw = json.dumps({"choices": [choice],
                               "usage": {"prompt_tokens": 7, "completion_tokens": 3}}).encode()
             self.send_response(200); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
             return
         self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
-        chunks = [{"delta": {"role": "assistant", "content": msg["content"][:3]}}, {"delta": {"content": msg["content"][3:]}}]
+        chunks = []
+        if msg.get("reasoning_content"):
+            chunks.append({"delta": {"role": "assistant", "reasoning_content": msg["reasoning_content"]}})
+            chunks.append({"delta": {"content": msg["content"]}})
+        else:
+            chunks.extend([{"delta": {"role": "assistant", "content": msg["content"][:3]}}, {"delta": {"content": msg["content"][3:]}}])
         for tc in msg.get("tool_calls", []):
             a = tc["function"]["arguments"]
             chunks.append({"delta": {"tool_calls": [{"index": 0, "id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": a[:4]}}]}})
             chunks.append({"delta": {"tool_calls": [{"index": 0, "function": {"arguments": a[4:]}}]}})
-        chunks.append({"delta": {}, "finish_reason": finish})
+        end_chunk = {"delta": {}, "finish_reason": finish}
+        if stop_seq:
+            end_chunk["stop_sequence"] = stop_seq
+        chunks.append(end_chunk)
         for c in chunks:
             self.wfile.write(("data: " + json.dumps({"choices": [dict(c, index=0)]}) + "\n\n").encode())
         self.wfile.write(b"data: [DONE]\n\n")
@@ -185,6 +202,23 @@ def main():
     st, raw = post(port, "/v1/responses", {"model": "m1", "tools": [fn], "parallel_tool_calls": True, "input": "hi"})
     assert st == 200 and json.loads(raw)["parallel_tool_calls"] is True, raw
     print("m2 adapter tool_choice + parallel + text.format ok")
+    # ---- M3: Anthropic thinking block (stream + non-stream) & stop_sequences
+    st, raw = post(port, "/v1/messages", {"model": "m1", "messages": [{"role": "user", "content": "think_test"}]})
+    m_th = json.loads(raw)
+    assert st == 200 and m_th["content"] == [{"type": "thinking", "thinking": "step 1"}, {"type": "text", "text": "answer 42"}], m_th
+    st, raw = post(port, "/v1/messages", {"model": "m1", "messages": [{"role": "user", "content": "think_test"}], "stream": True})
+    ev = sse(raw)
+    starts = [e["content_block"]["type"] for e in ev if e["type"] == "content_block_start"]
+    assert starts == ["thinking", "text"], starts
+    assert "".join(e["delta"].get("thinking", "") for e in ev if e["type"] == "content_block_delta") == "step 1"
+    assert "".join(e["delta"].get("text", "") for e in ev if e["type"] == "content_block_delta") == "answer 42"
+    st, raw = post(port, "/v1/messages", {"model": "m1", "stop_sequences": ["THREE"], "messages": [{"role": "user", "content": "count"}]})
+    m_st = json.loads(raw)
+    assert SEEN[-1]["stop"] == ["THREE"] and m_st["stop_reason"] == "stop_sequence" and m_st["stop_sequence"] == "THREE", m_st
+    st, raw = post(port, "/v1/messages", {"model": "m1", "stop_sequences": ["THREE"], "messages": [{"role": "user", "content": "count"}], "stream": True})
+    ev = sse(raw)
+    assert ev[-2]["delta"] == {"stop_reason": "stop_sequence", "stop_sequence": "THREE"}, ev[-2]
+    print("m3 thinking + stop_sequences ok")
     print("responses ok")
 
 

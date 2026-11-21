@@ -846,6 +846,59 @@ def _clean_json_output(text: str) -> str:
         return text
 
 
+def _parse_stop(val: Any) -> List[str]:
+    """Normalize OpenAI `stop` (str or list of str) into a deduplicated list of non-empty strings."""
+    if isinstance(val, str):
+        return [val] if val else []
+    if isinstance(val, list):
+        out: List[str] = []
+        for x in val:
+            if isinstance(x, str) and x and x not in out:
+                out.append(x)
+        return out
+    return []
+
+
+class _StopMatcher:
+    """Streaming stop-sequence detector that holds back at most (max_len - 1) tail chars so a split
+    stop sequence is never leaked to the client."""
+
+    def __init__(self, stops: List[str]) -> None:
+        self._stops = [s for s in stops if s]
+        self._hold = max((len(s) for s in self._stops), default=1) - 1
+        self._buf = ""
+        self.matched: Optional[str] = None
+
+    def feed(self, delta: str) -> str:
+        if self.matched or not delta:
+            return ""
+        self._buf += delta
+        earliest_idx, earliest_stop = -1, None
+        for s in self._stops:
+            idx = self._buf.find(s)
+            if idx >= 0 and (earliest_idx < 0 or idx < earliest_idx):
+                earliest_idx, earliest_stop = idx, s
+        if earliest_idx >= 0:
+            self.matched = earliest_stop
+            out = self._buf[:earliest_idx]
+            self._buf = ""
+            return out
+        if self._hold <= 0:
+            out, self._buf = self._buf, ""
+            return out
+        if len(self._buf) > self._hold:
+            cut = len(self._buf) - self._hold
+            out, self._buf = self._buf[:cut], self._buf[cut:]
+            return out
+        return ""
+
+    def flush(self) -> str:
+        if self.matched:
+            return ""
+        out, self._buf = self._buf, ""
+        return out
+
+
 def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     messages = body.get("messages") or []
     system_parts: List[str] = []
@@ -2362,6 +2415,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
         reasoning = entry.get("reasoning")
         calls = entry.get("tool_calls")  # already in {id,type,function} shape, or None
         finish = entry.get("finish") or ("tool_calls" if calls else "stop")
+        stop_seq = entry.get("stop_sequence")
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         completion = (content or "") + "".join(c["function"]["arguments"] for c in (calls or []))
@@ -2370,9 +2424,12 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             message_obj: Dict[str, Any] = {"role": "assistant", "content": content or None}
             if calls:
                 message_obj["tool_calls"] = calls
+            choice: Dict[str, Any] = {"index": 0, "message": message_obj, "finish_reason": finish}
+            if stop_seq:
+                choice["stop_sequence"] = stop_seq
             self._send_json(200, {
                 "id": chat_id, "object": "chat.completion", "created": created, "model": model,
-                "choices": [{"index": 0, "message": message_obj, "finish_reason": finish}],
+                "choices": [choice],
                 "usage": usage,
             })
             return
@@ -2382,9 +2439,12 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
 
-        def _emit(delta: Dict[str, Any], fin: Optional[str] = None) -> None:
+        def _emit(delta: Dict[str, Any], fin: Optional[str] = None, sseq: Optional[str] = None) -> None:
+            ch: Dict[str, Any] = {"index": 0, "delta": delta, "finish_reason": fin}
+            if sseq:
+                ch["stop_sequence"] = sseq
             chunk = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                     "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+                     "choices": [ch]}
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
             self.wfile.flush()
 
@@ -2396,7 +2456,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 _emit({"content": content})
             if calls:
                 _emit({"tool_calls": calls})
-            _emit({}, finish)
+            _emit({}, finish, stop_seq)
             uchunk = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                       "choices": [], "usage": usage}
             self.wfile.write(f"data: {json.dumps(uchunk, ensure_ascii=False)}\n\n".encode("utf-8"))
@@ -2561,15 +2621,18 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
 
-        def emit(delta: Dict[str, Any], finish: Optional[str] = None) -> None:
+        def emit(delta: Dict[str, Any], finish: Optional[str] = None, stop_seq: Optional[str] = None) -> None:
             if first_token_at[0] is None and (delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls")):
                 first_token_at[0] = time.time() - req_started
+            ch: Dict[str, Any] = {"index": 0, "delta": delta, "finish_reason": finish}
+            if stop_seq:
+                ch["stop_sequence"] = stop_seq
             chunk = {
                 "id": chat_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                "choices": [ch],
             }
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
             self.wfile.flush()
@@ -2674,10 +2737,13 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             return
         events = itertools.chain([first], events)
 
+        stops = _parse_stop(body.get("stop"))
+        matcher = _StopMatcher(stops) if stops else None
+
         def collect(on_reasoning=None, on_text=None) -> Tuple[str, Optional[str]]:
             """Read the stream to its end: (answer text, problem or None).
 
-            A reply counts only when Venice said response.completed.
+            A reply counts only when Venice said response.completed (or a client stop sequence matched).
             """
             parts: List[str] = []
             done = False
@@ -2689,9 +2755,26 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 elif kind == "reasoning" and on_reasoning:
                     on_reasoning(delta)
                 elif kind == "text":
-                    parts.append(delta)
+                    if matcher is not None:
+                        piece = matcher.feed(delta)
+                        if piece:
+                            parts.append(piece)
+                            if on_text:
+                                on_text(piece)
+                        if matcher.matched is not None:
+                            done = True
+                            proc.kill()
+                            break
+                    else:
+                        parts.append(delta)
+                        if on_text:
+                            on_text(delta)
+            if matcher is not None and matcher.matched is None:
+                tail = matcher.flush()
+                if tail:
+                    parts.append(tail)
                     if on_text:
-                        on_text(delta)
+                        on_text(tail)
             return "".join(parts), None if done else "the Venice stream ended before the reply was complete"
 
         if not stream:
@@ -2708,18 +2791,22 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             if _response_format_instruction(body.get("response_format")):
                 full_text = _clean_json_output(full_text)
             reasoning = "".join(reason_parts) or None  # surfaced when the model reasoned (`/think`)
+            stop_seq = matcher.matched if matcher is not None else None
             message_obj = {"role": "assistant", "content": full_text or None}
             if reasoning:
                 message_obj["reasoning_content"] = reasoning
             _cache_put(cache_key, {"content": full_text or "", "reasoning": reasoning, "tool_calls": None,
-                                   "finish": "stop", "prompt_chars": prompt_chars})
+                                   "finish": "stop", "stop_sequence": stop_seq, "prompt_chars": prompt_chars})
             STATS.record_request(model, ok=True, total_s=time.time() - req_started)
+            choice_out: Dict[str, Any] = {"index": 0, "message": message_obj, "finish_reason": "stop"}
+            if stop_seq:
+                choice_out["stop_sequence"] = stop_seq
             self._send_json(200, {
                 "id": chat_id,
                 "object": "chat.completion",
                 "created": created,
                 "model": model,
-                "choices": [{"index": 0, "message": message_obj, "finish_reason": "stop"}],
+                "choices": [choice_out],
                 "usage": _usage(prompt_chars, full_text),
             })
             return
@@ -2740,9 +2827,10 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 STATS.record_request(model, ok=False, total_s=time.time() - req_started, ttft_s=first_token_at[0])
                 return
-            emit({}, "stop")
+            stop_seq = matcher.matched if matcher is not None else None
+            emit({}, "stop", stop_seq)
             _cache_put(cache_key, {"content": full_text or "", "reasoning": "".join(reason_parts) or None,
-                                   "tool_calls": None, "finish": "stop", "prompt_chars": prompt_chars})
+                                   "tool_calls": None, "finish": "stop", "stop_sequence": stop_seq, "prompt_chars": prompt_chars})
             send_usage(full_text)
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()

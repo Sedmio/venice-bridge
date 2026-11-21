@@ -134,6 +134,10 @@ def messages_to_chat(body: Dict[str, Any]) -> Dict[str, Any]:
             out["parallel_tool_calls"] = False
     if isinstance(body.get("max_tokens"), int):
         out["max_tokens"] = body["max_tokens"]
+    if isinstance(body.get("stop_sequences"), list):
+        stops = [s for s in body["stop_sequences"] if isinstance(s, str) and s]
+        if stops:
+            out["stop"] = stops
     return out
 
 
@@ -216,12 +220,12 @@ def responses_to_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, s
 # ---------------------------------------------------------------- reading the upstream answer
 
 def _chat_events(resp: Any, stream: bool) -> Iterator[Tuple[str, Any]]:
-    """('text', str) as it arrives, then ('calls', [{id,name,arguments}]) and ('end', {finish, usage})."""
+    """('reasoning', str) and ('text', str) as they arrive, then ('calls', [{id,name,arguments}]) and ('end', {finish, stop_sequence, usage})."""
     calls: Dict[int, Dict[str, str]] = {}
-    finish, usage = "stop", {}
+    finish, stop_seq, usage = "stop", None, {}
 
-    def take(choice: Dict[str, Any], part: Dict[str, Any]) -> Optional[str]:
-        nonlocal finish
+    def take(choice: Dict[str, Any], part: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        nonlocal finish, stop_seq
         for tc in part.get("tool_calls") or []:
             slot = calls.setdefault(tc.get("index", len(calls)), {"id": "", "name": "", "arguments": ""})
             fn = tc.get("function") or {}
@@ -229,13 +233,19 @@ def _chat_events(resp: Any, stream: bool) -> Iterator[Tuple[str, Any]]:
             slot["name"] = fn.get("name") or slot["name"]
             slot["arguments"] += fn.get("arguments") or ""
         finish = choice.get("finish_reason") or finish
-        return part.get("content") if isinstance(part.get("content"), str) and part["content"] else None
+        if choice.get("stop_sequence"):
+            stop_seq = choice["stop_sequence"]
+        reasoning = part.get("reasoning_content") if isinstance(part.get("reasoning_content"), str) and part["reasoning_content"] else None
+        text = part.get("content") if isinstance(part.get("content"), str) and part["content"] else None
+        return reasoning, text
 
     if not stream:
         data = json.loads(resp.read())
         usage = data.get("usage") or {}
         for choice in data.get("choices") or []:
-            text = take(choice, choice.get("message") or {})
+            reasoning, text = take(choice, choice.get("message") or {})
+            if reasoning:
+                yield "reasoning", reasoning
             if text:
                 yield "text", text
     else:
@@ -253,13 +263,15 @@ def _chat_events(resp: Any, stream: bool) -> Iterator[Tuple[str, Any]]:
                     continue
                 usage = data.get("usage") or usage
                 for choice in data.get("choices") or []:
-                    text = take(choice, choice.get("delta") or {})
+                    reasoning, text = take(choice, choice.get("delta") or {})
+                    if reasoning:
+                        yield "reasoning", reasoning
                     if text:
                         yield "text", text
     done = [dict(c, id=c["id"] or "call_" + uuid.uuid4().hex[:12]) for _, c in sorted(calls.items()) if c["name"]]
     if done:
         yield "calls", done
-    yield "end", {"finish": "tool_calls" if done else finish, "usage": usage}
+    yield "end", {"finish": "tool_calls" if done else finish, "stop_sequence": stop_seq, "usage": usage}
 
 
 def _json_args(s: str) -> Any:
@@ -373,8 +385,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "id": mid, "type": "message", "role": "assistant", "model": body.get("model") or chat["model"], "content": [],
                 "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
         text_open = False
+        thinking_open = False
+
+        def close_open() -> None:
+            nonlocal text_open, thinking_open
+            if (text_open or thinking_open) and stream:
+                self._sse("content_block_stop", {"type": "content_block_stop", "index": len(blocks) - 1})
+            text_open = False
+            thinking_open = False
+
         for kind, value in events:
-            if kind == "text":
+            if kind == "reasoning":
+                if text_open:
+                    close_open()
+                if not thinking_open:
+                    blocks.append({"type": "thinking", "thinking": ""})
+                    thinking_open = True
+                    if stream:
+                        self._sse("content_block_start", {"type": "content_block_start", "index": len(blocks) - 1,
+                                                          "content_block": {"type": "thinking", "thinking": ""}})
+                blocks[-1]["thinking"] += value
+                if stream:
+                    self._sse("content_block_delta", {"type": "content_block_delta", "index": len(blocks) - 1,
+                                                      "delta": {"type": "thinking_delta", "thinking": value}})
+            elif kind == "text":
+                if thinking_open:
+                    close_open()
                 if not text_open:
                     blocks.append({"type": "text", "text": ""})
                     text_open = True
@@ -386,9 +422,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._sse("content_block_delta", {"type": "content_block_delta", "index": len(blocks) - 1,
                                                       "delta": {"type": "text_delta", "text": value}})
             elif kind == "calls":
-                if text_open and stream:
-                    self._sse("content_block_stop", {"type": "content_block_stop", "index": len(blocks) - 1})
-                text_open = False
+                close_open()
                 for c in value:
                     blocks.append({"type": "tool_use", "id": c["id"], "name": c["name"], "input": _json_args(c["arguments"])})
                     if stream:
@@ -400,16 +434,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         self._sse("content_block_stop", {"type": "content_block_stop", "index": i})
             else:
                 end = value
-        stop = {"tool_calls": "tool_use", "length": "max_tokens"}.get(end["finish"], "end_turn")
+        stop_seq = end.get("stop_sequence")
+        stop = "stop_sequence" if stop_seq else {"tool_calls": "tool_use", "length": "max_tokens"}.get(end["finish"], "end_turn")
         usage = {"input_tokens": int(end["usage"].get("prompt_tokens") or 0), "output_tokens": int(end["usage"].get("completion_tokens") or 0)}
         if stream:
-            if text_open:
-                self._sse("content_block_stop", {"type": "content_block_stop", "index": len(blocks) - 1})
-            self._sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None}, "usage": usage})
+            close_open()
+            self._sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": stop_seq}, "usage": usage})
             self._sse("message_stop", {"type": "message_stop"})
         else:
             self._json(200, {"id": mid, "type": "message", "role": "assistant", "model": body.get("model") or chat["model"],
-                             "content": blocks or [{"type": "text", "text": ""}], "stop_reason": stop, "stop_sequence": None, "usage": usage})
+                             "content": blocks or [{"type": "text", "text": ""}], "stop_reason": stop, "stop_sequence": stop_seq, "usage": usage})
 
     # ---- OpenAI Responses out
     def _responses_out(self, body: Dict[str, Any], chat: Dict[str, Any], custom: Dict[str, str], events: Iterator[Tuple[str, Any]]) -> None:
