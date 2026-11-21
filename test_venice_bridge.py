@@ -1575,6 +1575,87 @@ def m5_multimodal_attachments_checks():
     print("m5 multimodal attachments ok")
 
 
+def m6_audio_and_image_gen_checks():
+    import base64, urllib.error, urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    srv = vb.ThreadingHTTPServer(("127.0.0.1", 0), vb.OpenAIBridgeHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+
+    def _multipart(fields, file_field=None):
+        bnd = "----VBridgeTestBnd"
+        parts = []
+        for k, v in fields.items():
+            parts.append(f"--{bnd}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode())
+        if file_field:
+            fname, mime, raw = file_field
+            parts.append(f"--{bnd}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{fname}\"\r\nContent-Type: {mime}\r\n\r\n".encode() + raw + b"\r\n")
+        parts.append(f"--{bnd}--\r\n".encode())
+        return b"".join(parts), f"multipart/form-data; boundary={bnd}"
+
+    def _req(path, data, ct):
+        r = urllib.request.Request(base + path, data, {"Content-Type": ct})
+        try:
+            with opener.open(r, timeout=15) as resp:
+                return resp.status, resp.headers.get("Content-Type", ""), resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers.get("Content-Type", ""), e.read()
+
+    old_asr = vb.VENICE.transcribe_audio
+    old_img = vb.VENICE.generate_image
+    old_max_audio = vb.MAX_AUDIO_BYTES
+    fake_png_b64 = base64.b64encode(b"\x89PNG\r\n\x1a\nFAKEPNG").decode("ascii")
+    try:
+        # 1. Audio transcriptions: json + text + 400 bad mime + 413 oversize
+        vb.VENICE.transcribe_audio = lambda raw, filename, mime, model=None, timestamps=False: {"text": "canary spoken"}
+        body, ct = _multipart({"model": "whisper-1"}, ("clip.wav", "audio/wav", b"RIFF0000WAVE"))
+        st, rct, raw = _req("/v1/audio/transcriptions", body, ct)
+        assert st == 200 and json.loads(raw) == {"text": "canary spoken"}, (st, raw)
+
+        body_t, ct_t = _multipart({"model": "whisper-1", "response_format": "text"}, ("clip.wav", "audio/wav", b"RIFF0000WAVE"))
+        st, rct, raw = _req("/v1/audio/transcriptions", body_t, ct_t)
+        assert st == 200 and "text/plain" in rct and raw.decode() == "canary spoken", (st, rct, raw)
+
+        body_bad, ct_bad = _multipart({}, ("bad.exe", "application/octet-stream", b"MZ"))
+        st, _, _ = _req("/v1/audio/transcriptions", body_bad, ct_bad)
+        assert st == 400, st
+
+        vb.MAX_AUDIO_BYTES = 4
+        body_big, ct_big = _multipart({}, ("clip.wav", "audio/wav", b"RIFF0000WAVE"))
+        st, _, _ = _req("/v1/audio/transcriptions", body_big, ct_big)
+        assert st == 413, st
+        vb.MAX_AUDIO_BYTES = old_max_audio
+
+        # 2. Image generations: b64_json + url (data URI) + n>1 -> 400 + empty prompt -> 400
+        vb.VENICE.generate_image = lambda prompt, size=None: (fake_png_b64, "png")
+        st, _, raw = _req("/v1/images/generations", json.dumps({"prompt": "a red cube"}).encode(), "application/json")
+        d = json.loads(raw)
+        assert st == 200 and d["data"] == [{"b64_json": fake_png_b64}] and isinstance(d["created"], int), (st, d)
+
+        st, _, raw = _req("/v1/images/generations", json.dumps({"prompt": "a red cube", "response_format": "url"}).encode(), "application/json")
+        d2 = json.loads(raw)
+        assert st == 200 and d2["data"] == [{"url": f"data:image/png;base64,{fake_png_b64}"}], (st, d2)
+
+        st, _, _ = _req("/v1/images/generations", json.dumps({"prompt": "x", "n": 2}).encode(), "application/json")
+        assert st == 400, st
+        st, _, _ = _req("/v1/images/generations", json.dumps({"prompt": ""}).encode(), "application/json")
+        assert st == 400, st
+
+        # 3. /stats counters present & zero base64 leakage
+        with opener.open(base + "/stats", timeout=10) as r:
+            snap_raw = r.read().decode()
+            snap = json.loads(snap_raw)
+        assert snap["endpoints"]["audio_transcriptions"] >= 2 and snap["endpoints"]["image_generations"] >= 2, snap
+        assert fake_png_b64 not in snap_raw
+    finally:
+        vb.VENICE.transcribe_audio = old_asr
+        vb.VENICE.generate_image = old_img
+        vb.MAX_AUDIO_BYTES = old_max_audio
+        srv.shutdown()
+        srv.server_close()
+    print("m6 audio + image gen ok")
+
+
 if __name__ == "__main__":
     cookie_file_checks()
     try:
@@ -1590,5 +1671,6 @@ if __name__ == "__main__":
         m3_stop_sequences_checks()
         m4_cookie_pool_checks()
         m5_multimodal_attachments_checks()
+        m6_audio_and_image_gen_checks()
     finally:
         shutil.rmtree(STATE_DIR, ignore_errors=True)

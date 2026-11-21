@@ -23,6 +23,7 @@ Auth & inference flow:
 import argparse
 import base64
 import datetime
+import email.parser
 import email.utils
 import http.client
 import fnmatch
@@ -57,6 +58,17 @@ POOL_FILE = os.environ.get("VENICE_BRIDGE_COOKIE_POOL", "")
 # Multimodal attachment limits (env-configurable; defaults: 10 MB per file, 20 MB total per request).
 MAX_ATTACHMENT_BYTES = int(os.environ.get("VENICE_BRIDGE_MAX_ATTACHMENT_BYTES", str(10 * 1024 * 1024)))
 MAX_TOTAL_ATTACHMENT_BYTES = int(os.environ.get("VENICE_BRIDGE_MAX_TOTAL_ATTACHMENT_BYTES", str(20 * 1024 * 1024)))
+MAX_AUDIO_BYTES = int(os.environ.get("VENICE_BRIDGE_MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))
+DEFAULT_ASR_MODEL = os.environ.get("VENICE_BRIDGE_ASR_MODEL", "nvidia/parakeet-tdt-0.6b-v3")
+ALLOWED_AUDIO_MIMES = {
+    "audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav", "audio/wave",
+    "audio/mp4", "audio/m4a", "audio/x-m4a", "audio/webm", "audio/ogg",
+    "audio/flac", "audio/x-flac",
+}
+_AUDIO_EXT_MIME = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4", ".webm": "audio/webm", ".ogg": "audio/ogg", ".flac": "audio/flac",
+}
 ALLOWED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 ALLOWED_FILE_MIMES = {
     "text/plain", "text/markdown", "text/csv", "text/rtf", "application/rtf",
@@ -672,6 +684,121 @@ class VeniceClient:
             cmd[1:1] = ["--max-time", str(max_time)]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return proc, tmpdir, hdr_file, body_file
+
+    def transcribe_audio(self, raw_bytes: bytes, filename: str, mime: str,
+                         model: Optional[str] = None, timestamps: bool = False) -> Dict[str, Any]:
+        """Speech-to-text via POST /api/inference/asr (nvidia/parakeet-tdt-0.6b-v3 by default)."""
+        asr_model = DEFAULT_ASR_MODEL if (not model or model in ("whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe")) else model
+        payload = {
+            "model": asr_model,
+            "responseFormat": "json",
+            "timestamps": bool(timestamps),
+            "audio": base64.b64encode(raw_bytes).decode("ascii"),
+            "filename": filename or "audio.wav",
+            "mimetype": mime,
+        }
+        for attempt in (0, 1):
+            r = cffi_requests.post(
+                f"{OUTERFACE_BASE}/api/inference/asr",
+                headers={**self.auth_headers(force_refresh=attempt > 0), "User-Agent": BROWSER_UA},
+                json=payload,
+                impersonate="chrome124",
+                timeout=120,
+            )
+            if r.status_code == 401 and attempt == 0:
+                continue
+            if r.status_code != 200:
+                raise RuntimeError(f"Venice ASR returned HTTP {r.status_code}")
+            return r.json()
+        raise RuntimeError("Venice ASR failed after auth refresh")
+
+    def generate_image(self, prompt: str, size: Optional[str] = None) -> Tuple[str, str]:
+        """Generate an image via Venice's in-chat image_generation tool on /api/inference/chat/agents/venice.
+        Returns (base64_data, format_ext) such as ('iVBOR...', 'png')."""
+        text = f"Generate an image of: {prompt.strip()}"
+        if size:
+            text += f" (size: {size})"
+        req_obj = {
+            "clientTools": [],
+            "input": {
+                "messages": [{
+                    "id": str(uuid.uuid4()),
+                    "type": "message",
+                    "role": "user",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                }]
+            },
+        }
+        url = f"{OUTERFACE_BASE}/api/inference/chat/agents/venice?agentModelId=deepseek-v4-1-flash-uncensored&paidImagesMode=block"
+        for attempt in (0, 1):
+            hdrs = self.auth_headers(force_refresh=attempt > 0)
+            tmpdir = tempfile.mkdtemp(prefix="vbridge-img-")
+            os.chmod(tmpdir, 0o700)
+            hdr_file = os.path.join(tmpdir, "headers.txt")
+            body_file = os.path.join(tmpdir, "body.json")
+            try:
+                with os.fdopen(os.open(hdr_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+                    for k, v in hdrs.items():
+                        f.write(f"{k}: {v}\n")
+                with os.fdopen(os.open(body_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+                    json.dump(req_obj, f, ensure_ascii=False)
+                proc = subprocess.Popen(
+                    [
+                        "curl", "-sS", "-N", "-i", "--http1.1",
+                        "--connect-timeout", "20", "--max-time", "120",
+                        "-A", BROWSER_UA, "-H", f"@{hdr_file}",
+                        "--data-binary", f"@{body_file}", url,
+                    ],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                try:
+                    status, _ = _read_head(proc.stdout)
+                    if status == 401 and attempt == 0:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                        continue
+                    if status != 200:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                        raise RuntimeError(f"Venice image generation returned HTTP {status}")
+                    chunks: Dict[int, str] = {}
+                    fmt = "png"
+                    ev = ""
+                    assert proc.stdout is not None
+                    for raw_line in proc.stdout:
+                        line = raw_line.decode("utf-8", "ignore").strip()
+                        if line.startswith("event:"):
+                            ev = line[6:].strip()
+                        elif line.startswith("data:") and ev == "veniceai:image_generation.image_chunk":
+                            try:
+                                d = json.loads(line[5:].strip())
+                                idx = int(d.get("chunk_index", len(chunks)))
+                                b64_part = d.get("image_chunk_b64")
+                                if isinstance(b64_part, str):
+                                    chunks[idx] = b64_part
+                                if isinstance(d.get("format"), str) and d["format"]:
+                                    fmt = d["format"].lower()
+                            except Exception:
+                                pass
+                finally:
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        proc.kill()
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            if not chunks:
+                raise RuntimeError("Venice did not return any image chunks for this prompt.")
+            b64_full = "".join(v for _, v in sorted(chunks.items()))
+            try:
+                decoded = base64.b64decode(b64_full, validate=True)
+            except Exception:
+                raise RuntimeError("Venice returned invalid base64 image data.")
+            if not decoded:
+                raise RuntimeError("Venice returned empty image data.")
+            return b64_full, fmt
+        raise RuntimeError("Venice image generation failed after auth refresh")
 
 
 VENICE = VeniceClient()
@@ -2586,7 +2713,10 @@ class _BridgeStats:
         self._lock = threading.Lock()
         self._started = time.time()
         self._requests = {"total": 0, "ok": 0, "error": 0, "cached": 0, "local": 0}
-        self._events = {"format_retries": 0, "judge_retries": 0, "runaway_cuts": 0, "proactive_jwt_refreshes": 0}
+        self._events = {
+            "format_retries": 0, "judge_retries": 0, "runaway_cuts": 0,
+            "proactive_jwt_refreshes": 0, "audio_transcriptions": 0, "image_generations": 0,
+        }
         self._models: Dict[str, Dict[str, float]] = {}
 
     def record_event(self, name: str, delta: int = 1) -> None:
@@ -2634,6 +2764,10 @@ class _BridgeStats:
                     "runaway_cuts": self._events["runaway_cuts"],
                 },
                 "auth": {"proactive_jwt_refreshes": self._events["proactive_jwt_refreshes"]},
+                "endpoints": {
+                    "audio_transcriptions": self._events["audio_transcriptions"],
+                    "image_generations": self._events["image_generations"],
+                },
                 "pool": POOL.status(),
                 "cache": {**_CACHE_STATS, "entries": len(_CACHE), "enabled": _CACHE_ENABLED},
                 "chat_quota": POOL.active_client().chat_quota(),
@@ -2673,6 +2807,29 @@ def _stats_html(snap: Dict[str, Any]) -> str:
         "</div><table><thead><tr><th>Model</th><th>Requests</th><th>Errors</th><th>Avg TTFT (s)</th><th>Avg Total (s)</th></tr></thead>"
         f"<tbody>{table}</tbody></table></body></html>"
     )
+
+
+def _parse_multipart_form(content_type: str, raw_body: bytes) -> Tuple[Dict[str, str], Optional[Tuple[str, str, bytes]]]:
+    """Parse multipart/form-data -> (text_fields, (filename, mime, raw_bytes) for 'file' or None)."""
+    msg = email.parser.BytesParser().parsebytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + raw_body
+    )
+    if not msg.is_multipart():
+        raise VeniceAttachmentError(400, "Expected multipart/form-data request.")
+    fields: Dict[str, str] = {}
+    file_part: Optional[Tuple[str, str, bytes]] = None
+    for part in msg.get_payload() or []:
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        payload = part.get_payload(decode=True) or b""
+        if name == "file":
+            fname = part.get_filename() or "audio.wav"
+            mime = (part.get_content_type() or "application/octet-stream").lower().split(";", 1)[0].strip()
+            file_part = (os.path.basename(fname), mime, payload)
+        else:
+            fields[name] = payload.decode("utf-8", "replace").strip()
+    return fields, file_part
 
 
 class OpenAIBridgeHandler(BaseHTTPRequestHandler):
@@ -2816,6 +2973,97 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             conn.close()
             self.close_connection = True
 
+    def _handle_audio_transcription(self) -> None:
+        length = int(self.headers.get("Content-Length", 0))
+        if length > MAX_AUDIO_BYTES + 1024 * 1024:
+            self._send_json(413, {"error": {"message": f"Audio upload exceeds limit ({MAX_AUDIO_BYTES} bytes).", "type": "invalid_request_error"}})
+            return
+        raw_body = self.rfile.read(length) if length else b""
+        ct = self.headers.get("Content-Type") or ""
+        try:
+            fields, file_part = _parse_multipart_form(ct, raw_body)
+        except VeniceAttachmentError as exc:
+            self._send_json(exc.status, {"error": {"message": exc.message, "type": "invalid_request_error"}})
+            return
+        if not file_part:
+            self._send_json(400, {"error": {"message": "Missing required 'file' field.", "type": "invalid_request_error"}})
+            return
+        fname, mime, audio_bytes = file_part
+        if len(audio_bytes) > MAX_AUDIO_BYTES:
+            self._send_json(413, {"error": {"message": f"Audio file exceeds limit ({MAX_AUDIO_BYTES} bytes).", "type": "invalid_request_error"}})
+            return
+        if not audio_bytes:
+            self._send_json(400, {"error": {"message": "Uploaded audio file is empty.", "type": "invalid_request_error"}})
+            return
+        if mime not in ALLOWED_AUDIO_MIMES:
+            ext = os.path.splitext(fname)[1].lower()
+            mapped = _AUDIO_EXT_MIME.get(ext)
+            if mapped and mime in ("application/octet-stream", "binary/octet-stream", ""):
+                mime = mapped
+            else:
+                self._send_json(400, {"error": {"message": f"Unsupported audio format: {mime} ({fname}). Supported: mp3, wav, m4a, webm, ogg, flac.", "type": "invalid_request_error"}})
+                return
+        resp_fmt = (fields.get("response_format") or "json").lower()
+        try:
+            res = POOL.active_client().transcribe_audio(
+                audio_bytes, fname, mime,
+                model=fields.get("model") or None,
+                timestamps=(resp_fmt == "verbose_json"),
+            )
+        except Exception as exc:
+            self._send_json(502, {"error": {"message": str(exc), "type": "venice_upstream_error"}})
+            return
+        STATS.record_event("audio_transcriptions")
+        text = str(res.get("text") or "")
+        if resp_fmt == "text":
+            raw = text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        if resp_fmt == "verbose_json":
+            out_v = {"task": "transcribe", "text": text}
+            if isinstance(res.get("timestamps"), list):
+                out_v["segments"] = res["timestamps"]
+            self._send_json(200, out_v)
+            return
+        self._send_json(200, {"text": text})
+
+    def _handle_image_generation(self) -> None:
+        length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw_body)
+        except Exception as exc:
+            self._send_json(400, {"error": {"message": f"Invalid JSON: {exc}", "type": "invalid_request_error"}})
+            return
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": {"message": "Request body must be a JSON object.", "type": "invalid_request_error"}})
+            return
+        prompt = str(body.get("prompt") or "").strip()
+        if not prompt:
+            self._send_json(400, {"error": {"message": "Missing required 'prompt' field.", "type": "invalid_request_error"}})
+            return
+        n = body.get("n", 1)
+        if not isinstance(n, int) or n != 1:
+            self._send_json(400, {"error": {"message": "Only n=1 is supported.", "type": "invalid_request_error"}})
+            return
+        resp_fmt = str(body.get("response_format") or "b64_json").lower()
+        if resp_fmt not in ("b64_json", "url"):
+            self._send_json(400, {"error": {"message": "response_format must be 'b64_json' or 'url'.", "type": "invalid_request_error"}})
+            return
+        size = str(body.get("size") or "").strip() or None
+        try:
+            b64_data, fmt = POOL.active_client().generate_image(prompt, size=size)
+        except Exception as exc:
+            self._send_json(502, {"error": {"message": str(exc), "type": "venice_upstream_error"}})
+            return
+        STATS.record_event("image_generations")
+        item = {"url": f"data:image/{fmt};base64,{b64_data}"} if resp_fmt == "url" else {"b64_json": b64_data}
+        self._send_json(200, {"created": int(time.time()), "data": [item]})
+
     def do_POST(self) -> None:
         started = time.time()
         try:
@@ -2841,6 +3089,12 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, {"ok": True})
             return
+
+        if path == "/v1/audio/transcriptions":
+            return self._handle_audio_transcription()
+
+        if path == "/v1/images/generations":
+            return self._handle_image_generation()
 
         if path != "/v1/chat/completions":
             self._send_json(404, {"error": {"message": f"Unknown POST path: {path}"}})
