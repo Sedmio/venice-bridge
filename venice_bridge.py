@@ -740,8 +740,9 @@ TOOL_REMINDER = (
     "described commands are never run. To use a tool, reply now with ONLY "
     '{"tool_calls":[{"name":"<exact tool name>","arguments":{...}}]}, for example '
     '{"tool_calls":[{"name":"example_tool","arguments":{"path":"notes.txt"}}]} '
-    "(example_tool is only an illustration; use the real tool names). After sending calls, stop and wait "
-    "for the tool result. If the task is finished, reply with the final answer as normal text."
+    "(example_tool is only an illustration; use the real tool names). Put parameters directly in arguments "
+    "(never nest arguments inside arguments); for multi-line SQL/Python use heredoc. After sending calls, "
+    "stop and wait for the tool result. If the task is finished, reply with normal text."
 )
 
 
@@ -917,11 +918,38 @@ ARG_ALIASES = {  # argument name of the client tool -> names models use for it
 
 
 def _fit_arguments(args: Any, props: Dict[str, Any]) -> Any:
-    """Rename arguments the model named differently (path -> filePath, cmd -> command, ...).
+    """Unwrap double-nested argument envelopes (e.g. {"arguments": {"command": "..."}}) and rename
+    arguments the model named differently (path -> filePath, cmd -> command, ...).
     Only a name the tool expects and did not get is filled, and only from a name it does not know."""
     if not isinstance(args, dict) or not props:
         return args
     args = dict(args)
+    # Models frequently double-wrap tool inputs as {"arguments": {...}} or {"name": "...", "arguments": {...}}
+    # or Anthropic-style {"input": {...}}. Unwrap before schema pruning so commands are not dropped.
+    for _ in range(3):
+        unwrapped = False
+        for wrap_key in ("arguments", "parameters", "input"):
+            if wrap_key in args and wrap_key not in props:
+                val = args[wrap_key]
+                if isinstance(val, str):
+                    s = val.strip()
+                    if s.startswith("{") and s.endswith("}"):
+                        try:
+                            parsed = json.loads(s)
+                            if isinstance(parsed, dict):
+                                val = parsed
+                        except Exception:
+                            pass
+                if isinstance(val, dict):
+                    args.pop(wrap_key)
+                    if "name" in args and "name" not in props:
+                        args.pop("name", None)
+                    for k, v in val.items():
+                        args.setdefault(k, v)
+                    unwrapped = True
+                    break
+        if not unwrapped:
+            break
     for key, others in ARG_ALIASES.items():
         if key in props and key not in args:
             for other in others:

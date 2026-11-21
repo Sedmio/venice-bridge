@@ -1151,6 +1151,27 @@ def reasoning_auto_checks() -> None:
     print("reasoning + venice-auto prefix ok")
 
 
+def nested_arguments_unwrap_checks():
+    props = {"command": {"type": "string"}, "timeout": {"type": "integer"}}
+    # 1. Double-nested {"arguments": {"command": "..."}}
+    out = vb._coerce_arguments(vb._fit_arguments({"arguments": {"command": "ls -la"}}, props), props)
+    assert out == {"command": "ls -la"}, out
+    # 2. Nested with redundant "name" {"name": "Bash", "arguments": {"command": "pwd"}}
+    out = vb._coerce_arguments(vb._fit_arguments({"name": "Bash", "arguments": {"command": "pwd"}}, props), props)
+    assert out == {"command": "pwd"}, out
+    # 3. JSON-encoded string inside nested "arguments"
+    out = vb._coerce_arguments(vb._fit_arguments({"arguments": '{"cmd": "echo hi"}'}, props), props)
+    assert out == {"command": "echo hi"}, out
+    # 4. Anthropic-style {"input": {"command": "..."}} when "input" is not in schema
+    out = vb._coerce_arguments(vb._fit_arguments({"input": {"command": "id"}}, props), props)
+    assert out == {"command": "id"}, out
+    # 5. Tool that genuinely has an "input" property keeps it intact
+    props_with_input = {"input": {"type": "object"}}
+    out = vb._coerce_arguments(vb._fit_arguments({"input": {"a": 1}}, props_with_input), props_with_input)
+    assert out == {"input": {"a": 1}}, out
+    print("nested arguments unwrap ok")
+
+
 if __name__ == "__main__":
     cookie_file_checks()
     try:
@@ -1159,5 +1180,6 @@ if __name__ == "__main__":
         end_to_end()
         local_backend_checks()
         reasoning_auto_checks()
+        nested_arguments_unwrap_checks()
     finally:
         shutil.rmtree(STATE_DIR, ignore_errors=True)
