@@ -1154,7 +1154,11 @@ def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
                 tools = matched
         has_tools = len(tools) > 0
 
-    for msg in messages:
+    # Attachments are uploaded only from messages after the last assistant turn (the fresh input). Older
+    # ones become a placeholder, so the rest of the conversation (tool loops) stays on route=chat instead
+    # of the agents/ad-hoc route, where Venice server tools collide with client tool calls.
+    last_asst = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
+    for idx, msg in enumerate(messages):
         role = msg.get("role", "user")
         raw_content = msg.get("content")
         if role == "system":
@@ -1191,9 +1195,13 @@ def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
             continue
         # user / other role: check for multimodal attachments
         role = "user"
-        if isinstance(raw_content, list) and any(
-                isinstance(it, dict) and it.get("type") in ("image_url", "input_image", "file", "input_file")
-                for it in raw_content):
+        has_media = isinstance(raw_content, list) and any(
+            isinstance(it, dict) and it.get("type") in ("image_url", "input_image", "file", "input_file")
+            for it in raw_content)
+        if has_media and idx < last_asst:
+            text = _flatten_content(raw_content)
+            prompt.append(_message(role, (text + "\n" if text else "") + "[earlier attachment, not resent]"))
+        elif has_media:
             msg_id = str(uuid.uuid4())
             text, vparts, blobs = _extract_attachments(raw_content, msg_id, total_att_bytes)
             all_attachments.extend(blobs)

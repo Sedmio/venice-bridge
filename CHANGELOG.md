@@ -8,7 +8,7 @@ Releases: <https://github.com/nsozturk/venice-bridge/releases> · PyPI: <https:/
 ### Added
 
 - **Multimodal image & document attachments** across OpenAI `/v1/chat/completions` (`image_url`, `file`), Anthropic `/v1/messages` (`image`, `document` base64), and OpenAI `/v1/responses` (`input_image`, `input_file`). Requests carrying attachments are sent as `multipart/form-data` to `/api/inference/chat/agents/ad-hoc`; text-only requests stay unchanged on the plain chat route. Enforces a 17-type MIME allowlist (png/jpg/gif/webp + txt/md/csv/rtf/json/yaml/xml/pdf/docx/xls/xlsx), rejects remote `http(s)://` URLs with HTTP 400 (`remote URLs not supported, send base64`), enforces per-file (10 MB) and total (20 MB) size limits with HTTP 413 (`VENICE_BRIDGE_MAX_ATTACHMENT_BYTES`, `VENICE_BRIDGE_MAX_TOTAL_ATTACHMENT_BYTES`), skips response cache for multimodal turns, and never logs raw bytes/base64.
-  - *Known limitation:* Because attachments require `/api/inference/chat/agents/ad-hoc`, combining an image attachment with client tool calls in the same turn can collide with Venice's own server tools (measured: `2/5` `bash` tool calls survived on `deepseek-v4-1-flash-uncensored` with an attached PNG; text-only tool turns are unaffected).
+  - *Known limitation:* Because attachments require `/api/inference/chat/agents/ad-hoc`, combining an image attachment with client tool calls in the same turn can collide with Venice's own server tools (measured: `2/5` `bash` tool calls survived on `deepseek-v4-1-flash-uncensored` with an attached PNG; text-only tool turns are unaffected). Only attachments sent after the last assistant turn are uploaded; older ones become a placeholder, so the rest of the conversation returns to the plain chat route.
 
 ## 0.2.3 — 2026-11-21
 

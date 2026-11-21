@@ -1563,6 +1563,15 @@ def m5_multimodal_attachments_checks():
             assert exc.status == 413 and png_b64 not in exc.message
     finally:
         vb.MAX_ATTACHMENT_BYTES, vb.MAX_TOTAL_ATTACHMENT_BYTES = old_max, old_tot
+
+    # 6. An attachment before the last assistant turn is not resent: later turns stay on route=chat
+    old_turn = {"model": "deepseek-v4-1-flash-uncensored", "messages": body_mm["messages"] + [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
+                                                            "function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "a.txt"}]}
+    p_old, _ = vb.openai_to_venice_chat(old_turn)
+    assert "_attachments" not in p_old, p_old.get("_attachments")
+    assert "earlier attachment" in p_old["messages"][0]["content"][0]["text"]
     print("m5 multimodal attachments ok")
 
 
