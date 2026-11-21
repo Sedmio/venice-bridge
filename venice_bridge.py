@@ -917,13 +917,20 @@ ARG_ALIASES = {  # argument name of the client tool -> names models use for it
 }
 
 
-def _fit_arguments(args: Any, props: Dict[str, Any]) -> Any:
+def _fit_arguments(args: Any, props: Dict[str, Any], required: Any = ()) -> Any:
     """Unwrap double-nested argument envelopes (e.g. {"arguments": {"command": "..."}}) and rename
     arguments the model named differently (path -> filePath, cmd -> command, ...).
-    Only a name the tool expects and did not get is filled, and only from a name it does not know."""
+    Only a name the tool expects and did not get is filled, and only from a name it does not know.
+    A bare-string call arrives wrapped as {"content": "..."} (tolerant_parser _build_call/_salvage);
+    when the tool has exactly one required string parameter and no `content` of its own, the string is
+    that parameter's value (measured: 48x `dropped args not in schema: ['content']`)."""
     if not isinstance(args, dict) or not props:
         return args
     args = dict(args)
+    if (list(args) == ["content"] and "content" not in props and isinstance(args["content"], str)):
+        req_strings = [k for k in (required or []) if k in props and props[k].get("type") in ("string", None)]
+        if len(req_strings) == 1:
+            return {req_strings[0]: args["content"]}
     # Models frequently double-wrap tool inputs as {"arguments": {...}} or {"name": "...", "arguments": {...}}
     # or Anthropic-style {"input": {...}}. Unwrap before schema pruning so commands are not dropped.
     for _ in range(3):
@@ -1279,11 +1286,14 @@ def _read_reply(
         if name:
             declared[name.lower()] = name
     props = {}
+    reqs: Dict[str, List[str]] = {}
     for t in tools or []:
         fn = t.get("function") if isinstance(t, dict) else None
         if isinstance(fn, dict) and fn.get("name") and isinstance(fn.get("parameters"), dict):
             props[fn["name"]] = fn["parameters"].get("properties") if isinstance(
                 fn["parameters"].get("properties"), dict) else {}
+            reqs[fn["name"]] = fn["parameters"].get("required") if isinstance(
+                fn["parameters"].get("required"), list) else []
     calls: List[Tuple[str, Any]] = []
     unknown: List[Tuple[str, Any]] = []
     subcalls: List[Tuple[str, Any]] = []
@@ -1318,7 +1328,7 @@ def _read_reply(
             name = None
         if name and declared:
             tp = props.get(name) or {}
-            args = _coerce_arguments(_fit_arguments(args, tp), tp)
+            args = _coerce_arguments(_fit_arguments(args, tp, reqs.get(name) or []), tp)
         (calls if name else unknown).append((name or c["name"], args))
     if unknown and not calls and len(parsed["content"]) < 200:
         # the reply is only a call, with an invented tool name: OpenCode tells the model it does not exist.

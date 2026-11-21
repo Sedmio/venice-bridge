@@ -1172,6 +1172,32 @@ def nested_arguments_unwrap_checks():
     print("nested arguments unwrap ok")
 
 
+def bare_string_content_checks():
+    # P0-3: a bare-string call arrives as {"content": raw}; with one required string param, assign it.
+    props = {"command": {"type": "string"}}
+    out = vb._coerce_arguments(vb._fit_arguments({"content": "ls -la"}, props, ["command"]), props)
+    assert out == {"command": "ls -la"}, out
+    # untyped required param also counts as a string slot
+    out = vb._fit_arguments({"content": "x"}, {"q": {}}, ["q"])
+    assert out == {"q": "x"}, out
+    # NEGATIVE: two required params -> ambiguous, leave untouched
+    out = vb._fit_arguments({"content": "x"}, {"a": {"type": "string"}, "b": {"type": "string"}}, ["a", "b"])
+    assert out == {"content": "x"}, out
+    # NEGATIVE: the tool really has a `content` property -> keep it
+    out = vb._fit_arguments({"content": "x"}, {"content": {"type": "string"}}, ["content"])
+    assert out == {"content": "x"}, out
+    # NEGATIVE: sole required param is not a string -> leave untouched
+    out = vb._fit_arguments({"content": "5"}, {"n": {"type": "integer"}}, ["n"])
+    assert out == {"content": "5"}, out
+    # NEGATIVE: no required list -> leave untouched
+    out = vb._fit_arguments({"content": "x"}, {"command": {"type": "string"}}, [])
+    assert out == {"content": "x"}, out
+    # a normal, already-correct call is unchanged
+    out = vb._fit_arguments({"command": "ls"}, props, ["command"])
+    assert out == {"command": "ls"}, out
+    print("bare string content ok")
+
+
 if __name__ == "__main__":
     cookie_file_checks()
     try:
@@ -1181,5 +1207,6 @@ if __name__ == "__main__":
         local_backend_checks()
         reasoning_auto_checks()
         nested_arguments_unwrap_checks()
+        bare_string_content_checks()
     finally:
         shutil.rmtree(STATE_DIR, ignore_errors=True)
