@@ -3,10 +3,21 @@
 All notable changes to venice-bridge. Versions follow [Semantic Versioning](https://semver.org/).
 Releases: <https://github.com/nsozturk/venice-bridge/releases> · PyPI: <https://pypi.org/project/venice-bridge/>
 
-## [Unreleased]
+## 0.2.4 — 2026-11-21
 
 ### Added
 
+- **Proactive Clerk JWT refresh.** The session token is refreshed in the background when fewer than
+  `VENICE_BRIDGE_PROACTIVE_REFRESH_S` seconds (default 30) remain, instead of on the request path
+  (7.5% of measured upstream opens had waited ≥ 0.5 s for auth).
+- **`GET /stats`** (JSON, or `?format=html`): live request, model, TTFT, retry, cache, auth, pool and endpoint counters. Counts only; no prompts, cookies or tokens.
+- **`tool_choice`** (`auto`, `none`, `required`, named) and **`parallel_tool_calls: false`** on
+  `/v1/chat/completions`; Anthropic `tool_choice` and `disable_parallel_tool_use` and Responses
+  `parallel_tool_calls` are forwarded by the adapters.
+- **`response_format`** (`json_object`, `json_schema`) and Responses **`text.format`**: the model is told to answer in JSON and fenced or padded JSON is cleaned up.
+- **`stop` / `stop_sequences`** (no-tools path): output stops before the first match, safe across stream chunks; the Anthropic adapter reports `stop_reason: "stop_sequence"`.
+- **Anthropic thinking blocks**: reasoning is streamed as `thinking` content blocks on `/v1/messages`.
+- **Opt-in multi-account cookie pool** (`VENICE_BRIDGE_COOKIE_POOL`, a 0600 file outside the repo, one cookie per line; see `cookie-pool.example.txt`). When the active account hits its quota (HTTP 429) the bridge moves to the next account until the reset. Unset = single-account behavior, unchanged. Accounts appear only as `acct#N` in logs and `/stats`.
 - **Multimodal image & document attachments** across OpenAI `/v1/chat/completions` (`image_url`, `file`), Anthropic `/v1/messages` (`image`, `document` base64), and OpenAI `/v1/responses` (`input_image`, `input_file`). Requests carrying attachments are sent as `multipart/form-data` to `/api/inference/chat/agents/ad-hoc`; text-only requests stay unchanged on the plain chat route. Enforces a 17-type MIME allowlist (png/jpg/gif/webp + txt/md/csv/rtf/json/yaml/xml/pdf/docx/xls/xlsx), rejects remote `http(s)://` URLs with HTTP 400 (`remote URLs not supported, send base64`), enforces per-file (10 MB) and total (20 MB) size limits with HTTP 413 (`VENICE_BRIDGE_MAX_ATTACHMENT_BYTES`, `VENICE_BRIDGE_MAX_TOTAL_ATTACHMENT_BYTES`), skips response cache for multimodal turns, and never logs raw bytes/base64.
   - *Known limitation:* Because attachments require `/api/inference/chat/agents/ad-hoc`, combining an image attachment with client tool calls in the same turn can collide with Venice's own server tools (measured: `2/5` `bash` tool calls survived on `deepseek-v4-1-flash-uncensored` with an attached PNG; text-only tool turns are unaffected). Only attachments sent after the last assistant turn are uploaded; older ones become a placeholder, so the rest of the conversation returns to the plain chat route.
 - **OpenAI-compatible Speech-to-Text (`POST /v1/audio/transcriptions`)** backed by Venice `/api/inference/asr` (`nvidia/parakeet-tdt-0.6b-v3` default; `json`, `text`, and `verbose_json` formats; mp3/wav/m4a/webm/ogg/flac allowlist; 25 MB cap via `VENICE_BRIDGE_MAX_AUDIO_BYTES` → HTTP 413; 0 chat/image quota spent).

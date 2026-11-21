@@ -530,6 +530,14 @@ Environment variables are read when a process starts. Set them before you start 
 | `VENICE_BRIDGE_JUDGE` | on | `0` turns the early-stop judge off. |
 | `VENICE_BRIDGE_JUDGE_MODEL` | `qwen3-5-35b-a3b` | Model used by the judge. |
 | `VENICE_BRIDGE_JUDGE_RETRIES` | `1` | Retries the judge may add per turn. |
+| `VENICE_BRIDGE_LOOP_MAX_CALLS` | `40` | Tool calls per reply before a runaway reply is cut. |
+| `VENICE_BRIDGE_LOOP_MAX_CHARS` | `150000` | Characters per tool-mode reply before it is cut. |
+| `VENICE_BRIDGE_PROACTIVE_REFRESH_S` | `30` | Refresh the session token in the background when fewer seconds than this remain. |
+| `VENICE_BRIDGE_COOKIE_POOL` | empty (off) | Opt-in multi-account pool: a 0600 file, one `__client` cookie per line (see `cookie-pool.example.txt`). On a quota 429 the bridge moves to the next account. |
+| `VENICE_BRIDGE_MAX_ATTACHMENT_BYTES` | `10485760` | Per-file limit for image/document attachments (413 above it). |
+| `VENICE_BRIDGE_MAX_TOTAL_ATTACHMENT_BYTES` | `20971520` | Total attachment limit per request. |
+| `VENICE_BRIDGE_MAX_AUDIO_BYTES` | `26214400` | Upload limit for `/v1/audio/transcriptions`. |
+| `VENICE_BRIDGE_ASR_MODEL` | `nvidia/parakeet-tdt-0.6b-v3` | Venice speech-to-text model. |
 
 Command-line options: `--host` (default `VENICE_BRIDGE_HOST`, else `127.0.0.1`) and `--port` (default `18891`).
 The bridge has no client authentication, so keep the host on loopback.

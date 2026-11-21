@@ -2,7 +2,7 @@
 
 > venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.
 
-Version 0.2.3 · MIT · Repository: https://github.com/nsozturk/venice-bridge · Docs: https://nsozturk.github.io/venice-bridge/
+Version 0.2.4 · MIT · Repository: https://github.com/nsozturk/venice-bridge · Docs: https://nsozturk.github.io/venice-bridge/
 
 ---
 
@@ -504,6 +504,14 @@ Environment variables are read when a process starts. Set them before you start 
 | `VENICE_BRIDGE_JUDGE` | on | `0` turns the early-stop judge off. |
 | `VENICE_BRIDGE_JUDGE_MODEL` | `qwen3-5-35b-a3b` | Model used by the judge. |
 | `VENICE_BRIDGE_JUDGE_RETRIES` | `1` | Retries the judge may add per turn. |
+| `VENICE_BRIDGE_LOOP_MAX_CALLS` | `40` | Tool calls per reply before a runaway reply is cut. |
+| `VENICE_BRIDGE_LOOP_MAX_CHARS` | `150000` | Characters per tool-mode reply before it is cut. |
+| `VENICE_BRIDGE_PROACTIVE_REFRESH_S` | `30` | Refresh the session token in the background when fewer seconds than this remain. |
+| `VENICE_BRIDGE_COOKIE_POOL` | empty (off) | Opt-in multi-account pool: a 0600 file, one `__client` cookie per line (see `cookie-pool.example.txt`). On a quota 429 the bridge moves to the next account. |
+| `VENICE_BRIDGE_MAX_ATTACHMENT_BYTES` | `10485760` | Per-file limit for image/document attachments (413 above it). |
+| `VENICE_BRIDGE_MAX_TOTAL_ATTACHMENT_BYTES` | `20971520` | Total attachment limit per request. |
+| `VENICE_BRIDGE_MAX_AUDIO_BYTES` | `26214400` | Upload limit for `/v1/audio/transcriptions`. |
+| `VENICE_BRIDGE_ASR_MODEL` | `nvidia/parakeet-tdt-0.6b-v3` | Venice speech-to-text model. |
 
 Command-line options: `--host` (default `VENICE_BRIDGE_HOST`, else `127.0.0.1`) and `--port` (default `18891`).
 The bridge has no client authentication, so keep the host on loopback.
@@ -536,6 +544,9 @@ The adapter has no command-line options.
 | `POST /v1/chat/completions` | OpenAI Chat Completions, streaming and non-streaming, with `tools` / `tool_calls`. A `<backend>/<model>` id is passed to that local backend; `venice-auto` is resolved first. When the model returns reasoning (see [Reasoning](#reasoning-opt-in)), it comes as `reasoning_content` (message field, or `delta.reasoning_content` when streaming). | `200`; `400` invalid JSON or `context_length_exceeded`; `402` plan or credits; `401`/`403` Venice refusal; `403` quota used up; `429` passing rate limit; `502` upstream, local backend (`local_backend_error`) or bridge failure |
 | `GET /v1/models` | `venice-auto` first, then the Venice models the account's web catalogue offers without credits (minus `e2ee-*` and `VENICE_EXCLUDE_MODELS`), plus `<backend>/<id>` for every reachable local backend. | `200`; `502` when nothing can be listed |
 | `GET /health` | Session state, remaining web chat quota (`chat_quota`), cache counters (`cache`). | `200`; `503` no usable login |
+| `GET /stats` | Live runtime counters (requests, models, TTFT, retries, cache, pool, endpoint counts); `?format=html` renders a minimal dark dashboard. | `200` |
+| `POST /v1/audio/transcriptions` | OpenAI Whisper-compatible speech-to-text (`multipart/form-data`: `file`, `model`, `response_format` `json`/`text`/`verbose_json`), backed by Venice ASR (`nvidia/parakeet-tdt-0.6b-v3`). Supports mp3/wav/m4a/webm/ogg/flac up to `VENICE_BRIDGE_MAX_AUDIO_BYTES` (25 MB). | `200`; `400` bad format; `413` too large; `502` upstream failure |
+| `POST /v1/images/generations` | OpenAI Image Generation (`{"prompt", "n": 1, "size", "response_format": "b64_json"|"url"}`, where `url` returns a `data:` URI), backed by Venice in-chat image generation (`image_chunk`). Uses 1 chat + 1 image quota call. | `200`; `400` invalid prompt / `n != 1`; `502` upstream failure |
 | `POST /reload` | Drops cached auth (cookie, session, token, attestation) and the local quota lock (also the over-quota state of `venice-auto`). | `200` |
 
 ### Adapter, `127.0.0.1:18892`
@@ -1041,7 +1052,7 @@ Live check of a running setup: `claude-venice --quota` prints `Venice web quota 
 # Tool routing — Claude Code / OpenCode / Codex → Venice
 
 How a client's tools reach the Venice web model and how the model's tool calls are mapped back.
-Source of truth is the code (`venice_bridge.py`, `venice_adapters.py`); this page describes v0.2.3.
+Source of truth is the code (`venice_bridge.py`, `venice_adapters.py`); this page describes v0.2.4.
 
 ## TL;DR
 
