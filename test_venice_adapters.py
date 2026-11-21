@@ -160,6 +160,31 @@ def main():
     assert va._pick_model("venice-bridge/ollama/x") == "venice-bridge/ollama/x"
     assert va._pick_model("m1") == "m1" and va._pick_model("claude-x") == "m1"  # known passes, unknown -> default
     print("pick_model ok")
+    # ---- M2: tool_choice, parallel_tool_calls, text.format -> response_format
+    c_any = va.messages_to_chat({"model": "m1", "tools": [tool_a], "tool_choice": {"type": "any", "disable_parallel_tool_use": True},
+                                 "messages": [{"role": "user", "content": "hi"}]})
+    assert c_any["tool_choice"] == "required" and c_any["parallel_tool_calls"] is False, c_any
+    c_one = va.messages_to_chat({"model": "m1", "tools": [tool_a], "tool_choice": {"type": "tool", "name": "read"},
+                                 "messages": [{"role": "user", "content": "hi"}]})
+    assert c_one["tool_choice"] == {"type": "function", "function": {"name": "read"}}, c_one
+    c_none = va.messages_to_chat({"model": "m1", "tools": [tool_a], "tool_choice": {"type": "none"},
+                                  "messages": [{"role": "user", "content": "hi"}]})
+    assert c_none["tool_choice"] == "none", c_none
+    r_chat, _ = va.responses_to_chat({"model": "m1", "tools": [fn], "tool_choice": {"type": "function", "name": "read"},
+                                      "parallel_tool_calls": False,
+                                      "text": {"format": {"type": "json_schema", "name": "s", "schema": {"type": "object"}}},
+                                      "input": "hi"})
+    assert r_chat["tool_choice"] == {"type": "function", "function": {"name": "read"}}, r_chat
+    assert r_chat["parallel_tool_calls"] is False, r_chat
+    assert r_chat["response_format"]["type"] == "json_schema" and r_chat["response_format"]["json_schema"]["name"] == "s", r_chat
+    st, raw = post(port, "/v1/responses", {"model": "m1", "tools": [fn], "parallel_tool_calls": False, "input": "hi"})
+    assert st == 200 and json.loads(raw)["parallel_tool_calls"] is False, raw
+    # Codex real shape: parallel_tool_calls=True, tool_choice="auto" -> preserved, never restricted to 1 call
+    c_codex, _ = va.responses_to_chat({"model": "m1", "tools": [fn], "tool_choice": "auto", "parallel_tool_calls": True, "input": "hi"})
+    assert c_codex["parallel_tool_calls"] is True and c_codex["tool_choice"] == "auto", c_codex
+    st, raw = post(port, "/v1/responses", {"model": "m1", "tools": [fn], "parallel_tool_calls": True, "input": "hi"})
+    assert st == 200 and json.loads(raw)["parallel_tool_calls"] is True, raw
+    print("m2 adapter tool_choice + parallel + text.format ok")
     print("responses ok")
 
 

@@ -119,6 +119,19 @@ def messages_to_chat(body: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {"model": _pick_model(body.get("model")), "messages": msgs, "stream": bool(body.get("stream"))}
     if tools:
         out["tools"] = tools
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict):
+        tct = tc.get("type")
+        if tct == "auto":
+            out["tool_choice"] = "auto"
+        elif tct == "any":
+            out["tool_choice"] = "required"
+        elif tct == "none":
+            out["tool_choice"] = "none"
+        elif tct == "tool" and tc.get("name"):
+            out["tool_choice"] = {"type": "function", "function": {"name": tc["name"]}}
+        if tc.get("disable_parallel_tool_use") is True:
+            out["parallel_tool_calls"] = False
     if isinstance(body.get("max_tokens"), int):
         out["max_tokens"] = body["max_tokens"]
     return out
@@ -174,6 +187,27 @@ def responses_to_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, s
     out_req: Dict[str, Any] = {"model": _pick_model(body.get("model")), "messages": msgs, "stream": bool(body.get("stream"))}
     if tools:
         out_req["tools"] = tools
+    rtc = body.get("tool_choice")
+    if isinstance(rtc, str) and rtc in ("auto", "required", "none"):
+        out_req["tool_choice"] = rtc
+    elif isinstance(rtc, dict) and rtc.get("type") == "function" and rtc.get("name"):
+        out_req["tool_choice"] = {"type": "function", "function": {"name": rtc["name"]}}
+    if isinstance(body.get("parallel_tool_calls"), bool):
+        out_req["parallel_tool_calls"] = body["parallel_tool_calls"]
+    text_cfg = body.get("text")
+    if isinstance(text_cfg, dict) and isinstance(text_cfg.get("format"), dict):
+        fmt = text_cfg["format"]
+        if fmt.get("type") == "json_object":
+            out_req["response_format"] = {"type": "json_object"}
+        elif fmt.get("type") == "json_schema":
+            out_req["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": fmt.get("name") or "response",
+                    "schema": fmt.get("schema") if isinstance(fmt.get("schema"), dict) else {},
+                    "strict": bool(fmt.get("strict", False)),
+                },
+            }
     if isinstance(body.get("max_output_tokens"), int):
         out_req["max_tokens"] = body["max_output_tokens"]
     return out_req, custom
@@ -381,7 +415,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _responses_out(self, body: Dict[str, Any], chat: Dict[str, Any], custom: Dict[str, str], events: Iterator[Tuple[str, Any]]) -> None:
         rid, stream, seq = "resp_" + uuid.uuid4().hex[:24], bool(chat.get("stream")), [0]
         base = {"id": rid, "object": "response", "created_at": int(time.time()), "model": body.get("model") or chat["model"],
-                "status": "in_progress", "output": [], "tools": body.get("tools") or [], "parallel_tool_calls": True}
+                "status": "in_progress", "output": [], "tools": body.get("tools") or [],
+                "parallel_tool_calls": bool(body.get("parallel_tool_calls", True))}
 
         def emit(event: str, data: Dict[str, Any]) -> None:
             if stream:

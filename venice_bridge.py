@@ -777,14 +777,95 @@ def _message(role: str, text: str) -> Dict[str, Any]:
     }
 
 
+def _parse_tool_choice(tc: Any) -> Tuple[str, Optional[str]]:
+    """Normalize OpenAI / Anthropic tool_choice -> ('auto'|'none'|'required'|'named', forced_name)."""
+    if tc is None:
+        return "auto", None
+    if isinstance(tc, str):
+        low = tc.strip().lower()
+        if low == "none":
+            return "none", None
+        if low in ("required", "any"):
+            return "required", None
+        return "auto", None
+    if isinstance(tc, dict):
+        kind = str(tc.get("type") or "").strip().lower()
+        if kind == "none":
+            return "none", None
+        if kind in ("required", "any"):
+            return "required", None
+        if kind in ("function", "tool"):
+            fn = tc.get("function")
+            name = (fn.get("name") if isinstance(fn, dict) else None) or tc.get("name")
+            if isinstance(name, str) and name.strip():
+                return "named", name.strip()
+    return "auto", None
+
+
+def _response_format_instruction(rf: Any) -> str:
+    """Build a strict JSON output instruction for OpenAI response_format (json_object / json_schema)."""
+    if not isinstance(rf, dict):
+        return ""
+    kind = str(rf.get("type") or "").strip().lower()
+    if kind == "json_object":
+        return "OUTPUT FORMAT: Reply with ONLY one valid JSON object. No markdown fences, no prose, no commentary."
+    if kind == "json_schema":
+        spec = rf.get("json_schema") if isinstance(rf.get("json_schema"), dict) else rf
+        schema = spec.get("schema") if isinstance(spec, dict) else None
+        if isinstance(schema, dict):
+            rendered = json.dumps(schema, ensure_ascii=False)
+            if len(rendered) <= 40000:
+                return (
+                    "OUTPUT FORMAT: Reply with ONLY one valid JSON value matching this JSON Schema "
+                    f"(no markdown fences, no prose, no commentary):\n{rendered}"
+                )
+        return "OUTPUT FORMAT: Reply with ONLY one valid JSON value. No markdown fences, no prose."
+    return ""
+
+
+def _clean_json_output(text: str) -> str:
+    """Extract and normalize a JSON value from a response_format reply (tolerates markdown fences & trailing commas)."""
+    if not isinstance(text, str) or not text.strip():
+        return text
+    s = text.strip()
+    try:
+        json.loads(s)
+        return s
+    except Exception:
+        pass
+    # Find the first '{' or '[' and parse leniently
+    idx_obj, idx_arr = s.find("{"), s.find("[")
+    starts = [i for i in (idx_obj, idx_arr) if i >= 0]
+    if not starts:
+        return text
+    start = min(starts)
+    try:
+        val, _ = read_lenient(s, start)
+        return json.dumps(val, ensure_ascii=False)
+    except Exception:
+        return text
+
+
 def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     messages = body.get("messages") or []
     system_parts: List[str] = []
     prompt: List[Dict[str, Any]] = []
     used: set = set()  # tool names already called in this conversation: listed with full schemas
 
-    tools = body.get("tools") or []
-    has_tools = isinstance(tools, list) and len(tools) > 0
+    raw_tools = body.get("tools") or []
+    tc_mode, tc_name = _parse_tool_choice(body.get("tool_choice"))
+    if tc_mode == "none" or not isinstance(raw_tools, list) or not raw_tools:
+        tools: List[Dict[str, Any]] = []
+        has_tools = False
+    else:
+        tools = raw_tools
+        if tc_mode == "named" and tc_name:
+            matched = [t for t in tools if isinstance(t, dict)
+                       and isinstance(t.get("function"), dict)
+                       and str(t["function"].get("name") or "").lower() == tc_name.lower()]
+            if matched:
+                tools = matched
+        has_tools = len(tools) > 0
 
     for msg in messages:
         role = msg.get("role", "user")
@@ -822,6 +903,10 @@ def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     if not any(m.get("role") == "user" for m in prompt):
         prompt.append(_message("user", "Hello."))
 
+    rf_instr = _response_format_instruction(body.get("response_format"))
+    if rf_instr:
+        system_parts.append(rf_instr)
+
     instructions = "\n\n".join(system_parts) if system_parts else "You are a helpful coding assistant."
     if has_tools:
         instructions += _build_tool_instructions(tools, used)
@@ -832,7 +917,16 @@ def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     model, web_enabled, x_search, think = _parse_web_tags(model)
 
     if has_tools:
-        prompt.append(_message("user", TOOL_REMINDER))
+        rem = TOOL_REMINDER
+        if tc_mode == "named" and tc_name:
+            rem += f' You MUST call the tool "{tc_name}" now using ONLY {{"tool_calls":[{{"name":"{tc_name}","arguments":{{...}}}}]}}. Do not reply in plain text.'
+        elif tc_mode == "required":
+            rem += ' You MUST call at least one declared tool now using ONLY {"tool_calls":[...]}. Do not reply in plain text.'
+        if body.get("parallel_tool_calls") is False:
+            rem += " Call at most ONE tool in this turn."
+        prompt.append(_message("user", rem))
+    elif rf_instr:
+        prompt.append(_message("user", "(format reminder) Reply with ONLY valid JSON matching the requested schema. No markdown fences or extra text."))
 
     effort = body.get("reasoning_effort")
     payload: Dict[str, Any] = {
@@ -1801,7 +1895,7 @@ def _drain(handle, gate: Optional[_LiveGate] = None, tools_mode: bool = False) -
             "streamed": bool(gate and gate.live), "venice": venice}
 
 
-def _reply_of(att: Dict[str, Any], tools: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+def _reply_of(att: Dict[str, Any], tools: Optional[List[Dict[str, Any]]], parallel: bool = True) -> Dict[str, Any]:
     """An attempt as {calls, content, reasoning, trigger, problem}; trigger None = a usable reply."""
     streamed = att.get("streamed", False)
     if att["failure"]:
@@ -1809,6 +1903,8 @@ def _reply_of(att: Dict[str, Any], tools: Optional[List[Dict[str, Any]]]) -> Dic
         return {"calls": None, "content": "", "reasoning": att["reasoning"], "trigger": kind, "problem": problem,
                 "streamed": streamed, "venice": att.get("venice")}
     calls, content, unreadable = _read_reply(att["text"], tools)
+    if calls and not parallel and len(calls) > 1:
+        calls = calls[:1]
     trigger = "unreadable" if unreadable else None if calls or content.strip() else "empty"
     problem = {"unreadable": "the model sent a tool call that could not be read",
                "empty": "Venice finished without sending any text."}.get(trigger)
@@ -1905,9 +2001,11 @@ def _complete_with_tools(body: Dict[str, Any], payload: Dict[str, Any], handle,
     the reply ends the turn right after a tool result, or holds a code block instead of a call while a
     shell tool is declared, the judge, and at most MAX_JUDGE_RETRIES."""
     tools = body.get("tools")
+    parallel = body.get("parallel_tool_calls") is not False
+    tc_mode, tc_name = _parse_tool_choice(body.get("tool_choice"))
     declared = {t["function"]["name"].lower(): t["function"]["name"] for t in tools or []
                 if isinstance(t, dict) and isinstance(t.get("function"), dict) and t["function"].get("name")}
-    best = _reply_of(_drain(handle, gate, tools_mode=True), tools)
+    best = _reply_of(_drain(handle, gate, tools_mode=True), tools, parallel=parallel)
     n = 1
     sys.stderr.write(f"[venice-bridge] attempt 1 (first): {_outcome(best)}\n")
     if best["streamed"]:
@@ -1918,7 +2016,15 @@ def _complete_with_tools(body: Dict[str, Any], payload: Dict[str, Any], handle,
         if time.time() < VENICE.quota_until:
             break  # quota known to be used up: no upstream call, not even the judge
         trigger, replace, from_judge = best["trigger"], False, False
-        if trigger:
+        if not trigger and not best["calls"] and tc_mode in ("required", "named") and format_left >= 1:
+            format_left -= 1
+            STATS.record_event("format_retries")
+            req_msg = (f'You MUST call the tool "{tc_name}" now using ONLY {{"tool_calls":[{{"name":"{tc_name}","arguments":{{...}}}}]}}.'
+                       if tc_mode == "named" and tc_name else
+                       'You MUST call at least one declared tool now using ONLY {"tool_calls":[{"name":"<exact tool name>","arguments":{...}}]}.')
+            nxt = dict(payload, messages=payload["messages"] + [_message("user", "(act reminder) " + req_msg)])
+            why = "tool_choice_" + tc_mode
+        elif trigger:
             if format_left < 1 or (trigger == "transport" and transport_left < 1):
                 break
             format_left -= 1
@@ -1952,7 +2058,7 @@ def _complete_with_tools(body: Dict[str, Any], payload: Dict[str, Any], handle,
         last = nxt
         if gate:
             gate.reset()
-        cand = _reply_of(_drain(handle, gate, tools_mode=True), tools)
+        cand = _reply_of(_drain(handle, gate, tools_mode=True), tools, parallel=parallel)
         sys.stderr.write(f"[venice-bridge] attempt {n} ({why}): {_outcome(cand)}\n")
         if cand["streamed"]:
             return cand
@@ -2599,6 +2705,8 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 STATS.record_request(model, ok=False, total_s=time.time() - req_started)
                 self._send_json(502, {"error": {"message": problem, "type": "venice_upstream_error"}})
                 return
+            if _response_format_instruction(body.get("response_format")):
+                full_text = _clean_json_output(full_text)
             reasoning = "".join(reason_parts) or None  # surfaced when the model reasoned (`/think`)
             message_obj = {"role": "assistant", "content": full_text or None}
             if reasoning:

@@ -1296,6 +1296,52 @@ def m1_resilience_and_stats_checks():
     print("stats endpoint ok")
 
 
+def m2_tool_choice_and_structured_checks():
+    tools = [
+        {"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},
+        {"type": "function", "function": {"name": "bash", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}},
+    ]
+    # 1. tool_choice: "none" disables tool emulation completely
+    p_none, has_none = vb.openai_to_venice_chat({
+        "model": "m", "tools": tools, "tool_choice": "none",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert has_none is False and "[TOOLS]" not in p_none["systemPrompt"]["instructions"]
+    # 2. tool_choice: named function restricts tool block and forces that tool
+    p_named, has_named = vb.openai_to_venice_chat({
+        "model": "m", "tools": tools, "tool_choice": {"type": "function", "function": {"name": "read"}},
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert has_named is True and "read" in p_named["systemPrompt"]["instructions"]
+    assert "bash" not in p_named["systemPrompt"]["instructions"]
+    assert "MUST call the tool" in p_named["messages"][-1]["content"][0]["text"]
+    # 3. tool_choice: "required" instructs mandatory tool call
+    p_req, has_req = vb.openai_to_venice_chat({
+        "model": "m", "tools": tools, "tool_choice": "required",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert has_req is True and "MUST call at least one" in p_req["messages"][-1]["content"][0]["text"]
+    # 4. parallel_tool_calls: False limits parsed calls to 1
+    two_calls_text = '{"tool_calls":[{"name":"read","arguments":{"path":"a.py"}},{"name":"bash","arguments":{"command":"ls"}}]}'
+    r_par = vb._reply_of({"text": two_calls_text, "reasoning": "", "failure": None, "streamed": False}, tools, parallel=True)
+    r_seq = vb._reply_of({"text": two_calls_text, "reasoning": "", "failure": None, "streamed": False}, tools, parallel=False)
+    assert len(r_par["calls"]) == 2 and len(r_seq["calls"]) == 1 and r_seq["calls"][0]["function"]["name"] == "read"
+    # 5. response_format (json_object & json_schema) + _clean_json_output
+    p_rf, _ = vb.openai_to_venice_chat({
+        "model": "m",
+        "response_format": {"type": "json_schema", "json_schema": {"name": "ans", "schema": {"type": "object", "properties": {"n": {"type": "integer"}}}}},
+        "messages": [{"role": "user", "content": "give n"}],
+    })
+    assert "JSON Schema" in p_rf["systemPrompt"]["instructions"] and '"integer"' in p_rf["systemPrompt"]["instructions"]
+    assert vb._clean_json_output('Sure:\n```json\n{"n": 42,}\n```') == '{"n": 42}'
+    assert vb._clean_json_output("plain text without json") == "plain text without json"
+    # oversized json_schema (>40k) must NOT emit a truncated invalid schema with ellipsis
+    huge_schema = {"type": "object", "properties": {f"k{i}": {"type": "string", "description": "x" * 100} for i in range(400)}}
+    huge_instr = vb._response_format_instruction({"type": "json_schema", "json_schema": {"name": "big", "schema": huge_schema}})
+    assert "…" not in huge_instr and "valid JSON value" in huge_instr, huge_instr
+    print("m2 tool_choice + parallel + response_format ok")
+
+
 if __name__ == "__main__":
     cookie_file_checks()
     try:
@@ -1307,5 +1353,6 @@ if __name__ == "__main__":
         nested_arguments_unwrap_checks()
         bare_string_content_checks()
         m1_resilience_and_stats_checks()
+        m2_tool_choice_and_structured_checks()
     finally:
         shutil.rmtree(STATE_DIR, ignore_errors=True)
