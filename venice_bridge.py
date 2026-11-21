@@ -32,6 +32,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,34 @@ COOKIE_FILE = os.environ.get("VENICE_BRIDGE_COOKIE_FILE", "~/.config/venice-brid
 # Opt-in multi-account cookie pool (empty by default = single-account mode, identical to prior behavior).
 # When set, must point to a 0600 file outside the repo with one Clerk __client cookie per line.
 POOL_FILE = os.environ.get("VENICE_BRIDGE_COOKIE_POOL", "")
+# Multimodal attachment limits (env-configurable; defaults: 10 MB per file, 20 MB total per request).
+MAX_ATTACHMENT_BYTES = int(os.environ.get("VENICE_BRIDGE_MAX_ATTACHMENT_BYTES", str(10 * 1024 * 1024)))
+MAX_TOTAL_ATTACHMENT_BYTES = int(os.environ.get("VENICE_BRIDGE_MAX_TOTAL_ATTACHMENT_BYTES", str(20 * 1024 * 1024)))
+ALLOWED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+ALLOWED_FILE_MIMES = {
+    "text/plain", "text/markdown", "text/csv", "text/rtf", "application/rtf",
+    "application/json", "application/x-yaml", "text/yaml", "text/xml", "application/xml",
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+_MIME_EXT = {
+    "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
+    "text/plain": "txt", "text/markdown": "md", "text/csv": "csv", "text/rtf": "rtf",
+    "application/rtf": "rtf", "application/json": "json", "application/x-yaml": "yaml",
+    "text/yaml": "yaml", "text/xml": "xml", "application/xml": "xml", "application/pdf": "pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+}
+
+
+class VeniceAttachmentError(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
 SESSION_BRIDGE_SERVER = os.environ.get("VENICE_BRIDGE_SESSION_DIR", "")
 if SESSION_BRIDGE_SERVER and SESSION_BRIDGE_SERVER not in sys.path:
     sys.path.insert(0, SESSION_BRIDGE_SERVER)
@@ -595,8 +624,9 @@ class VeniceClient:
     def open_chat_stream(self, payload: Dict[str, Any], force_refresh: bool = False, max_time: Optional[float] = None):
         """Stream the request to the route chosen for its model, via system curl --http1.1 (passes Cloudflare)."""
         hdrs = self.auth_headers(force_refresh=force_refresh)
+        attachments = payload.get("_attachments") or []
         path = "/api/inference/chat/agents/ad-hoc"
-        if _uses_chat_route(payload.get("modelId")):
+        if not attachments and _uses_chat_route(payload.get("modelId")):
             payload, path = _to_chat_payload(payload), "/api/inference/chat"
         else:
             payload = {k: v for k, v in payload.items() if not k.startswith("_")}  # drop internal flags
@@ -604,6 +634,8 @@ class VeniceClient:
         os.chmod(tmpdir, 0o700)
         hdr_file = os.path.join(tmpdir, "headers.txt")
         body_file = os.path.join(tmpdir, "body.json")
+        if attachments:
+            hdrs.pop("Content-Type", None)  # curl -F sets multipart/form-data boundary
         with os.fdopen(os.open(hdr_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
             for k, v in hdrs.items():
                 f.write(f"{k}: {v}\n")
@@ -624,10 +656,18 @@ class VeniceClient:
             BROWSER_UA,
             "-H",
             f"@{hdr_file}",
-            "--data-binary",
-            f"@{body_file}",
-            OUTERFACE_BASE + path,
         ]
+        if attachments:
+            cmd.extend(["-H", "Expect:", "-F", f"request=<{body_file}"])
+            for idx, att in enumerate(attachments):
+                att_path = os.path.join(tmpdir, f"att_{idx}.bin")
+                with os.fdopen(os.open(att_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as af:
+                    af.write(att["data"])
+                safe_name = re.sub(r'["\\;\r\n]', "_", att["filename"])
+                cmd.extend(["-F", f"media.{att['media_id']}=@{att_path};filename={safe_name};type={att['mime']}"])
+            cmd.append(OUTERFACE_BASE + path)
+        else:
+            cmd.extend(["--data-binary", f"@{body_file}", OUTERFACE_BASE + path])
         if max_time:  # the judge's overall limit; chat has none (a stall still ends it)
             cmd[1:1] = ["--max-time", str(max_time)]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1017,11 +1057,87 @@ class _StopMatcher:
         return out
 
 
+def _parse_data_uri(uri: str, as_image: bool, filename: Optional[str] = None) -> Dict[str, Any]:
+    """Decode and validate a base64 data: URI against the 17-type MIME allowlist and size limits.
+    Remote http(s) URLs are rejected with 400 (no SSRF). Never puts base64 data into error messages."""
+    if not isinstance(uri, str) or not uri.strip():
+        raise VeniceAttachmentError(400, "Attachment data is empty; send a base64 data: URI.")
+    s = uri.strip()
+    if s.lower().startswith(("http://", "https://")):
+        raise VeniceAttachmentError(400, "remote URLs not supported, send base64")
+    if not s.lower().startswith("data:") or ";base64," not in s[:128].lower():
+        raise VeniceAttachmentError(400, "Attachment must be a base64 data: URI (data:<mime>;base64,...).")
+    head, b64 = s.split(",", 1)
+    mime = head[5:].split(";", 1)[0].strip().lower()
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+    allowed = ALLOWED_IMAGE_MIMES if as_image else (ALLOWED_IMAGE_MIMES | ALLOWED_FILE_MIMES)
+    if mime not in allowed:
+        raise VeniceAttachmentError(400, f"Unsupported attachment MIME type: {mime}")
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        raise VeniceAttachmentError(400, f"Invalid base64 encoding for attachment ({mime}).")
+    if len(raw) > MAX_ATTACHMENT_BYTES:
+        raise VeniceAttachmentError(413, f"Attachment size ({len(raw)} bytes) exceeds per-file limit ({MAX_ATTACHMENT_BYTES} bytes).")
+    kind = "input_image" if mime in ALLOWED_IMAGE_MIMES else "input_file"
+    ext = _MIME_EXT.get(mime, "bin")
+    safe_name = os.path.basename(str(filename or f"attachment.{ext}")).strip() or f"attachment.{ext}"
+    return {"kind": kind, "mime": mime, "data": raw, "filename": safe_name}
+
+
+def _extract_attachments(content: Any, msg_id: str, total_bytes: List[int]) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split a multimodal message content list into (plain_text, venice_media_parts, binary_blobs)."""
+    if not isinstance(content, list):
+        return _flatten_content(content), [], []
+    texts: List[str] = []
+    vparts: List[Dict[str, Any]] = []
+    blobs: List[Dict[str, Any]] = []
+    for item in content:
+        if isinstance(item, str):
+            texts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind in ("text", "input_text", "output_text"):
+            if isinstance(item.get("text"), str):
+                texts.append(item["text"])
+        elif kind in ("image_url", "input_image"):
+            iu = item.get("image_url")
+            url = iu.get("url") if isinstance(iu, dict) else iu
+            detail = (iu.get("detail") if isinstance(iu, dict) else None) or item.get("detail") or "auto"
+            parsed = _parse_data_uri(str(url or ""), as_image=True)
+            total_bytes[0] += len(parsed["data"])
+            if total_bytes[0] > MAX_TOTAL_ATTACHMENT_BYTES:
+                raise VeniceAttachmentError(413, f"Total attachment size exceeds limit ({MAX_TOTAL_ATTACHMENT_BYTES} bytes).")
+            media_id = f"{msg_id}.{len(blobs) + 1}"
+            vparts.append({"type": "input_image", "media_id": media_id, "detail": detail})
+            blobs.append({**parsed, "media_id": media_id})
+        elif kind in ("file", "input_file"):
+            fobj = item.get("file") if isinstance(item.get("file"), dict) else item
+            uri = fobj.get("file_data") or fobj.get("data") or fobj.get("url") or ""
+            fname = fobj.get("filename") or fobj.get("name")
+            parsed = _parse_data_uri(str(uri), as_image=False, filename=fname)
+            total_bytes[0] += len(parsed["data"])
+            if total_bytes[0] > MAX_TOTAL_ATTACHMENT_BYTES:
+                raise VeniceAttachmentError(413, f"Total attachment size exceeds limit ({MAX_TOTAL_ATTACHMENT_BYTES} bytes).")
+            media_id = f"{msg_id}.{len(blobs) + 1}"
+            if parsed["kind"] == "input_image":
+                vparts.append({"type": "input_image", "media_id": media_id, "detail": "auto"})
+            else:
+                vparts.append({"type": "input_file", "media_id": media_id, "filename": parsed["filename"]})
+            blobs.append({**parsed, "media_id": media_id})
+    return "\n".join(texts), vparts, blobs
+
+
 def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     messages = body.get("messages") or []
     system_parts: List[str] = []
     prompt: List[Dict[str, Any]] = []
     used: set = set()  # tool names already called in this conversation: listed with full schemas
+    all_attachments: List[Dict[str, Any]] = []
+    total_att_bytes = [0]
 
     raw_tools = body.get("tools") or []
     tc_mode, tc_name = _parse_tool_choice(body.get("tool_choice"))
@@ -1040,16 +1156,21 @@ def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
 
     for msg in messages:
         role = msg.get("role", "user")
-        text = _flatten_content(msg.get("content"))
+        raw_content = msg.get("content")
         if role == "system":
+            text = _flatten_content(raw_content)
             if text:
                 system_parts.append(text)
             continue
         if role == "tool":
+            text = _flatten_content(raw_content)
             tool_id = msg.get("tool_call_id") or ""
             text = f"[Tool Result {tool_id}]\n{text}"
             role = "user"
-        elif role == "assistant":
+            prompt.append(_message(role, text or ""))
+            continue
+        if role == "assistant":
+            text = _flatten_content(raw_content)
             tcs = msg.get("tool_calls") or []
             if tcs:
                 simplified = []
@@ -1066,10 +1187,22 @@ def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
                         used.add(fn["name"])
                 # prose and calls together: keep both, the model imitates its own history
                 text = (text + "\n" if text else "") + json.dumps({"tool_calls": simplified}, ensure_ascii=False)
+            prompt.append(_message(role, text or ""))
+            continue
+        # user / other role: check for multimodal attachments
+        role = "user"
+        if isinstance(raw_content, list) and any(
+                isinstance(it, dict) and it.get("type") in ("image_url", "input_image", "file", "input_file")
+                for it in raw_content):
+            msg_id = str(uuid.uuid4())
+            text, vparts, blobs = _extract_attachments(raw_content, msg_id, total_att_bytes)
+            all_attachments.extend(blobs)
+            m_obj = _message(role, text or "")
+            m_obj["id"] = msg_id
+            m_obj["content"].extend(vparts)
+            prompt.append(m_obj)
         else:
-            role = "user"
-
-        prompt.append(_message(role, text or ""))
+            prompt.append(_message(role, _flatten_content(raw_content) or ""))
 
     if not any(m.get("role") == "user" for m in prompt):
         prompt.append(_message("user", "Hello."))
@@ -1125,6 +1258,8 @@ def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     # wants passed back, which breaks tool calls (400), so tool requests never get it.
     if (think or effort in ("medium", "high")) and not has_tools:
         payload["_think"] = True
+    if all_attachments:
+        payload["_attachments"] = all_attachments
     return payload, has_tools
 
 
@@ -1817,15 +1952,7 @@ def _cleanup(handle) -> None:
         proc.wait(timeout=2)
     except Exception:
         proc.kill()
-    for p in (hdr_file, body_file):
-        try:
-            os.unlink(p)
-        except OSError:
-            pass
-    try:
-        os.rmdir(tmpdir)
-    except OSError:
-        pass
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _open_upstream(payload: Dict[str, Any], max_time: Optional[float] = None, _failovers: int = 0):
@@ -2390,8 +2517,18 @@ _CACHE = _collections.OrderedDict()  # key -> (stored_at_epoch, entry)
 _CACHE_STATS = {"hits": 0, "misses": 0, "stores": 0}
 
 
+def _has_multimodal_parts(body: Dict[str, Any]) -> bool:
+    for m in body.get("messages") or []:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, list) and any(
+                isinstance(it, dict) and it.get("type") in ("image_url", "input_image", "file", "input_file")
+                for it in c):
+            return True
+    return False
+
+
 def _cache_key(body: Dict[str, Any]) -> Optional[str]:
-    if not _CACHE_ENABLED or not isinstance(body, dict):
+    if not _CACHE_ENABLED or not isinstance(body, dict) or _has_multimodal_parts(body):
         return None
     keyable = {k: v for k, v in body.items() if k != "stream"}
     try:
@@ -2734,15 +2871,21 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             self._serve_cached(cached, stream, model)
             STATS.record_request(model, ok=True, total_s=time.time() - req_started, ttft_s=0.0, cached=True)
             return
-        venice_payload, has_tools = openai_to_venice_chat(body)
-        prompt_chars = (len(venice_payload["systemPrompt"]["instructions"])
-                        + sum(len(m["content"][0]["text"]) for m in venice_payload["messages"]))
+        try:
+            venice_payload, has_tools = openai_to_venice_chat(body)
+        except VeniceAttachmentError as exc:
+            STATS.record_request(model, ok=False, total_s=time.time() - req_started)
+            self._send_json(exc.status, {"error": {"message": exc.message, "type": "invalid_request_error"}})
+            return
+        msg_chars = sum(len(c.get("text", "")) for m in venice_payload["messages"] for c in m.get("content", []))
+        prompt_chars = len(venice_payload["systemPrompt"]["instructions"]) + msg_chars
         sys.stderr.write(
-            "[venice-bridge] request chars: system=%d messages=%d (%d) tools=%d\n" % (
+            "[venice-bridge] request chars: system=%d messages=%d (%d) tools=%d%s\n" % (
                 len(venice_payload["systemPrompt"]["instructions"]),
-                sum(len(m["content"][0]["text"]) for m in venice_payload["messages"]),
+                msg_chars,
                 len(venice_payload["messages"]),
                 len(body.get("tools") or []),
+                f" attachments={len(venice_payload['_attachments'])}" if venice_payload.get("_attachments") else "",
             )
         )
 

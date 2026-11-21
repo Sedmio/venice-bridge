@@ -80,6 +80,56 @@ def _text(content: Any) -> str:
     return "\n".join(out)
 
 
+def _rich_content(content: Any) -> Any:
+    """Plain string when text-only; OpenAI multimodal content list when Anthropic image/document or
+    Responses input_image/input_file blocks are present."""
+    if not isinstance(content, list):
+        return _text(content)
+    has_media = any(isinstance(b, dict) and b.get("type") in ("image", "document", "input_image", "input_file") for b in content)
+    if not has_media:
+        return _text(content)
+    parts: List[Dict[str, Any]] = []
+    for b in content:
+        if isinstance(b, str) and b:
+            parts.append({"type": "text", "text": b})
+        elif not isinstance(b, dict):
+            continue
+        kind = b.get("type")
+        if kind in ("text", "input_text", "output_text") and isinstance(b.get("text"), str):
+            parts.append({"type": "text", "text": b["text"]})
+        elif kind == "image":
+            src = b.get("source") if isinstance(b.get("source"), dict) else {}
+            if src.get("type") == "base64" and src.get("data"):
+                mt = src.get("media_type") or "image/png"
+                parts.append({"type": "image_url", "image_url": {"url": f"data:{mt};base64,{src['data']}"}})
+            elif src.get("type") == "url" and src.get("url"):
+                parts.append({"type": "image_url", "image_url": {"url": str(src["url"])}})
+        elif kind == "document":
+            src = b.get("source") if isinstance(b.get("source"), dict) else {}
+            if src.get("type") == "base64" and src.get("data"):
+                mt = src.get("media_type") or "application/pdf"
+                parts.append({"type": "file", "file": {"file_data": f"data:{mt};base64,{src['data']}", "filename": b.get("title") or "document.pdf"}})
+            elif src.get("type") == "url" and src.get("url"):
+                parts.append({"type": "file", "file": {"file_data": str(src["url"]), "filename": b.get("title") or "document"}})
+        elif kind == "input_image":
+            url = b.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if url:
+                parts.append({"type": "image_url", "image_url": {"url": str(url)}})
+        elif kind == "input_file":
+            fobj: Dict[str, Any] = {}
+            if b.get("file_data"):
+                fobj["file_data"] = str(b["file_data"])
+            elif b.get("file_url"):
+                fobj["file_data"] = str(b["file_url"])
+            if b.get("filename"):
+                fobj["filename"] = str(b["filename"])
+            if fobj.get("file_data"):
+                parts.append({"type": "file", "file": fobj})
+    return parts if parts else _text(content)
+
+
 def _call(call_id: str, name: str, arguments: Any) -> Dict[str, Any]:
     args = arguments if isinstance(arguments, str) else json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
     return {"id": call_id, "type": "function", "function": {"name": name, "arguments": args}}
@@ -110,7 +160,7 @@ def messages_to_chat(body: Dict[str, Any]) -> Dict[str, Any]:
                     text = _text(b.get("content"))
                     msgs.append({"role": "tool", "tool_call_id": b.get("tool_use_id", ""),
                                  "content": ("[error] " + text) if b.get("is_error") else text})
-            rest = _text([b for b in blocks if not (isinstance(b, dict) and b.get("type") == "tool_result")])
+            rest = _rich_content([b for b in blocks if not (isinstance(b, dict) and b.get("type") == "tool_result")])
             if rest:
                 msgs.append({"role": "user", "content": rest})
     tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""),
@@ -157,9 +207,9 @@ def responses_to_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, s
         kind = it.get("type") or ("message" if it.get("role") else "")
         if kind == "message":
             role = {"developer": "system"}.get(it.get("role"), it.get("role") or "user")
-            text = _text(it.get("content"))
-            if text:
-                msgs.append({"role": role, "content": text})
+            content_val = _rich_content(it.get("content")) if role == "user" else _text(it.get("content"))
+            if content_val:
+                msgs.append({"role": role, "content": content_val})
         elif kind in ("function_call", "custom_tool_call"):
             args = it.get("arguments") if kind == "function_call" else {"input": it.get("input", "")}
             call = _call(it.get("call_id") or it.get("id") or "", it.get("name", ""), args)

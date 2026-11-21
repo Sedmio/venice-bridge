@@ -1489,6 +1489,83 @@ def m4_cookie_pool_checks():
     print("m4 cookie pool ok")
 
 
+def m5_multimodal_attachments_checks():
+    import base64, struct, zlib
+
+    def _tiny_png():
+        def ch(tag, data):
+            return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+        raw = b"\x00\xff\x00\x00"
+        ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+        return b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", ihdr) + ch(b"IDAT", zlib.compress(raw)) + ch(b"IEND", b"")
+
+    png_b64 = base64.b64encode(_tiny_png()).decode("ascii")
+    png_uri = f"data:image/png;base64,{png_b64}"
+    pdf_b64 = base64.b64encode(b"%PDF-1.4\nCANARY_TEST\n%%EOF\n").decode("ascii")
+    pdf_uri = f"data:application/pdf;base64,{pdf_b64}"
+
+    # 1. Text-only request stays byte-for-byte on plain chat path (no _attachments)
+    old_route = vb.ROUTE
+    vb.ROUTE = "auto"
+    try:
+        p_txt, has_t = vb.openai_to_venice_chat({"model": "deepseek-v4-1-flash-uncensored", "messages": [{"role": "user", "content": "hi"}]})
+        assert has_t is False and "_attachments" not in p_txt
+        assert vb._uses_chat_route("deepseek-v4-1-flash-uncensored") is True
+    finally:
+        vb.ROUTE = old_route
+
+    # 2. Multimodal request extracts image + PDF, builds input_image & input_file with local media_id, skips cache
+    body_mm = {
+        "model": "deepseek-v4-1-flash-uncensored",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": png_uri}},
+                {"type": "file", "file": {"file_data": pdf_uri, "filename": "doc.pdf"}},
+            ],
+        }],
+    }
+    p_mm, _ = vb.openai_to_venice_chat(body_mm)
+    atts = p_mm.get("_attachments") or []
+    assert len(atts) == 2, atts
+    assert atts[0]["mime"] == "image/png" and atts[1]["mime"] == "application/pdf" and atts[1]["filename"] == "doc.pdf"
+    msg_content = p_mm["messages"][0]["content"]
+    assert [c["type"] for c in msg_content] == ["output_text", "input_image", "input_file"], msg_content
+    assert msg_content[1]["media_id"] == atts[0]["media_id"] and msg_content[2]["media_id"] == atts[1]["media_id"]
+    assert vb._cache_key(body_mm) is None  # multimodal requests must never enter cache
+
+    # 3. Remote http(s) URL -> 400 (no SSRF)
+    try:
+        vb.openai_to_venice_chat({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]}]})
+        raise AssertionError("remote URL should raise 400")
+    except vb.VeniceAttachmentError as exc:
+        assert exc.status == 400 and "base64" in exc.message.lower()
+
+    # 4. Disallowed MIME -> 400
+    exe_uri = "data:application/x-msdownload;base64," + base64.b64encode(b"MZ").decode()
+    try:
+        vb.openai_to_venice_chat({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "file", "file": {"file_data": exe_uri, "filename": "a.exe"}}]}]})
+        raise AssertionError("disallowed MIME should raise 400")
+    except vb.VeniceAttachmentError as exc:
+        assert exc.status == 400 and png_b64 not in exc.message
+
+    # 5. Oversized attachment -> 413
+    old_max, old_tot = vb.MAX_ATTACHMENT_BYTES, vb.MAX_TOTAL_ATTACHMENT_BYTES
+    vb.MAX_ATTACHMENT_BYTES, vb.MAX_TOTAL_ATTACHMENT_BYTES = 16, 32
+    try:
+        try:
+            vb.openai_to_venice_chat(body_mm)
+            raise AssertionError("oversized attachment should raise 413")
+        except vb.VeniceAttachmentError as exc:
+            assert exc.status == 413 and png_b64 not in exc.message
+    finally:
+        vb.MAX_ATTACHMENT_BYTES, vb.MAX_TOTAL_ATTACHMENT_BYTES = old_max, old_tot
+    print("m5 multimodal attachments ok")
+
+
 if __name__ == "__main__":
     cookie_file_checks()
     try:
@@ -1503,5 +1580,6 @@ if __name__ == "__main__":
         m2_tool_choice_and_structured_checks()
         m3_stop_sequences_checks()
         m4_cookie_pool_checks()
+        m5_multimodal_attachments_checks()
     finally:
         shutil.rmtree(STATE_DIR, ignore_errors=True)

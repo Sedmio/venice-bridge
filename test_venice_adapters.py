@@ -219,6 +219,26 @@ def main():
     ev = sse(raw)
     assert ev[-2]["delta"] == {"stop_reason": "stop_sequence", "stop_sequence": "THREE"}, ev[-2]
     print("m3 thinking + stop_sequences ok")
+    # ---- M5: Multimodal image & document passthrough (Anthropic & Responses -> OpenAI content array)
+    c_img = va.messages_to_chat({"model": "m1", "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what color?"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+        {"type": "document", "title": "a.pdf", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ="}},
+    ]}]})
+    parts = c_img["messages"][0]["content"]
+    assert isinstance(parts, list) and [p["type"] for p in parts] == ["text", "image_url", "file"], parts
+    assert parts[1]["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgo="
+    assert parts[2]["file"]["file_data"] == "data:application/pdf;base64,JVBERi0xLjQ=" and parts[2]["file"]["filename"] == "a.pdf"
+    r_img, _ = va.responses_to_chat({"model": "m1", "input": [{"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "see"},
+        {"type": "input_image", "image_url": "data:image/jpeg;base64,/9j/"},
+        {"type": "input_file", "filename": "x.pdf", "file_data": "data:application/pdf;base64,JVBERi0="},
+    ]}]})
+    r_parts = r_img["messages"][0]["content"]
+    assert isinstance(r_parts, list) and [p["type"] for p in r_parts] == ["text", "image_url", "file"], r_parts
+    assert r_parts[1]["image_url"]["url"] == "data:image/jpeg;base64,/9j/"
+    assert r_parts[2]["file"]["filename"] == "x.pdf"
+    print("m5 adapter multimodal ok")
     print("responses ok")
 
 
