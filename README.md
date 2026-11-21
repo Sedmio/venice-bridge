@@ -26,6 +26,7 @@ the backend of the venice.ai web app, signed in with your own browser login. The
 and no API key is needed.
 
 Documentation site: <https://nsozturk.github.io/venice-bridge/> · Agent contract: [AGENTS.md](https://github.com/nsozturk/venice-bridge/blob/main/AGENTS.md) ·
+Changelog: [CHANGELOG.md](https://github.com/nsozturk/venice-bridge/blob/main/CHANGELOG.md) ·
 Tool routing reference: [docs/TOOL_ROUTING.md](https://github.com/nsozturk/venice-bridge/blob/main/docs/TOOL_ROUTING.md)
 
 > [!WARNING]

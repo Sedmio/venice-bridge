@@ -32,7 +32,7 @@
   "description": "venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.",
   "operatingSystem": "macOS",
   "applicationCategory": "DeveloperApplication",
-  "softwareVersion": "0.2.1",
+  "softwareVersion": "0.2.2",
   "license": "https://opensource.org/licenses/MIT",
   "codeRepository": "https://github.com/nsozturk/venice-bridge",
   "downloadUrl": "https://github.com/nsozturk/venice-bridge",
@@ -276,7 +276,7 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
 <body>
 
 <header class="navbar">
-  <a href="#overview" class="brand">venice-bridge <span class="badge">v0.2.1</span></a>
+  <a href="#overview" class="brand">venice-bridge <span class="badge">v0.2.2</span></a>
   <div class="nav-actions">
     <a href="#quick-start" class="nav-link">Quick start</a>
     <a href="#how-it-works" class="nav-link">How it works</a>
@@ -299,6 +299,7 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
       <div class="nav-group">
         <div class="nav-title">Getting started</div>
         <a href="#overview" class="nav-item">Overview</a>
+        <a href="#whats-new" class="nav-item">What's new</a>
         <a href="#screenshots" class="nav-item">Screenshots</a>
         <a href="#requirements" class="nav-item">Requirements</a>
         <a href="#quick-start" class="nav-item">Quick start</a>
@@ -390,6 +391,28 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
         <div class="callout-title">Model quality</div>
         <p>Venice's fast models are weak at long agentic chains. In a small test of 5 one-tool runs per model through Claude Code, none of the three fast models produced a clean correct final answer every time, and one invented a cited weather report (one machine, one account). Good for cheap exploratory runs, not for high-stakes work.</p>
       </div>
+    </section>
+
+    <section id="whats-new">
+      <h2>What's new</h2>
+      <p>Full history: <a href="https://github.com/nsozturk/venice-bridge/blob/main/CHANGELOG.md">CHANGELOG.md</a> · <a href="https://github.com/nsozturk/venice-bridge/releases">Releases</a> · <a href="https://pypi.org/project/venice-bridge/">PyPI</a></p>
+      <h3>v0.2.2 <small>2026-11-21</small></h3>
+      <ul>
+        <li><strong>Bare-string tool calls are no longer dropped.</strong> A bare string reply reaches the bridge as <code>{"content": "..."}</code>; when the tool has no <code>content</code> parameter and exactly one required string parameter, the string goes there.</li>
+        <li>This "What's new" section and a changelog.</li>
+      </ul>
+      <h3>v0.2.1 <small>2026-11-21</small></h3>
+      <ul>
+        <li><strong>Double-nested tool arguments are unwrapped</strong> (<code>{"arguments": {...}}</code>, <code>{"input": {...}}</code>, a JSON string in <code>arguments</code>), so the inner command is no longer dropped.</li>
+        <li>The format reminder asks for parameters directly in <code>arguments</code> and a heredoc for multi-line SQL or Python.</li>
+        <li><strong>On PyPI</strong>: <code>pipx install venice-bridge</code> gives <code>venice-bridge</code>, <code>venice-adapters</code> and <code>claude-venice</code>.</li>
+      </ul>
+      <h3>v0.2.0 <small>2026-11-21</small></h3>
+      <ul>
+        <li>Claude Code and Codex CLI through the adapter (<code>127.0.0.1:18892</code>), and the <code>claude-venice</code> launcher.</li>
+        <li>Local models by prefix (<code>ollama/</code>, <code>lmstudio/</code>, <code>backends.json</code>) and the <code>venice-auto</code> fallback model.</li>
+        <li>Opt-in web search (<code>:web</code>, <code>:xsearch</code>) and reasoning (<code>:think</code>); response cache.</li>
+      </ul>
     </section>
 
     <section id="screenshots">
@@ -746,7 +769,7 @@ claude-venice -m venice-auto               # works through the adapter, because 
       <p>The table above shows the common cases. The full alias lists (tool names, argument names, Venice server-tool names mapped back to the client's tools, and what is deliberately not routed) are in <a href="https://github.com/nsozturk/venice-bridge/blob/main/docs/TOOL_ROUTING.md"><code>docs/TOOL_ROUTING.md</code></a>.</p>
 
       <h3 id="argument-fitting">Argument fitting</h3>
-      <p>Argument fitting renames arguments the model named differently: <code>path</code> / <code>file_path</code> / <code>filename</code> → <code>filePath</code>, <code>cmd</code> / <code>script</code> → <code>command</code>, <code>old_str</code> → <code>oldString</code>, <code>new_str</code> → <code>newString</code>, <code>contents</code> / <code>text</code> → <code>content</code>, <code>query</code> / <code>regex</code> → <code>pattern</code>, <code>link</code> → <code>url</code>. This happens only when the tool expects that name, did not get it, and does not know the other name.</p>
+      <p>Argument fitting renames arguments the model named differently: <code>path</code> / <code>file_path</code> / <code>filename</code> → <code>filePath</code>, <code>cmd</code> / <code>script</code> → <code>command</code>, <code>old_str</code> → <code>oldString</code>, <code>new_str</code> → <code>newString</code>, <code>contents</code> / <code>text</code> → <code>content</code>, <code>query</code> / <code>regex</code> → <code>pattern</code>, <code>link</code> → <code>url</code>. This happens only when the tool expects that name, did not get it, and does not know the other name. Before renaming, envelopes the model adds around the real arguments (<code>{"arguments": {...}}</code>, <code>{"input": {...}}</code>, <code>{"parameters": {...}}</code>, a JSON string in <code>arguments</code>) are unwrapped, up to three levels, when the tool has no field of that name. A bare string (<code>{"content": "..."}</code>) goes into the tool's one required string parameter when it has no <code>content</code> of its own.</p>
 
       <h3 id="completion-check">Completion check</h3>
       <p>A reply counts only after its completion signal: <code>response.completed</code> on the agent route; on the chat route, which sends no closing event, a clean end of the HTTP response (curl exit code 0). A cut stream never becomes a half-written file.</p>
@@ -1039,7 +1062,7 @@ claude-venice --quota                   <span class="c"># Venice web quota  rema
     <div class="no-results" id="noResults">No section matches your search.</div>
 
     <footer>
-      <p>venice-bridge v0.2.1 · MIT · <a href="https://github.com/nsozturk/venice-bridge">github.com/nsozturk/venice-bridge</a> · Unofficial, not affiliated with Venice.ai.</p>
+      <p>venice-bridge v0.2.2 · MIT · <a href="https://github.com/nsozturk/venice-bridge">github.com/nsozturk/venice-bridge</a> · Unofficial, not affiliated with Venice.ai.</p>
     </footer>
   </main>
 </div>

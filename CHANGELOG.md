@@ -1,0 +1,56 @@
+# Changelog
+
+All notable changes to venice-bridge. Versions follow [Semantic Versioning](https://semver.org/).
+Releases: <https://github.com/nsozturk/venice-bridge/releases> · PyPI: <https://pypi.org/project/venice-bridge/>
+
+## 0.2.2 — 2026-11-21
+
+### Fixed
+
+- **Bare-string tool calls are no longer dropped.** When a model answers a tool call with a bare
+  string, it reaches the bridge as `{"content": "..."}`. If the tool has no `content` parameter and
+  exactly one required string parameter, the string now goes into that parameter instead of being
+  dropped as `dropped args not in schema: ['content']`.
+
+### Docs
+
+- This changelog, and a "What's new" section on the documentation site.
+
+## 0.2.1 — 2026-11-21
+
+### Fixed
+
+- **Double-nested tool arguments are unwrapped**: `{"arguments": {...}}`, `{"name": ..., "arguments": {...}}`,
+  a JSON string in `arguments`, and `{"input": {...}}` / `{"parameters": {...}}`, up to three levels and
+  only when the tool's schema has no field of that name.
+- The format reminder tells the model to put parameters directly in `arguments` and to use a heredoc for
+  multi-line SQL or Python.
+
+### Added
+
+- Installable from PyPI: `pipx install venice-bridge` gives the `venice-bridge`, `venice-adapters` and
+  `claude-venice` commands.
+
+## 0.2.0 — 2026-11-21
+
+### Added
+
+- `venice_adapters.py` (127.0.0.1:18892): Anthropic Messages and OpenAI Responses in front of the bridge,
+  so Claude Code and Codex CLI work. Standard library only.
+- `claude-venice`: runs Claude Code against the adapter in an isolated profile.
+- Local models by prefix (`ollama/...`, `lmstudio/...`, others via `backends.json`).
+- `venice-auto`: Venice normally, a local model while the daily web quota is used up.
+- Opt-in Venice web search (`:web`, `:xsearch`) and reasoning on no-tool requests (`:think`).
+- `temperature` and `top_p` forwarded; credit-only and e2ee models hidden from `/v1/models`;
+  in-memory cache for byte-identical repeat requests.
+
+### Fixed
+
+- A local model asked through the adapter never falls back to Venice when its backend is down.
+- `reasoning_effort` no longer turns reasoning on for requests that declare tools.
+- `venice-bridge/venice-auto` resolves like `venice-auto`.
+
+## 0.1.0
+
+- First open-source release: OpenAI-compatible bridge for the venice.ai web plan with emulated tool calls,
+  plain chat route by default, native call reader and tool-name / argument routing.
