@@ -1,0 +1,12 @@
+# Optional multi-account cookie pool template for venice-bridge.
+# Keep your real file OUTSIDE the repo, e.g. ~/.config/venice-bridge/cookie-pool.txt
+# and restrict its permissions to owner-only:
+#
+#   chmod 600 ~/.config/venice-bridge/cookie-pool.txt
+#   export VENICE_BRIDGE_COOKIE_POOL=~/.config/venice-bridge/cookie-pool.txt
+#
+# Put one Clerk `__client` cookie value per line (blank lines and `#` comments are ignored).
+# Default (env var unset): single-account mode, unchanged.
+#
+# <clerk_client_cookie_for_account_1>
+# <clerk_client_cookie_for_account_2>

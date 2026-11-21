@@ -50,6 +50,9 @@ from curl_cffi import requests as cffi_requests
 #   2. A local session daemon whose `client.py` (with get_session(domain)) lives in
 #      SESSION_BRIDGE_SERVER, e.g. a browser extension that syncs cookies to disk.
 COOKIE_FILE = os.environ.get("VENICE_BRIDGE_COOKIE_FILE", "~/.config/venice-bridge/client-cookie.txt")
+# Opt-in multi-account cookie pool (empty by default = single-account mode, identical to prior behavior).
+# When set, must point to a 0600 file outside the repo with one Clerk __client cookie per line.
+POOL_FILE = os.environ.get("VENICE_BRIDGE_COOKIE_POOL", "")
 SESSION_BRIDGE_SERVER = os.environ.get("VENICE_BRIDGE_SESSION_DIR", "")
 if SESSION_BRIDGE_SERVER and SESSION_BRIDGE_SERVER not in sys.path:
     sys.path.insert(0, SESSION_BRIDGE_SERVER)
@@ -291,9 +294,11 @@ def _jwt_exp(jwt_token: str) -> float:
 
 
 class VeniceClient:
-    def __init__(self) -> None:
+    def __init__(self, cookie_override: Optional[str] = None, label: str = "acct#1") -> None:
         self._lock = threading.Lock()  # Clerk state + JWT; held across the Clerk HTTP calls
         self._attest_lock = threading.Lock()  # attestation only; never taken together with _lock
+        self._cookie_override: Optional[str] = cookie_override
+        self.label: str = label
         self._clerk_client: Optional[str] = None
         self._sb_client: Optional[str] = None  # the session source's own value for the current sync
         self._session_ts: float = 0.0
@@ -309,6 +314,10 @@ class VeniceClient:
         self.quota_until: float = 0.0  # epoch seconds; chat is answered locally until then
 
     def _load_clerk_client(self) -> str:
+        if self._cookie_override:
+            if not self._clerk_client:
+                self._clerk_client = self._cookie_override
+            return self._clerk_client
         session = get_session("venice.ai")
         if not session:
             raise VeniceAuthError(
@@ -362,7 +371,7 @@ class VeniceClient:
                 continue
             if m.group(1) != self._clerk_client:
                 self._clerk_client = m.group(1)
-                if self._session_ts_raw:
+                if self._session_ts_raw and not self._cookie_override:
                     _write_saved_client(self._session_ts_raw, self._clerk_client)
 
     def _fall_back_to_session_bridge(self) -> bool:
@@ -626,6 +635,115 @@ class VeniceClient:
 
 
 VENICE = VeniceClient()
+
+
+class _AccountPool:
+    """Opt-in deterministic multi-account pool (disabled by default: POOL_FILE == '').
+
+    Stays on the active account until its quota is exhausted (quota_until > now), then switches
+    in order to the next available account (acct#1, acct#2, ...). Never logs or exposes cookies,
+    JWTs, or user IDs. Refuses pool files whose permissions allow group/other access (!= 0600).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._clients: List[VeniceClient] = []
+        self._active_idx: int = 0
+        if POOL_FILE:
+            try:
+                self.reload()
+            except Exception as exc:
+                sys.stderr.write(f"[venice-bridge] pool init failed: {exc}\n")
+
+    def reload(self) -> None:
+        with self._lock:
+            self._clients = []
+            self._active_idx = 0
+            if not POOL_FILE:
+                return
+            path = os.path.expanduser(POOL_FILE)
+            if not os.path.exists(path):
+                return
+            mode = os.stat(path).st_mode & 0o777
+            if mode & 0o077:
+                raise VeniceAuthError(
+                    "Cookie pool file must have 0600 permissions (chmod 600 before enabling VENICE_BRIDGE_COOKIE_POOL)."
+                )
+            cookies: List[str] = []
+            with open(path, encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("__client="):
+                        line = line[len("__client="):].split(";", 1)[0].strip()
+                    if line:
+                        cookies.append(line)
+            self._clients = [VeniceClient(cookie_override=c, label=f"acct#{i}") for i, c in enumerate(cookies, 1)]
+
+    def is_enabled(self) -> bool:
+        with self._lock:
+            return bool(self._clients)
+
+    def active_client(self) -> VeniceClient:
+        with self._lock:
+            if not self._clients:
+                return VENICE
+            now = time.time()
+            cur = self._clients[self._active_idx]
+            if now >= cur.quota_until:
+                return cur
+            for idx, c in enumerate(self._clients):
+                if now >= c.quota_until:
+                    self._active_idx = idx
+                    return c
+            return cur
+
+    def failover(self, exhausted: VeniceClient) -> Optional[VeniceClient]:
+        with self._lock:
+            if not self._clients:
+                return None
+            now = time.time()
+            n = len(self._clients)
+            for offset in range(1, n + 1):
+                idx = (self._active_idx + offset) % n
+                cand = self._clients[idx]
+                if cand is not exhausted and now >= cand.quota_until:
+                    self._active_idx = idx
+                    sys.stderr.write(
+                        f"[venice-bridge] pool: {exhausted.label} quota exhausted; switching to {cand.label}\n"
+                    )
+                    return cand
+            return None
+
+    def all_exhausted(self) -> bool:
+        now = time.time()
+        with self._lock:
+            if not self._clients:
+                return now < VENICE.quota_until
+            return all(now < c.quota_until for c in self._clients)
+
+    def earliest_reset(self) -> float:
+        with self._lock:
+            if not self._clients:
+                return VENICE.quota_until
+            return min(c.quota_until for c in self._clients)
+
+    def status(self) -> Dict[str, Any]:
+        now = time.time()
+        with self._lock:
+            if not self._clients:
+                return {"enabled": False, "total": 1, "available": 0 if now < VENICE.quota_until else 1, "active": "acct#1"}
+            avail = sum(1 for c in self._clients if now >= c.quota_until)
+            return {
+                "enabled": True,
+                "total": len(self._clients),
+                "available": avail,
+                "active": self._clients[self._active_idx].label,
+            }
+
+
+POOL = _AccountPool()
 
 
 def _flatten_content(content: Any) -> str:
@@ -1555,7 +1673,7 @@ def _read_head(stream) -> Tuple[int, Dict[str, str]]:
 def _quota_error() -> Tuple[int, str]:
     # ponytail: answered as 403, not 429. OpenCode retries 429 silently and for hours
     # (7 upstream calls in 45 s, nothing shown); a 403 ends the turn and shows this message.
-    mins = max(1, round((VENICE.quota_until - time.time()) / 60))
+    mins = max(1, round((POOL.earliest_reset() - time.time()) / 60))
     return 403, f"Venice web chat quota is used up for this account. Resets in about {mins} min."
 
 
@@ -1710,13 +1828,16 @@ def _cleanup(handle) -> None:
         pass
 
 
-def _open_upstream(payload: Dict[str, Any], max_time: Optional[float] = None):
+def _open_upstream(payload: Dict[str, Any], max_time: Optional[float] = None, _failovers: int = 0):
     """Start one upstream call and read its HTTP head: (handle, None), or (None, (client status, error body)).
-    One retry with a fresh JWT and attestation when Venice says the token is stale."""
+    One retry with a fresh JWT and attestation when Venice says the token is stale.
+    When the opt-in cookie pool is enabled and the active account hits quota (429 with remaining==0),
+    switches deterministically to the next available account."""
+    client = POOL.active_client()
     for attempt in (0, 1):
         t0 = time.time()
         try:
-            handle = VENICE.open_chat_stream(payload, force_refresh=attempt > 0, max_time=max_time)
+            handle = client.open_chat_stream(payload, force_refresh=attempt > 0, max_time=max_time)
         except Exception as exc:
             return None, (502, {"error": {"message": str(exc), "type": "bridge_error"}})
         proc = handle[0]
@@ -1742,7 +1863,20 @@ def _open_upstream(payload: Dict[str, Any], max_time: Optional[float] = None):
     if ROUTE == "auto" and status == 400 and "modelNotFound" in detail and model not in AGENT_ONLY_MODELS:
         AGENT_ONLY_MODELS.add(model)  # the chat route does not have this model: the agent route does
         sys.stderr.write(f"[venice-bridge] {model} is not on the chat route; using the agent route for it\n")
-        return _open_upstream(payload, max_time)
+        return _open_upstream(payload, max_time, _failovers)
+    if status == 429 and POOL.is_enabled():
+        quota = client.chat_quota() or {}
+        if quota.get("remaining") == 0:
+            client.quota_until = quota.get("reset_at") or (time.time() + 60)
+            nxt = POOL.failover(client)
+            if nxt is not None and _failovers < len(POOL._clients):
+                return _open_upstream(payload, max_time, _failovers + 1)
+            code, message = _quota_error()
+            sys.stderr.write(f"[venice-bridge] upstream 429: {message}\n")
+            return None, (code, {"error": {"message": message, "type": "venice_quota_exhausted", "code": 429}})
+        msg = f"Venice is rate limiting right now (not the quota): {detail or 'no detail'}"
+        sys.stderr.write(f"[venice-bridge] upstream 429: {msg}\n")
+        return None, (429, {"error": {"message": msg, "type": "venice_rate_limited", "code": 429}})
     if status == 403 and ("challenge" in head.get("cf-mitigated", "") or detail.startswith("<")):
         # a Cloudflare challenge is neither a quota nor an auth problem: never lock on it
         message = ("Cloudflare challenged the request. Open venice.ai in your browser, refresh the "
@@ -2066,7 +2200,7 @@ def _complete_with_tools(body: Dict[str, Any], payload: Dict[str, Any], handle,
     last = payload
     format_left, judge_left, transport_left = MAX_FORMAT_RETRIES, MAX_JUDGE_RETRIES, 1
     while True:
-        if time.time() < VENICE.quota_until:
+        if POOL.all_exhausted():
             break  # quota known to be used up: no upstream call, not even the judge
         trigger, replace, from_judge = best["trigger"], False, False
         if not trigger and not best["calls"] and tc_mode in ("required", "named") and format_left >= 1:
@@ -2095,7 +2229,7 @@ def _complete_with_tools(body: Dict[str, Any], payload: Dict[str, Any], handle,
             break
         else:
             verdict = _ask_judge(body, best["content"])
-            if verdict not in JUDGE_REMINDERS or time.time() < VENICE.quota_until:
+            if verdict not in JUDGE_REMINDERS or POOL.all_exhausted():
                 break
             judge_left -= 1
             STATS.record_event("judge_retries")
@@ -2179,7 +2313,7 @@ def _resolve_auto(model: str) -> str:
     cands = [c.strip() for c in os.environ.get("VENICE_AUTO_MODELS", DEFAULT_AUTO_MODELS).split(",") if c.strip()]
     venice_c = [c for c in cands if "/" not in c]
     local_c = [c for c in cands if "/" in c]
-    if time.time() < VENICE.quota_until and local_c:
+    if POOL.all_exhausted() and local_c:
         return local_c[0]  # over quota: a Venice tag is meaningless on a local backend, so drop the suffix
     chosen = venice_c[0] if venice_c else (local_c[0] if local_c else "deepseek-v4-1-flash-uncensored")
     return chosen + (":" + suffix if suffix and "/" not in chosen else "")
@@ -2355,8 +2489,9 @@ class _BridgeStats:
                     "runaway_cuts": self._events["runaway_cuts"],
                 },
                 "auth": {"proactive_jwt_refreshes": self._events["proactive_jwt_refreshes"]},
+                "pool": POOL.status(),
                 "cache": {**_CACHE_STATS, "entries": len(_CACHE), "enabled": _CACHE_ENABLED},
-                "chat_quota": VENICE.chat_quota(),
+                "chat_quota": POOL.active_client().chat_quota(),
                 "models": models_out,
             }
 
@@ -2470,8 +2605,9 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/health":
             try:
-                VENICE.get_jwt()
-                self._send_json(200, {"ok": True, "venice_session": "active", "chat_quota": VENICE.chat_quota(),
+                active = POOL.active_client()
+                active.get_jwt()
+                self._send_json(200, {"ok": True, "venice_session": "active", "chat_quota": active.chat_quota(),
                                       "cache": {**_CACHE_STATS, "entries": len(_CACHE), "enabled": _CACHE_ENABLED}})
             except Exception as exc:
                 self._send_json(503, {"ok": False, "error": str(exc)})
@@ -2494,7 +2630,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
         if path == "/v1/models":
             models = list_local_models()
             try:
-                models = VENICE.list_models() + models
+                models = POOL.active_client().list_models() + models
             except Exception as exc:
                 if not models:
                     self._send_json(502, {"error": {"message": str(exc), "type": "bridge_error"}})
@@ -2553,6 +2689,11 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 VENICE._jwt = None
                 VENICE._attest_token = None
                 VENICE.quota_until = 0.0
+            try:
+                POOL.reload()
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+                return
             self._send_json(200, {"ok": True})
             return
 
@@ -2577,7 +2718,7 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             STATS.record_request(f"{backend['name']}/{local_model}", ok=True, total_s=time.time() - t_local, local=True)
             return
 
-        if time.time() < VENICE.quota_until:  # known to be over quota: do not spend an upstream call
+        if POOL.all_exhausted():  # known to be over quota: do not spend an upstream call
             code, message = _quota_error()
             STATS.record_request(str(body.get("model") or ""), ok=False)
             self._send_json(code, {"error": {"message": message, "type": "venice_quota_exhausted", "code": 429}})

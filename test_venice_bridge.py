@@ -1365,6 +1365,130 @@ def m3_stop_sequences_checks():
     print("m3 stop_sequences ok")
 
 
+def m4_cookie_pool_checks():
+    import io, sys
+    old_pool_file = vb.POOL_FILE
+    try:
+        # 1. Default (opt-in off): single account, identical to today
+        vb.POOL_FILE = ""
+        vb.POOL.reload()
+        assert vb.POOL.is_enabled() is False
+        assert vb.POOL.active_client() is vb.VENICE
+
+        # 2. Pool file with loose permissions (0644) must be refused
+        pfile = os.path.join(STATE_DIR, "pool.txt")
+        secret_a = "FAKE_COOKIE_ALPHA_SECRET_999"
+        secret_b = "FAKE_COOKIE_BETA_SECRET_888"
+        open(pfile, "w").write(f"# test pool\n{secret_a}\n__client={secret_b}; Path=/\n")
+        os.chmod(pfile, 0o644)
+        vb.POOL_FILE = pfile
+        try:
+            vb.POOL.reload()
+            raise AssertionError("0644 pool file should have been refused")
+        except vb.VeniceAuthError as exc:
+            assert "0600" in str(exc)
+            assert secret_a not in str(exc) and secret_b not in str(exc)
+
+        # 3. 0600 pool file loads deterministically: acct#1 stays active until quota_until
+        os.chmod(pfile, 0o600)
+        vb.POOL.reload()
+        assert vb.POOL.is_enabled() is True
+        c1 = vb.POOL.active_client()
+        assert c1.label == "acct#1" and vb.POOL.active_client() is c1  # deterministic, no random rotation
+
+        # 4. Quota exhaustion on acct#1 switches to acct#2; no secrets in logs or /stats
+        err_buf = io.StringIO()
+        old_err = sys.stderr
+        sys.stderr = err_buf
+        try:
+            c1.quota_until = time.time() + 300
+            c2 = vb.POOL.failover(c1)
+            assert c2 is not None and c2.label == "acct#2"
+            assert vb.POOL.active_client() is c2
+            assert vb.POOL.all_exhausted() is False
+            snap = json.dumps(vb.STATS.snapshot())
+        finally:
+            sys.stderr = old_err
+        logs = err_buf.getvalue()
+        assert "acct#1" in logs and "acct#2" in logs, logs
+        assert secret_a not in logs and secret_b not in logs, logs
+        assert secret_a not in snap and secret_b not in snap, snap
+        assert '"pool":' in snap and '"acct#2"' in snap, snap
+
+        # 5. Both exhausted -> all_exhausted() is True, failover returns None
+        c2.quota_until = time.time() + 120
+        assert vb.POOL.failover(c2) is None
+        assert vb.POOL.all_exhausted() is True
+        # Once acct#1's reset passes, it is available again
+        c1.quota_until = time.time() - 1
+        assert vb.POOL.all_exhausted() is False
+        assert vb.POOL.active_client() is c1
+
+        # 6. End-to-end failover via _open_upstream + format retry + venice-auto + all-exhausted
+        c1.quota_until = 0.0
+        c2.quota_until = 0.0
+        vb.POOL._active_idx = 0
+        c2_calls = []
+        c2_exhausted = [False]
+
+        class _FakeProc:
+            def __init__(self, raw_bytes):
+                self.stdout = io.BytesIO(raw_bytes)
+                self.stderr = io.BytesIO(b"")
+                self.returncode = 0
+            def kill(self): pass
+            def wait(self, timeout=None): return 0
+
+        def _fake_handle(raw_bytes):
+            d = tempfile.mkdtemp(prefix="vtest-")
+            return (_FakeProc(raw_bytes), d, os.path.join(d, "h"), os.path.join(d, "b"))
+
+        c1.chat_quota = lambda: {"remaining": 0, "reset_at": time.time() + 300}
+        c2.chat_quota = lambda: {"remaining": 0, "reset_at": time.time() + 180} if c2_exhausted[0] else {"remaining": 50, "reset_at": time.time() + 300}
+        c1.open_chat_stream = lambda payload, force_refresh=False, max_time=None: _fake_handle(b"HTTP/1.1 429 Too Many Requests\r\n\r\n{}")
+
+        def _c2_stream(payload, force_refresh=False, max_time=None):
+            c2_calls.append(len(payload.get("messages") or []))
+            if c2_exhausted[0]:
+                return _fake_handle(b"HTTP/1.1 429 Too Many Requests\r\n\r\n{}")
+            if len(c2_calls) == 2:
+                # first tools attempt returns empty -> forces format retry on acct#2
+                return _fake_handle(b"HTTP/1.1 200 OK\r\n\r\n")
+            return _fake_handle(b'HTTP/1.1 200 OK\r\n\r\n{"kind":"content","content":"ok from acct2"}\n')
+
+        c2.open_chat_stream = _c2_stream
+        old_v_quota = vb.VENICE.quota_until
+        vb.VENICE.quota_until = time.time() + 600  # VENICE global exhausted must NOT affect active pool acct#2!
+        try:
+            # (a) acct#1 gets 429+remaining:0 -> same _open_upstream call fails over to acct#2 and returns 200
+            h, fail = vb._open_upstream({"modelId": "m", "messages": []})
+            assert fail is None and h is not None, fail
+            vb._cleanup(h)
+            assert vb.POOL.active_client() is c2 and len(c2_calls) == 1
+            # (b) venice-auto stays on Venice while acct#2 has quota (must NOT fall back to ollama)
+            assert vb._resolve_auto("venice-auto") == "deepseek-v4-1-flash-uncensored"
+            # (c) format retry runs on acct#2 (not skipped even though VENICE.quota_until is in the future)
+            h2, fail2 = vb._open_upstream({"modelId": "m", "messages": [{"role": "user", "content": [{"type": "output_text", "text": "hi"}]}]})
+            assert fail2 is None
+            res = vb._complete_with_tools(
+                {"model": "m", "tools": [{"type": "function", "function": {"name": "read"}}], "messages": [{"role": "user", "content": "hi"}]},
+                {"modelId": "m", "messages": [{"role": "user", "content": [{"type": "output_text", "text": "hi"}]}]},
+                h2,
+            )
+            assert res["content"] == "ok from acct2" and len(c2_calls) == 3, (res, c2_calls)
+            # (d) once acct#2 is also exhausted -> returns quota error (403, code 429) and venice-auto falls back to local
+            c2_exhausted[0] = True
+            h3, fail3 = vb._open_upstream({"modelId": "m", "messages": []})
+            assert h3 is None and fail3 is not None and fail3[0] == 403 and fail3[1]["error"]["code"] == 429, fail3
+            assert vb._resolve_auto("venice-auto").startswith("ollama/")
+        finally:
+            vb.VENICE.quota_until = old_v_quota
+    finally:
+        vb.POOL_FILE = old_pool_file
+        vb.POOL.reload()
+    print("m4 cookie pool ok")
+
+
 if __name__ == "__main__":
     cookie_file_checks()
     try:
@@ -1378,5 +1502,6 @@ if __name__ == "__main__":
         m1_resilience_and_stats_checks()
         m2_tool_choice_and_structured_checks()
         m3_stop_sequences_checks()
+        m4_cookie_pool_checks()
     finally:
         shutil.rmtree(STATE_DIR, ignore_errors=True)
