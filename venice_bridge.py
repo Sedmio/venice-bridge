@@ -1499,19 +1499,6 @@ def _fit_arguments(args: Any, props: Dict[str, Any], required: Any = ()) -> Any:
             req_strings = [k for k in (required or []) if k in props and props[k].get("type") in ("string", None)]
             if len(req_strings) == 1:
                 args = {req_strings[0]: args["content"]}
-    # Models occasionally double-encode the primary string argument itself as JSON, e.g.
-    # {"command": '{"command": "cd ..."}'} -> zsh tries to execute '{"command":' and fails with exit 127.
-    if "command" in props and isinstance(args.get("command"), str) and args["command"].lstrip().startswith("{"):
-        try:
-            parsed, _ = read_lenient(args["command"].lstrip(), 0)
-            if isinstance(parsed, dict) and isinstance(parsed.get("command"), str):
-                for k, v in parsed.items():
-                    if k == "command":
-                        args["command"] = v
-                    elif k in props and k not in args:
-                        args[k] = v
-        except Exception:
-            pass
     # Models frequently double-wrap tool inputs as {"arguments": {...}} or {"name": "...", "arguments": {...}}
     # or Anthropic-style {"input": {...}}. Unwrap before schema pruning so commands are not dropped.
     for _ in range(3):
@@ -1544,6 +1531,37 @@ def _fit_arguments(args: Any, props: Dict[str, Any], required: Any = ()) -> Any:
                 if other in args and other not in props:
                     args[key] = args.pop(other)
                     break
+    # Models occasionally double-encode the primary string argument itself as JSON, e.g.
+    # {"command": '{"command": "cd ..."}'} -> zsh tries to execute '{"command":' and fails with exit 127.
+    # Run after wrap_key/ARG_ALIASES, with a regex fallback when inner shell double-quotes were not escaped.
+    if "command" in props and isinstance(args.get("command"), str) and args["command"].lstrip().startswith("{"):
+        cmd_s = args["command"].strip()
+        unwrapped_cmd = False
+        try:
+            parsed, _ = read_lenient(cmd_s, 0)
+            if isinstance(parsed, dict) and isinstance(parsed.get("command"), str):
+                for k, v in parsed.items():
+                    if k == "command":
+                        args["command"] = v
+                    elif k in props and k not in args:
+                        args[k] = v
+                unwrapped_cmd = True
+        except Exception:
+            pass
+        if not unwrapped_cmd:
+            m = re.match(r'^\{\s*"command"\s*:\s*"(.*)"\s*\}$', cmd_s, re.S)
+            if m:
+                args["command"] = re.sub(r'(?<!\\)\\"', '"', m.group(1))
+    # Models writing regexes in JSON often emit `\b` or `\f` instead of `\\b` / `\\f`, which JSON
+    # decodes to ASCII backspace (\x08) / formfeed (\x0c). Claude Code's Bash validator rejects any
+    # control character in `command` ("command contains control characters"). Restore `\b`/`\f` and
+    # strip any other stray C0 control chars (keeping \n, \r, \t).
+    if "command" in props and isinstance(args.get("command"), str):
+        c = args["command"]
+        if any(ord(ch) < 32 and ch not in "\n\r\t" for ch in c):
+            c = c.replace("\x08", r"\b").replace("\x0c", r"\f")
+            c = "".join(ch for ch in c if ord(ch) >= 32 or ch in "\n\r\t")
+            args["command"] = c
     return args
 
 

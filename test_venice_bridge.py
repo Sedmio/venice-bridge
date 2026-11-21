@@ -1206,6 +1206,13 @@ def nested_arguments_unwrap_checks():
     # Negative: valid bash brace group '{ echo hi; }' must stay untouched
     out = vb._fit_arguments({"command": "{ echo hi; }"}, props, ["command"])
     assert out == {"command": "{ echo hi; }"}, out
+    # Double-encoded command with unescaped inner double quotes (real L3608 regression):
+    raw_bad = '{"command": "python3 -c \'import json; print(json.loads(\"{}\").get(\"token\",\"\"))\'; echo ok"}'
+    out = vb._fit_arguments({"command": raw_bad}, props, ["command"])
+    assert out["command"].startswith("python3 -c 'import json;") and out["command"].endswith("echo ok"), out
+    # JSON-decoded \b (\x08) in Bash regexes (real L3415 regression: Claude Code rejects control chars):
+    out = vb._fit_arguments({"command": "grep -oE '\x08[0-9]+\x08' f.txt"}, props, ["command"])
+    assert out["command"] == r"grep -oE '\b[0-9]+\b' f.txt", out
     print("nested arguments unwrap ok")
 
 

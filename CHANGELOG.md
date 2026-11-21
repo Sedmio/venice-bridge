@@ -3,6 +3,13 @@
 All notable changes to venice-bridge. Versions follow [Semantic Versioning](https://semver.org/).
 Releases: <https://github.com/nsozturk/venice-bridge/releases> · PyPI: <https://pypi.org/project/venice-bridge/>
 
+## 0.2.6 — 2026-11-21
+
+### Fixed
+
+- **Double-encoded `Bash.command` with unescaped inner double quotes.** Moved double-encoded `{"command": "..."}` unwrapping in `_fit_arguments` to run after `wrap_key` / `ARG_ALIASES` and added a regex fallback when unescaped inner double quotes cause strict JSON/lenient parsing to fail (fixes residual `Exit code 127: command not found: command:` errors).
+- **Control characters in `Bash.command` from JSON-decoded regex escapes.** When models emit `\b` or `\f` instead of `\\b` / `\\f` inside JSON `Bash` arguments, JSON decodes them to ASCII backspace (`\x08`) / formfeed (`\x0c`), which Claude Code's Zod validator rejects (`"command contains control characters that would be hidden in the approval dialog"`). `_fit_arguments` now restores `\x08` → `\b` and `\x0c` → `\f` and strips any other stray C0 control characters (preserving `\n`, `\r`, `\t`).
+
 ## 0.2.5 — 2026-11-21
 
 ### Fixed

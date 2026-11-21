@@ -32,7 +32,7 @@
   "description": "venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.",
   "operatingSystem": "macOS",
   "applicationCategory": "DeveloperApplication",
-  "softwareVersion": "0.2.5",
+  "softwareVersion": "0.2.6",
   "license": "https://opensource.org/licenses/MIT",
   "codeRepository": "https://github.com/nsozturk/venice-bridge",
   "downloadUrl": "https://github.com/nsozturk/venice-bridge",
@@ -276,7 +276,7 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
 <body>
 
 <header class="navbar">
-  <a href="#overview" class="brand">venice-bridge <span class="badge">v0.2.5</span></a>
+  <a href="#overview" class="brand">venice-bridge <span class="badge">v0.2.6</span></a>
   <div class="nav-actions">
     <a href="#quick-start" class="nav-link">Quick start</a>
     <a href="#how-it-works" class="nav-link">How it works</a>
@@ -396,6 +396,11 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
     <section id="whats-new">
       <h2>What's new</h2>
       <p>Full history: <a href="https://github.com/nsozturk/venice-bridge/blob/main/CHANGELOG.md">CHANGELOG.md</a> · <a href="https://github.com/nsozturk/venice-bridge/releases">Releases</a> · <a href="https://pypi.org/project/venice-bridge/">PyPI</a></p>
+      <h3>v0.2.6 <small>2026-11-21</small></h3>
+      <ul>
+        <li><strong>Double-encoded <code>Bash.command</code> regex fallback:</strong> unwraps <code>{"command": "..."}</code> even when unescaped inner shell double quotes break JSON parsing.</li>
+        <li><strong>Control-character restoration in <code>Bash.command</code>:</strong> restores JSON-decoded <code>\x08</code>/<code>\x0c</code> back to <code>\b</code>/<code>\f</code> and strips stray C0 control characters so Claude Code's Zod validator no longer rejects regex commands.</li>
+      </ul>
       <h3>v0.2.5 <small>2026-11-21</small></h3>
       <ul>
         <li><strong>No more auto web-search hijacking:</strong> explicitly sends <code>webEnabled: false</code>, <code>webScrapeEnabled: false</code>, and <code>xSearchEnabled: false</code> unless <code>:web</code> / <code>:xsearch</code> is requested.</li>
@@ -1097,7 +1102,7 @@ claude-venice --quota                   <span class="c"># Venice web quota  rema
     <div class="no-results" id="noResults">No section matches your search.</div>
 
     <footer>
-      <p>venice-bridge v0.2.5 · MIT · <a href="https://github.com/nsozturk/venice-bridge">github.com/nsozturk/venice-bridge</a> · Unofficial, not affiliated with Venice.ai.</p>
+      <p>venice-bridge v0.2.6 · MIT · <a href="https://github.com/nsozturk/venice-bridge">github.com/nsozturk/venice-bridge</a> · Unofficial, not affiliated with Venice.ai.</p>
     </footer>
   </main>
 </div>

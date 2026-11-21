@@ -2,7 +2,7 @@
 
 > venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.
 
-Version 0.2.5 · MIT · Repository: https://github.com/nsozturk/venice-bridge · Docs: https://nsozturk.github.io/venice-bridge/
+Version 0.2.6 · MIT · Repository: https://github.com/nsozturk/venice-bridge · Docs: https://nsozturk.github.io/venice-bridge/
 
 ---
 
@@ -1055,7 +1055,7 @@ Live check of a running setup: `claude-venice --quota` prints `Venice web quota 
 # Tool routing — Claude Code / OpenCode / Codex → Venice
 
 How a client's tools reach the Venice web model and how the model's tool calls are mapped back.
-Source of truth is the code (`venice_bridge.py`, `venice_adapters.py`); this page describes v0.2.5.
+Source of truth is the code (`venice_bridge.py`, `venice_adapters.py`); this page describes v0.2.6.
 
 ## TL;DR
 
