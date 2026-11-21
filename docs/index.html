@@ -955,6 +955,17 @@ claude-venice --quota                   <span class="c"># Venice web quota  rema
           <tr><td><code>kimi-k2-5</code></td><td>agent (not on the chat route)</td><td>commands work, its own tests left failing</td><td class="num">146 s</td></tr>
         </tbody>
       </table></div>
+
+      <h3>When to use venice-bridge vs local vs paid</h3>
+      <p>Because the Venice web route has no native <code>tools</code> / <code>tool_choice</code> and no prompt cache (<code>cached_tokens: 0</code>), match the backend to the job. On short synthetic tool benchmarks across four Venice models, the bridge scored 52/52 with 0 runaway cuts; <strong>caveat:</strong> that score comes from short synthetic tasks — in long real sessions before the runaway cutoff, 15 of 7,167 streams entered repetition loops, so 52/52 is not proof of 95%+ reliability on long sessions.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Workload</th><th>Recommended route</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>High-volume / parallel exploration, cheap throwaway runs</td><td><code>venice-bridge</code> (use <code>claude-venice --lean</code> if the repo has <code>.mcp.json</code>)</td><td>Request-metered web plan, ~4–5 s per step, short synthetic tool benchmarks: 52/52</td></tr>
+          <tr><td>Offline / private / zero-quota work needing native <code>tools</code></td><td>Local models via Ollama / LM Studio / llama.cpp (direct or <code>&lt;backend&gt;/&lt;model&gt;</code> via the bridge)</td><td>Native tool grammar, no external network or daily request cap</td></tr>
+          <tr><td>Deep multi-step coding, architecture, security review, strict schema / long-context fidelity</td><td>Paid native-tools APIs (including the metered <code>api.venice.ai/api/v1</code>)</td><td>Native <code>tools</code> + <code>tool_choice</code> + real prompt caching; web login cookies do not work on <code>api.venice.ai</code></td></tr>
+        </tbody>
+      </table></div>
     </section>
 
     <section id="troubleshooting">

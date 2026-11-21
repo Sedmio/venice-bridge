@@ -579,6 +579,16 @@ Claude Code, none of the three fast models produced a clean, correct final answe
 cited weather report. Measured on one machine, one account. Treat venice-bridge as a cheap runner for exploratory
 work, check what it produces, and do not use it for high-stakes changes.
 
+### When to use venice-bridge vs local vs paid
+
+Because the Venice web route has no native `tools` / `tool_choice` and no prompt cache (`cached_tokens: 0`), match the backend to the job. On short synthetic tool benchmarks across four Venice models, the bridge scored 52/52 with 0 runaway cuts; **caveat:** that score comes from short synthetic tasks — in long real sessions before the runaway cutoff, 15 of 7,167 streams entered repetition loops, so 52/52 is not proof of 95%+ reliability on long sessions.
+
+| Workload | Recommended route | Why |
+|---|---|---|
+| High-volume / parallel exploration, cheap throwaway runs | **`venice-bridge`** (pass `claude-venice --lean` if the repo has `.mcp.json`) | Request-metered web plan, ~4–5 s per step, short synthetic tool benchmarks: 52/52 |
+| Offline / private / zero-quota work needing native `tools` | **Local models via Ollama / LM Studio / llama.cpp** (direct or `<backend>/<model>` through the bridge) | Native tool grammar, no external network or daily request cap |
+| Deep multi-step coding, architecture, security review, strict schema / long-context fidelity | **Paid native-tools APIs** (including the metered `api.venice.ai/api/v1`) | Native `tools` + `tool_choice` + real prompt caching; web login cookies do not work on `api.venice.ai` |
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
