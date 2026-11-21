@@ -3,6 +3,14 @@
 All notable changes to venice-bridge. Versions follow [Semantic Versioning](https://semver.org/).
 Releases: <https://github.com/nsozturk/venice-bridge/releases> · PyPI: <https://pypi.org/project/venice-bridge/>
 
+## Unreleased
+
+### Fixed
+
+- **Code written instead of run.** A reply with no tool call that holds a fenced code block while a shell tool
+  is declared now goes to the judge, which can ask the model to run the command instead of showing it.
+- `bash_tool` is routed to the client's shell tool.
+
 ## 0.2.2 — 2026-11-21
 
 ### Fixed

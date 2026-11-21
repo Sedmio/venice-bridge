@@ -477,6 +477,8 @@ def end_to_end() -> None:
             + text('\n```json\n{"tool_ca') + text('lls":[{"name":"read","arguments":{"filePath":"a"}}]}\n```') + done,
         "long_then_cut": b"".join(text(p) for p in LONG_PARTS),  # no response.completed
         "long_with_braces": b"".join(text(p) for p in LONG_PARTS) + text(' Use {"name": "x"} or { y } here.') + done,
+        # a first-turn reply that writes the command as a code block instead of calling the shell (phase-0 T1)
+        "code": text("```python\nimport sqlite3\nprint(1)\n```") + done,
     }
     own_step = frame("veniceai:tool_call_generation.in_progress", {"detected_tools": [{"type": "Recognized", "tool": "get_attachment"}]})
     static["own_tool_recovered"] = own_step + call  # one step with Venice's tool, then our format: left alone
@@ -488,6 +490,7 @@ def end_to_end() -> None:
         "loop_then_call": [swallowed, call], "broken_then_call": [broken, call], "empty_then_text": [done, prose],
         "prose_then_call": [prose, call], "cut_then_loop_then_call": [static["cut"], swallowed, swallowed, call],
         "loop_then_cut_then_call": [swallowed, static["cut"], call], "prose_then_500": [prose, None],  # None = HTTP 500
+        "code_then_call": [static["code"], call],
     }
     verdicts = {"judge-stopped": "stopped_early", "judge-finished": "finished", "judge-missing": "missing_result",
                 "judge-quota": "stopped_early", "judge-slow": "stopped_early"}
@@ -578,13 +581,13 @@ def end_to_end() -> None:
                       {"id": "c1", "function": {"name": "read", "arguments": "{}"}}]},
                   {"role": "tool", "tool_call_id": "c1", "content": "file text"}]
 
-    def ask(case, stream=False, with_tools=False, messages=None):
+    def ask(case, stream=False, with_tools=False, messages=None, tool_list=None):
         seen.pop(case, None)
         del judged[:]
         vb.VENICE.quota_until = 0.0
         body = {"model": case, "stream": stream, "messages": messages or [{"role": "user", "content": "x"}]}
         if with_tools:
-            body["tools"] = tools
+            body["tools"] = tool_list or tools
         req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % bridge.server_address[1],
                                      json.dumps(body).encode(), {"Content-Type": "application/json"})
         try:
@@ -680,6 +683,18 @@ def end_to_end() -> None:
     code, out = ask("prose", with_tools=True, messages=after_tool + [
         {"role": "assistant", "content": "done"}, {"role": "user", "content": "thanks, what next?"}])
     assert code == 200 and len(seen["prose"]) == 1 and judged == []
+    # first turn, a code block instead of a call while a shell tool is declared: the judge is asked
+    with_bash = tools + [{"type": "function", "function": {"name": "bash"}}]
+    for stream in (False, True):
+        code, out = ask("code_then_call", stream=stream, with_tools=True, tool_list=with_bash)
+        assert code == 200 and calls_of(out, stream) == ["read"], (stream, out)
+        assert seen["code_then_call"] == [vb.TOOL_REMINDER, act(vb.CONTINUE_REMINDER)] and len(judged) == 1
+    vb.JUDGE_MODEL = "judge-finished"  # the judge says the code block is the answer: it is kept, no retry
+    code, out = ask("code", with_tools=True, tool_list=with_bash)
+    assert code == 200 and "import sqlite3" in content_of(out, False) and len(seen["code"]) == 1 and len(judged) == 1
+    vb.JUDGE_MODEL = "judge-stopped"
+    code, out = ask("code", with_tools=True)  # no shell tool declared: a code block is just an answer, not judged
+    assert code == 200 and len(seen["code"]) == 1 and judged == []
     # missing_result: a second text answer may replace the first
     vb.JUDGE_MODEL = "judge-missing"
     code, out = ask("prose", with_tools=True, messages=after_tool)
@@ -1196,6 +1211,10 @@ def bare_string_content_checks():
     out = vb._fit_arguments({"command": "ls"}, props, ["command"])
     assert out == {"command": "ls"}, out
     print("bare string content ok")
+    # phase-0c: qwen-3-8-27b called the shell as `bash_tool`; it must reach the declared bash / shell tool
+    assert vb._route_call("bash_tool", {"command": "ls"}, {"bash": "bash"}) == ("bash", {"command": "ls"})
+    assert vb._route_call("bash_tool", {"command": "ls"}, {"shell": "shell"}) == ("shell", {"command": "ls"})
+    print("bash_tool alias ok")
 
 
 if __name__ == "__main__":

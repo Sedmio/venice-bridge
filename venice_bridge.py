@@ -859,7 +859,8 @@ TOOL_ALIASES = {  # client tool -> names models use for it
     "bash": ("shell", "sh", "zsh", "terminal", "execute", "exec", "run", "run_command", "execute_command",
              "run_shell_command", "run_terminal_cmd", "shell_command", "command", "calculator",
              "code_interpreter", "python", "exec_command", "local_shell", "shell_exec", "bash_command",
-             "run_bash", "run_shell", "container.exec", "execute_shell", "exec_shell", "execcommand"),
+             "run_bash", "run_shell", "container.exec", "execute_shell", "exec_shell", "execcommand",
+             "bash_tool"),  # bash_tool: qwen-3-8-27b, phase-0c T1 r9 (2026-11-21)
     "read": ("cat", "read_file", "readfile", "view", "view_file", "open", "open_file", "get_file",
              "get_attachment", "view_media", "hydrate_content", "head", "tail"),
     "write": ("write_file", "writefile", "create_file", "save_file", "create", "write_to_file", "replace_file"),
@@ -1777,6 +1778,16 @@ def _ends_after_tool(body: Dict[str, Any]) -> bool:
     return last == "tool"
 
 
+_FENCE = re.compile(r"```[^\n`]*\n[\s\S]*?```")
+
+
+def _code_instead_of_call(content: str, declared: Dict[str, str]) -> bool:
+    """A reply with no call that holds a fenced code block while a shell tool is declared: the model may
+    have written the command instead of running it (qwen-3-8-27b, phase-0 T1, 2026-11-21). Only opens the
+    judge path; the judge decides whether a code block was the right answer."""
+    return bool(content) and bool(_have("bash", declared)) and bool(_FENCE.search(content))
+
+
 def _tail(text: str, n: int) -> str:
     return "…" + text[-n:] if len(text) > n else text
 
@@ -1835,7 +1846,8 @@ def _complete_with_tools(body: Dict[str, Any], payload: Dict[str, Any], handle,
 
     Retries (each a full upstream request): server loop, unreadable call, empty reply and a broken
     stream, at most MAX_FORMAT_RETRIES together (a broken stream once, resent unchanged); then, when
-    the reply ends the turn right after a tool result, the judge, and at most MAX_JUDGE_RETRIES."""
+    the reply ends the turn right after a tool result, or holds a code block instead of a call while a
+    shell tool is declared, the judge, and at most MAX_JUDGE_RETRIES."""
     tools = body.get("tools")
     declared = {t["function"]["name"].lower(): t["function"]["name"] for t in tools or []
                 if isinstance(t, dict) and isinstance(t.get("function"), dict) and t["function"].get("name")}
@@ -1862,7 +1874,8 @@ def _complete_with_tools(body: Dict[str, Any], payload: Dict[str, Any], handle,
                             if trigger in ("server_loop", "server_tool") else FORMAT_REMINDERS[trigger])
                 nxt = dict(payload, messages=payload["messages"] + [_message("user", "(act reminder) " + reminder)])
             why = trigger
-        elif best["calls"] or not JUDGE_ENABLED or judge_left < 1 or not _ends_after_tool(body):
+        elif best["calls"] or not JUDGE_ENABLED or judge_left < 1 or not (
+                _ends_after_tool(body) or _code_instead_of_call(best["content"], declared)):
             break
         else:
             verdict = _ask_judge(body, best["content"])
