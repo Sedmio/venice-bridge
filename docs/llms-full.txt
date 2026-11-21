@@ -18,8 +18,8 @@ the backend of the venice.ai web app, signed in with your own browser login. The
 `claude-venice`, starts Claude Code against the adapter in its own profile. Nothing uses the paid Venice API,
 and no API key is needed.
 
-Documentation site: <https://nsozturk.github.io/venice-bridge/> · Agent contract: [AGENTS.md](AGENTS.md) ·
-Tool routing reference: [docs/TOOL_ROUTING.md](docs/TOOL_ROUTING.md)
+Documentation site: <https://nsozturk.github.io/venice-bridge/> · Agent contract: [AGENTS.md](https://github.com/nsozturk/venice-bridge/blob/main/AGENTS.md) ·
+Tool routing reference: [docs/TOOL_ROUTING.md](https://github.com/nsozturk/venice-bridge/blob/main/docs/TOOL_ROUTING.md)
 
 > [!WARNING]
 > **Unofficial. Read this before you use it.**
@@ -76,6 +76,14 @@ pip install curl_cffi
 python3 venice_bridge.py            # options: --host, --port (default 127.0.0.1:18891)
 ```
 
+Or install it from [PyPI](https://pypi.org/project/venice-bridge/) as commands (`venice-bridge`,
+`venice-adapters`, `claude-venice`):
+
+```bash
+pipx install venice-bridge          # or: pip install venice-bridge
+venice-bridge                       # same options; venice-adapters starts the adapter
+```
+
 ### 3. Check it
 
 ```bash
@@ -88,7 +96,7 @@ with `"ok": false` and the reason.
 
 ### 4. Add the provider to OpenCode
 
-Copy the provider block from [`examples/opencode.json`](examples/opencode.json) into
+Copy the provider block from [`examples/opencode.json`](https://github.com/nsozturk/venice-bridge/blob/main/examples/opencode.json) into
 `~/.config/opencode/opencode.json` (or a project `opencode.json`). The example lists nine models; this is the
 same block with one of them:
 
@@ -203,7 +211,7 @@ Venice quota. A leading `venice-bridge/` is stripped first, so `venice-bridge/ol
 
 To add llama.cpp, MLX or any other OpenAI-compatible server, write `~/.config/venice-bridge/backends.json`
 (path override: `VENICE_BRIDGE_BACKENDS`). A file **replaces** the defaults, so list every backend you want;
-[`examples/backends.json`](examples/backends.json) lists the two defaults plus llama.cpp:
+[`examples/backends.json`](https://github.com/nsozturk/venice-bridge/blob/main/examples/backends.json) lists the two defaults plus llama.cpp:
 
 ```json
 {"backends":[{"name":"llamacpp","base_url":"http://127.0.0.1:8080/v1","api_key":null}]}
@@ -315,9 +323,9 @@ counts; the adapter reports `cached_tokens: 0`. Do not read them as billing.
 
 ## Autostart with launchd
 
-[`examples/com.example.venice-bridge.plist`](examples/com.example.venice-bridge.plist) is a launchd template that
+[`examples/com.example.venice-bridge.plist`](https://github.com/nsozturk/venice-bridge/blob/main/examples/com.example.venice-bridge.plist) is a launchd template that
 starts the bridge at login and restarts it if it exits.
-[`examples/com.example.venice-adapters.plist`](examples/com.example.venice-adapters.plist) does the same for the
+[`examples/com.example.venice-adapters.plist`](https://github.com/nsozturk/venice-bridge/blob/main/examples/com.example.venice-adapters.plist) does the same for the
 adapter.
 
 1. Replace every `/PATH/TO` with real absolute paths (your `python3` and this folder).
@@ -402,7 +410,7 @@ Venice's web routes do not give the model the client's declared tools (measured 
 agent route `/agents/ad-hoc` and on `/agents/venice`: a declared `bash` client tool was invisible to the model; the
 chat route offers the model no tools). The bridge therefore emulates tool calling in text. The full mapping
 tables (tool-name aliases, argument-name aliases, Venice server-tool names, what is dropped) are in
-[docs/TOOL_ROUTING.md](docs/TOOL_ROUTING.md).
+[docs/TOOL_ROUTING.md](https://github.com/nsozturk/venice-bridge/blob/main/docs/TOOL_ROUTING.md).
 
 - **Tool emulation.** The tool list goes into the system prompt: built-in tools and tools already used in the
   conversation with a compact full JSON schema, the rest as one-liners, inside a 78,000-character budget. A real
@@ -477,7 +485,7 @@ Environment variables are read when a process starts. Set them before you start 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `VENICE_BRIDGE_HOST` | `127.0.0.1` | Bind address. Keep it on loopback (see [SECURITY.md](SECURITY.md)). `--host` overrides it. |
+| `VENICE_BRIDGE_HOST` | `127.0.0.1` | Bind address. Keep it on loopback (see [SECURITY.md](https://github.com/nsozturk/venice-bridge/blob/main/SECURITY.md)). `--host` overrides it. |
 | `VENICE_BRIDGE_ROUTE` | `auto` | Venice web route: `auto` (chat route; agent route for a model the chat route does not know), `chat` (chat route only), `agent` (agent route only; needs a paid plan). See [Routes](#routes). |
 | `VENICE_BRIDGE_COOKIE_FILE` | `~/.config/venice-bridge/client-cookie.txt` | File holding the `__client` cookie value. |
 | `VENICE_BRIDGE_SESSION_DIR` | empty (off) | Folder with a `client.py` exposing `get_session(domain)` that returns `{"timestamp": <ms>, "tokens": {"clerk_client": "<value>"}}`, for a local session daemon. Used when the cookie file is missing or empty. |
@@ -732,12 +740,12 @@ If the bridge does not answer it prints `could not read http://127.0.0.1:18891/h
 `tolerant_parser.py` is a Python port of the tolerant tool-call parser of
 [opencode-venice-web](https://github.com/CanArslanDev/opencode-venice-web), and the malformed-reply fixtures come
 from the same project; several reminder texts and the judge prompt are adapted from it. All are used under the MIT
-License. See [NOTICE.md](NOTICE.md) and
-[THIRD_PARTY_LICENSE-opencode-venice-web.txt](THIRD_PARTY_LICENSE-opencode-venice-web.txt).
+License. See [NOTICE.md](https://github.com/nsozturk/venice-bridge/blob/main/NOTICE.md) and
+[THIRD_PARTY_LICENSE-opencode-venice-web.txt](https://github.com/nsozturk/venice-bridge/blob/main/THIRD_PARTY_LICENSE-opencode-venice-web.txt).
 
 ## License
 
-[MIT](LICENSE) © 2026 venice-bridge contributors.
+[MIT](https://github.com/nsozturk/venice-bridge/blob/main/LICENSE) © 2026 venice-bridge contributors.
 
 ---
 

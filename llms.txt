@@ -18,7 +18,7 @@
 
 ## Install
 
-- Requirements: macOS, Python 3.10+, `pip install curl_cffi`, a venice.ai web account (tested on a paid plan, Pro).
+- Requirements: macOS, Python 3.10+, `pip install curl_cffi` (or `pipx install venice-bridge` from PyPI), a venice.ai web account (tested on a paid plan, Pro).
 - Save the cookie value to `~/.config/venice-bridge/client-cookie.txt` (mode 0600).
 - Run `python3 venice_bridge.py`, then check `curl -s http://127.0.0.1:18891/health`. For Claude Code or Codex also run `python3 venice_adapters.py`.
 - Self-checks (offline): `python3 test_venice_bridge.py` and `python3 test_venice_adapters.py`.

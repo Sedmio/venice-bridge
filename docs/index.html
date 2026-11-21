@@ -428,6 +428,7 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
       <pre><code>git clone https://github.com/nsozturk/venice-bridge.git
 cd venice-bridge
 pip install curl_cffi</code></pre>
+      <p>Or install the commands <code>venice-bridge</code>, <code>venice-adapters</code> and <code>claude-venice</code> from <a href="https://pypi.org/project/venice-bridge/">PyPI</a>: <code>pipx install venice-bridge</code>.</p>
 
       <h3>2. Save your login cookie (the only setup step)</h3>
       <p>The bridge needs the value of the <code>__client</code> cookie of <code>clerk.venice.ai</code>, a long-lived Clerk cookie. From it the bridge mints a session JWT of about 60 seconds and a client attestation for every request window.</p>

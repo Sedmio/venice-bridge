@@ -1,11 +1,11 @@
 <p align="center"><img src="https://raw.githubusercontent.com/nsozturk/venice-bridge/main/assets/banner.png" alt="venice-bridge — use your venice.ai web subscription from OpenCode, Claude Code and Codex CLI" width="100%"></p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2.1-8b5cf6" alt="Version 0.2.1">
+  <a href="https://pypi.org/project/venice-bridge/"><img src="https://img.shields.io/pypi/v/venice-bridge?color=8b5cf6" alt="PyPI version"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-3776ab?logo=python&logoColor=white" alt="Python 3.10+">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e" alt="MIT License"></a>
+  <a href="https://github.com/nsozturk/venice-bridge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/Venice%20API%20key-not%20needed-0ea5e9" alt="No Venice API key needed">
-  <a href="AGENTS.md"><img src="https://img.shields.io/badge/AI%20Agent-Native%20Ready-f59e0b" alt="AI Agent: Native Ready"></a>
+  <a href="https://github.com/nsozturk/venice-bridge/blob/main/AGENTS.md"><img src="https://img.shields.io/badge/AI%20Agent-Native%20Ready-f59e0b" alt="AI Agent: Native Ready"></a>
   <img src="https://img.shields.io/badge/platform-macOS-111827?logo=apple&logoColor=white" alt="Platform: macOS">
 </p>
 
@@ -102,10 +102,11 @@ pip install curl_cffi
 python3 venice_bridge.py            # options: --host, --port (default 127.0.0.1:18891)
 ```
 
-Or install it as commands (`venice-bridge`, `venice-adapters`, `claude-venice`) with pipx:
+Or install it from [PyPI](https://pypi.org/project/venice-bridge/) as commands (`venice-bridge`,
+`venice-adapters`, `claude-venice`):
 
 ```bash
-pipx install git+https://github.com/nsozturk/venice-bridge.git
+pipx install venice-bridge          # or: pip install venice-bridge
 venice-bridge                       # same options; venice-adapters starts the adapter
 ```
 

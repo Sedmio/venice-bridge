@@ -21,7 +21,7 @@ Unofficial: not affiliated with, endorsed by, or supported by Venice.ai. It uses
 
 ## Install
 
-- Requirements: macOS, Python 3.10+, `pip install curl_cffi`, and a client: OpenCode, the Claude Code CLI, Codex CLI, or any OpenAI Chat Completions client.
+- Requirements: macOS, Python 3.10+, `pip install curl_cffi` (or `pipx install venice-bridge` from PyPI), and a client: OpenCode, the Claude Code CLI, Codex CLI, or any OpenAI Chat Completions client.
 - Save the `__client` cookie value to `~/.config/venice-bridge/client-cookie.txt` (mode 600).
 - Run `python3 venice_bridge.py`, check `curl -s http://127.0.0.1:18891/health`.
 - For Claude Code or Codex also run `python3 venice_adapters.py`, check `curl -s http://127.0.0.1:18892/health`.
