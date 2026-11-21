@@ -3,7 +3,7 @@
 All notable changes to venice-bridge. Versions follow [Semantic Versioning](https://semver.org/).
 Releases: <https://github.com/nsozturk/venice-bridge/releases> · PyPI: <https://pypi.org/project/venice-bridge/>
 
-## Unreleased
+## 0.2.3 — 2026-11-21
 
 ### Added
 
