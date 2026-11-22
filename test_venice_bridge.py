@@ -1168,6 +1168,10 @@ def reasoning_auto_checks() -> None:
     # no tools + effort high still reasons
     p2, _ = vb.openai_to_venice_chat({"model": "m", "reasoning_effort": "high", "messages": [{"role": "user", "content": "hi"}]})
     assert p2.get("_think") is True and vb._to_chat_payload(p2)["reasoning"] is True
+    # explicit :think suffix enables reasoning even on tool turns
+    p3, has3 = vb.openai_to_venice_chat({"model": "deepseek-v4-1-flash-uncensored:think",
+                                         "messages": [{"role": "user", "content": "hi"}], "tools": tool})
+    assert has3 is True and p3.get("_think") is True and vb._to_chat_payload(p3)["reasoning"] is True
 
     # Fix 3: venice-auto resolves even behind the OpenCode `venice-bridge/` provider prefix.
     old_q = vb.VENICE.quota_until
@@ -1206,13 +1210,49 @@ def nested_arguments_unwrap_checks():
     # Negative: valid bash brace group '{ echo hi; }' must stay untouched
     out = vb._fit_arguments({"command": "{ echo hi; }"}, props, ["command"])
     assert out == {"command": "{ echo hi; }"}, out
-    # Double-encoded command with unescaped inner double quotes (real L3608 regression):
-    raw_bad = '{"command": "python3 -c \'import json; print(json.loads(\"{}\").get(\"token\",\"\"))\'; echo ok"}'
+    # Double-encoded command with unescaped inner double quotes + trailing envelope brackets (L3608 & L4697):
+    raw_bad = '{"command": "python3 -c \'import json; print(json.loads(\"{}\").get(\"token\",\"\"))\'; echo ok"}}]}'
     out = vb._fit_arguments({"command": raw_bad}, props, ["command"])
     assert out["command"].startswith("python3 -c 'import json;") and out["command"].endswith("echo ok"), out
     # JSON-decoded \b (\x08) in Bash regexes (real L3415 regression: Claude Code rejects control chars):
     out = vb._fit_arguments({"command": "grep -oE '\x08[0-9]+\x08' f.txt"}, props, ["command"])
     assert out["command"] == r"grep -oE '\b[0-9]+\b' f.txt", out
+    # Salvaged Write where Go/code inner quotes broke JSON (real L4492 regression):
+    wprops = {"file_path": {"type": "string"}, "content": {"type": "string"}}
+    raw_write = '{"file_path": "/tmp/a.go", "content": "package p\nimport \"fmt\"\n"}'
+    out = vb._fit_arguments({"content": raw_write}, wprops, ["file_path", "content"])
+    assert out["file_path"] == "/tmp/a.go" and 'import "fmt"' in out["content"], out
+    # Schema/wrapping regressions: 1-element list args, stringified arguments with unescaped quotes,
+    # report_finding title/category aliases, task_id int->str, set_goals strings->objects, insert_assets asset_type->type:
+    out = vb._fit_arguments([{"command": "echo hi"}], props, ["command"])
+    assert out == {"command": "echo hi"}, out
+    bad_arg_str = '{"command": "curl -H \"Authorization: Bearer x\" http://127.0.0.1"}'
+    out = vb._fit_arguments({"arguments": bad_arg_str}, props, ["command"])
+    assert out["command"].startswith("curl -H"), out
+    rf_props = {"summary": {"type": "string"}, "vulnclass": {"type": "string"}, "severity": {"type": "string"}}
+    out = vb._coerce_arguments(vb._fit_arguments({"title": "XSS", "category": "xss", "severity": "low"}, rf_props, ["summary", "vulnclass"]), rf_props)
+    assert out == {"summary": "XSS", "vulnclass": "xss", "severity": "low"}, out
+    tid_props = {"task_id": {"type": "string"}}
+    out = vb._coerce_arguments(vb._fit_arguments({"task_id": 10}, tid_props, ["task_id"]), tid_props)
+    assert out == {"task_id": "10"}, out
+    sg_props = {"goals": {"type": "array", "items": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}}}}
+    out = vb._coerce_arguments({"goals": ["goal 1", "goal 2"]}, sg_props)
+    assert out == {"goals": [{"text": "goal 1"}, {"text": "goal 2"}]}, out
+    ia_props = {"assets": {"type": "array", "items": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string"}, "path": {"type": "string"}, "page_title": {"type": "string"}}}}}
+    out = vb._coerce_arguments({"assets": [{"asset_type": "file", "path": "/a", "page_title": None}]}, ia_props)
+    assert out == {"assets": [{"type": "file", "path": "/a"}]}, out
+    out2 = vb._coerce_arguments({"assets": [{"type": "web", "page_title": 404}]}, ia_props)
+    assert out2 == {"assets": [{"type": "web", "page_title": "404"}]}, out2
+    # Empty {} call to a tool with required params is dropped as broken so the bridge retries:
+    tdefs = [
+        {"type": "function", "function": {"name": "Bash", "parameters": {"type": "object", "required": ["command"], "properties": {"command": {"type": "string"}}}}},
+        {"type": "function", "function": {"name": "list_goals", "parameters": {"type": "object", "properties": {}}}},
+    ]
+    tc, _, broken = vb._read_reply('{"tool_calls":[{"name":"Bash","arguments":{}}]}', tdefs)
+    assert not tc and broken is True, (tc, broken)
+    # Zero-required-param tool with {} is still allowed:
+    tc2, _, broken2 = vb._read_reply('{"tool_calls":[{"name":"list_goals","arguments":{}}]}', tdefs)
+    assert len(tc2) == 1 and tc2[0]["function"]["name"] == "list_goals" and broken2 is False, (tc2, broken2)
     print("nested arguments unwrap ok")
 
 

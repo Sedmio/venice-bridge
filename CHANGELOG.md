@@ -3,6 +3,17 @@
 All notable changes to venice-bridge. Versions follow [Semantic Versioning](https://semver.org/).
 Releases: <https://github.com/nsozturk/venice-bridge/releases> · PyPI: <https://pypi.org/project/venice-bridge/>
 
+## 0.3.0 — 2026-11-22
+
+### Added
+- **Embeddings endpoint (`POST /v1/embeddings`)** — OpenAI-compatible embeddings backed by Venice's `text-embedding-bge-m3` (`1024`-dim float vectors).
+- **Thinking mode on tool-calling turns** — models requested with `:think` suffix or `VENICE_REASONING=1` now preserve reasoning output (`reasoning_content`) on both streaming and non-streaming tool-call turns.
+- **Anonymous web search mode** — sets `webSearchProviderMode: "anon"` when web search is enabled.
+- **Multi-backend `claude-venice` launcher** — added `--unquant`, `--zai`, and `--go` / `--opencode-go` flags with isolated `0600` local key files (`~/.config/venice-bridge/*-api-key.txt`) and `--models` discovery for each backend.
+
+### Fixed
+- **High-concurrency `ConnectionResetError(54)` / 502 fix** — raised `ThreadingHTTPServer.request_queue_size` from Python's default `5` to `512` in both `venice_bridge.py` and `venice_adapters.py`, added exponential-backoff retries (5 attempts) for transient socket resets in `venice_adapters._upstream()`, and cleanly caught `(BrokenPipeError, ConnectionResetError)` on aborted client SSE streams.
+
 ## 0.2.6 — 2026-11-21
 
 ### Fixed

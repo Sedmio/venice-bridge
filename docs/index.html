@@ -32,7 +32,7 @@
   "description": "venice-bridge is a free, open-source local bridge for macOS that lets OpenCode, Claude Code, Codex CLI and other OpenAI- or Anthropic-compatible coding agents use a venice.ai web subscription, with working tool calls.",
   "operatingSystem": "macOS",
   "applicationCategory": "DeveloperApplication",
-  "softwareVersion": "0.2.6",
+  "softwareVersion": "0.3.0",
   "license": "https://opensource.org/licenses/MIT",
   "codeRepository": "https://github.com/nsozturk/venice-bridge",
   "downloadUrl": "https://github.com/nsozturk/venice-bridge",
@@ -276,7 +276,7 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
 <body>
 
 <header class="navbar">
-  <a href="#overview" class="brand">venice-bridge <span class="badge">v0.2.6</span></a>
+  <a href="#overview" class="brand">venice-bridge <span class="badge">v0.3.0</span></a>
   <div class="nav-actions">
     <a href="#quick-start" class="nav-link">Quick start</a>
     <a href="#how-it-works" class="nav-link">How it works</a>
@@ -396,6 +396,12 @@ footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border
     <section id="whats-new">
       <h2>What's new</h2>
       <p>Full history: <a href="https://github.com/nsozturk/venice-bridge/blob/main/CHANGELOG.md">CHANGELOG.md</a> · <a href="https://github.com/nsozturk/venice-bridge/releases">Releases</a> · <a href="https://pypi.org/project/venice-bridge/">PyPI</a></p>
+      <h3>v0.3.0 <small>2026-11-22</small></h3>
+      <ul>
+        <li>Added <code>POST /v1/embeddings</code> (OpenAI-compatible <code>text-embedding-bge-m3</code> 1024-dim vectors) and thinking-mode preservation on tool-calling turns (<code>:think</code> / <code>VENICE_REASONING=1</code>).</li>
+        <li>Fixed high-concurrency <code>502 ConnectionResetError(54)</code> by raising HTTP listen backlog to <code>512</code>, adding exponential-backoff retries in <code>venice_adapters.py</code>, and guarding aborted SSE stream writes.</li>
+        <li>Added <code>--unquant</code>, <code>--zai</code>, and <code>--go</code> / <code>--opencode-go</code> multi-backend options to <code>claude-venice</code>.</li>
+      </ul>
       <h3>v0.2.6 <small>2026-11-21</small></h3>
       <ul>
         <li><strong>Double-encoded <code>Bash.command</code> regex fallback:</strong> unwraps <code>{"command": "..."}</code> even when unescaped inner shell double quotes break JSON parsing.</li>
@@ -1102,7 +1108,7 @@ claude-venice --quota                   <span class="c"># Venice web quota  rema
     <div class="no-results" id="noResults">No section matches your search.</div>
 
     <footer>
-      <p>venice-bridge v0.2.6 · MIT · <a href="https://github.com/nsozturk/venice-bridge">github.com/nsozturk/venice-bridge</a> · Unofficial, not affiliated with Venice.ai.</p>
+      <p>venice-bridge v0.3.0 · MIT · <a href="https://github.com/nsozturk/venice-bridge">github.com/nsozturk/venice-bridge</a> · Unofficial, not affiliated with Venice.ai.</p>
     </footer>
   </main>
 </div>

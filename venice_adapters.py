@@ -35,12 +35,24 @@ def log(msg: str) -> None:
     sys.stderr.write("[venice-adapters] %s\n" % msg)
 
 
-def _upstream(method: str, path: str, body: Optional[bytes] = None) -> Tuple[http.client.HTTPConnection, Any]:
+def _upstream(method: str, path: str, body: Optional[bytes] = None, max_retries: int = 5) -> Tuple[http.client.HTTPConnection, Any]:
     # http.client, not urlopen: urlopen would go through the macOS system proxy
     u = urlsplit(UPSTREAM)
-    conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=900)
-    conn.request(method, u.path + path, body, {"Content-Type": "application/json", "Authorization": "Bearer local"})
-    return conn, conn.getresponse()
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=900)
+            conn.request(method, u.path + path, body, {"Content-Type": "application/json", "Authorization": "Bearer local"})
+            return conn, conn.getresponse()
+        except (ConnectionResetError, ConnectionRefusedError, BrokenPipeError, TimeoutError, http.client.RemoteDisconnected) as exc:
+            last_exc = exc
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if attempt < max_retries - 1:
+                time.sleep(0.15 * (2 ** attempt))
+    raise last_exc
 
 
 def _pick_model(asked: Any) -> str:
@@ -569,6 +581,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    http.server.ThreadingHTTPServer.request_queue_size = 512
     server = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
     log("listening on http://%s:%d  ->  %s  (default model %s)" % (HOST, PORT, UPSTREAM, DEFAULT_MODEL))
     try:

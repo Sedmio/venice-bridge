@@ -217,6 +217,8 @@ def _to_chat_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     # injecting unrelated web search results into coding/tool turns (measured 2026-11-21).
     out["webEnabled"] = bool(payload.get("_webEnabled"))
     out["webScrapeEnabled"] = bool(payload.get("_webEnabled"))
+    if payload.get("_webEnabled"):
+        out["webSearchProviderMode"] = "anon"
     out["xSearchEnabled"] = bool(payload.get("_xSearch"))
     return out
 
@@ -798,6 +800,28 @@ class VeniceClient:
                 raise RuntimeError("Venice returned empty image data.")
             return b64_full, fmt
         raise RuntimeError("Venice image generation failed after auth refresh")
+
+    def embed(self, inp: Any, encoding_format: str = "float") -> Dict[str, Any]:
+        """Generate OpenAI-compatible embeddings via Venice's /api/app/memoria/embeddings (text-embedding-bge-m3)."""
+        req_body = {
+            "input": inp,
+            "encoding_format": encoding_format or "float",
+            "skipImportance": True,
+        }
+        url = f"{OUTERFACE_BASE}/api/app/memoria/embeddings"
+        for attempt in (0, 1):
+            hdrs = {**self.auth_headers(force_refresh=attempt > 0), "User-Agent": BROWSER_UA,
+                    "Content-Type": "application/json"}
+            r = cffi_requests.post(url, json=req_body, headers=hdrs, impersonate="chrome124", timeout=30)
+            if r.status_code == 401 and attempt == 0:
+                continue
+            if r.status_code != 200:
+                raise RuntimeError(f"Venice embeddings returned HTTP {r.status_code}: {r.text[:200]}")
+            data = r.json()
+            if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+                raise RuntimeError("Venice embeddings returned unexpected payload shape")
+            return data
+        raise RuntimeError("Venice embeddings failed after auth refresh")
 
 
 VENICE = VeniceClient()
@@ -1385,10 +1409,11 @@ def openai_to_venice_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         payload["_webEnabled"] = True
     if x_search:
         payload["_xSearch"] = True
-    # Reasoning / chain of thought: on when asked (`:think`, VENICE_REASONING, or reasoning_effort
-    # medium|high) AND the request carries no tools — a reasoning turn emits reasoning_content Venice
-    # wants passed back, which breaks tool calls (400), so tool requests never get it.
-    if (think or effort in ("medium", "high")) and not has_tools:
+    # Reasoning / chain of thought: explicit `:think` suffix or VENICE_REASONING=1 works on both
+    # plain chat and tool turns (plain `/api/inference/chat` sees only text turns, verified live
+    # 2026-11-22: HTTP 200 + reasoning_content + valid tool_calls). Implicit `reasoning_effort`
+    # medium|high remains gated to no-tools turns so clients sending effort by default stay fast.
+    if think or (effort in ("medium", "high") and not has_tools):
         payload["_think"] = True
     if all_attachments:
         payload["_attachments"] = all_attachments
@@ -1461,8 +1486,12 @@ ARG_ALIASES = {  # argument name of the client tool -> names models use for it
     "replace_all": ("replaceAll", "all", "global"),
     "caseSensitive": ("case_sensitive",),
     "agent": ("subagent_type", "agent_type", "subagent", "agent_name", "role", "mode"),
-    "id": ("skill_id", "skill_name", "skill", "name"),
+    "id": ("node_id", "item_id", "target_id", "skill_id", "skill_name", "skill", "name"),
+    "task_id": ("taskId", "id"),
     "skill": ("id", "skill_id", "skill_name", "name"),
+    "summary": ("title", "description", "conclusion", "message", "text"),
+    "vulnclass": ("category", "vuln_class", "vuln_type", "vulnerability_type", "type", "class"),
+    "timeout": ("timeout_ms", "timeout_s", "timeout_sec"),
     "command": ("cmd", "script", "code", "shell_command", "input", "expression"),
     "oldString": ("old_string", "old_str", "old", "old_text", "search", "find"),
     "old_string": ("oldString", "old_str", "old", "old_text", "search", "find"),
@@ -1483,38 +1512,85 @@ def _fit_arguments(args: Any, props: Dict[str, Any], required: Any = ()) -> Any:
     A bare-string call arrives wrapped as {"content": "..."} (tolerant_parser _build_call/_salvage);
     when the tool has exactly one required string parameter and no `content` of its own, the string is
     that parameter's value (measured: 48x `dropped args not in schema: ['content']`)."""
+    if isinstance(args, list) and len(args) == 1 and isinstance(args[0], dict):
+        args = args[0]  # models sometimes wrap tool arguments in a 1-element list: [{"command": "..."}]
     if not isinstance(args, dict) or not props:
         return args
     args = dict(args)
-    if (list(args) == ["content"] and "content" not in props and isinstance(args["content"], str)):
+    if list(args) == ["content"] and isinstance(args["content"], str):
         s = args["content"].strip()
-        if s.startswith("{"):
+        missing_other_req = any(k != "content" and k not in args for k in (required or ()))
+        if s.startswith("{") and ("content" not in props or missing_other_req):
+            unwrapped_c = False
             try:
                 parsed, _ = read_lenient(s, 0)
-                if isinstance(parsed, dict) and any(k in props for k in parsed):
+                if isinstance(parsed, dict) and any(k in props or k in ("file_path", "filePath", "path") for k in parsed):
                     args = parsed
+                    unwrapped_c = True
             except Exception:
                 pass
+            if not unwrapped_c:
+                m = re.match(
+                    r'^\{\s*"(file_path|filePath|path)"\s*:\s*"([^"]+)"\s*,\s*"content"\s*:\s*"(.*)"\s*[\}\]\s]*\}$',
+                    s, re.S,
+                )
+                if m:
+                    args = {m.group(1): m.group(2), "content": re.sub(r'(?<!\\)\\"', '"', m.group(3))}
         if list(args) == ["content"] and "content" not in props:
             req_strings = [k for k in (required or []) if k in props and props[k].get("type") in ("string", None)]
             if len(req_strings) == 1:
                 args = {req_strings[0]: args["content"]}
     # Models frequently double-wrap tool inputs as {"arguments": {...}} or {"name": "...", "arguments": {...}}
-    # or Anthropic-style {"input": {...}}. Unwrap before schema pruning so commands are not dropped.
+    # or Anthropic-style {"input": {...}}, sometimes stringified with unescaped inner quotes.
     for _ in range(3):
         unwrapped = False
+        if "tool_calls" in args and "tool_calls" not in props:
+            tc_val = args["tool_calls"]
+            if isinstance(tc_val, list) and len(tc_val) == 1 and isinstance(tc_val[0], dict):
+                args.pop("tool_calls")
+                for k, v in tc_val[0].items():
+                    args.setdefault(k, v)
+                unwrapped = True
+                continue
         for wrap_key in ("arguments", "parameters", "input"):
             if wrap_key in args and wrap_key not in props:
                 val = args[wrap_key]
+                if isinstance(val, list) and len(val) == 1 and isinstance(val[0], dict):
+                    val = val[0]
                 if isinstance(val, str):
                     s = val.strip()
-                    if s.startswith("{") and s.endswith("}"):
+                    if s.startswith("{"):
+                        parsed_ok = False
                         try:
                             parsed = json.loads(s)
                             if isinstance(parsed, dict):
                                 val = parsed
+                                parsed_ok = True
                         except Exception:
                             pass
+                        if not parsed_ok:
+                            try:
+                                parsed, _ = read_lenient(s, 0)
+                                if isinstance(parsed, dict):
+                                    val = parsed
+                                    parsed_ok = True
+                            except Exception:
+                                pass
+                        if not parsed_ok:
+                            mc = re.match(r'^\{\s*"command"\s*:\s*"(.*)"\s*[\}\]\s]*\}$', s, re.S)
+                            if mc:
+                                val = {"command": re.sub(r'(?<!\\)\\"', '"', mc.group(1))}
+                            else:
+                                mw = re.match(
+                                    r'^\{\s*"(file_path|filePath|path)"\s*:\s*"([^"]+)"\s*,\s*"content"\s*:\s*"(.*)"\s*[\}\]\s]*\}$',
+                                    s, re.S,
+                                )
+                                if mw:
+                                    val = {mw.group(1): mw.group(2), "content": re.sub(r'(?<!\\)\\"', '"', mw.group(3))}
+                    elif s:
+                        req_strings = [k for k in (required or []) if k in props and props[k].get("type") in ("string", None)]
+                        if len(req_strings) == 1:
+                            val = {req_strings[0]: s}
                 if isinstance(val, dict):
                     args.pop(wrap_key)
                     if "name" in args and "name" not in props:
@@ -1549,7 +1625,7 @@ def _fit_arguments(args: Any, props: Dict[str, Any], required: Any = ()) -> Any:
         except Exception:
             pass
         if not unwrapped_cmd:
-            m = re.match(r'^\{\s*"command"\s*:\s*"(.*)"\s*\}$', cmd_s, re.S)
+            m = re.match(r'^\{\s*"command"\s*:\s*"(.*)"\s*[\}\]\s]*\}$', cmd_s, re.S)
             if m:
                 args["command"] = re.sub(r'(?<!\\)\\"', '"', m.group(1))
     # Models writing regexes in JSON often emit `\b` or `\f` instead of `\\b` / `\\f`, which JSON
@@ -1573,6 +1649,8 @@ def _coerce_arguments(args: Any, props: Dict[str, Any]) -> Any:
     """Fix argument VALUES (not just names), keyed off the tool's own schema:
     a command given as a list -> one string; a url the model put in prompt; the sub-agent tool's
     required agent/description when the model left them out."""
+    if isinstance(args, list) and len(args) == 1 and isinstance(args[0], dict):
+        args = args[0]  # models sometimes wrap tool arguments in a 1-element list: [{"command": "..."}]
     if not isinstance(args, dict) or not props:
         return args
     args = dict(args)
@@ -1613,6 +1691,79 @@ def _coerce_arguments(args: Any, props: Dict[str, Any]) -> Any:
             # the item is additionalProperties:false: keep only the four allowed keys
             norm.append({k: q[k] for k in ("question", "header", "options", "multiple") if k in q})
         args["questions"] = norm
+    # Generic JSON-Schema scalar & array-of-objects coercion (e.g. task_id int -> str,
+    # set_goals ["text"] -> [{"text": ...}], insert_assets [{"asset_type": ...}] -> [{"type": ...}]).
+    for k, schema in props.items():
+        if k not in args or not isinstance(schema, dict):
+            continue
+        v = args[k]
+        st = schema.get("type")
+        if st == "string" and isinstance(v, (int, float)) and not isinstance(v, bool):
+            args[k] = str(v)
+        elif st == "integer" and isinstance(v, str) and re.fullmatch(r"-?\d+", v.strip()):
+            args[k] = int(v.strip())
+        elif st == "boolean" and isinstance(v, str) and v.strip().lower() in ("true", "false"):
+            args[k] = (v.strip().lower() == "true")
+        elif st == "array" and isinstance(v, list):
+            items = schema.get("items")
+            if isinstance(items, dict) and items.get("type") == "object":
+                iprops = items.get("properties") or {}
+                ireq = items.get("required") or []
+                str_key = next(
+                    (rk for rk in ireq if isinstance(iprops.get(rk), dict) and iprops[rk].get("type") in ("string", None)),
+                    next((ck for ck in ("text", "title", "description", "goal", "name") if ck in iprops), None),
+                )
+                new_list = []
+                changed = False
+                for elem in v:
+                    if isinstance(elem, str) and str_key:
+                        new_list.append({str_key: elem})
+                        changed = True
+                    elif isinstance(elem, dict):
+                        ed = dict(elem)
+                        if "type" in iprops and "type" not in ed:
+                            for alt in ("asset_type", "kind"):
+                                if alt in ed and alt not in iprops:
+                                    ed["type"] = ed.pop(alt)
+                                    changed = True
+                                    break
+                        if "text" in iprops and "text" not in ed:
+                            for alt in ("description", "desc", "constraint", "goal", "summary", "content"):
+                                if alt in ed and isinstance(ed[alt], str):
+                                    ed["text"] = ed[alt]
+                                    changed = True
+                                    break
+                        # Coerce nested scalar fields inside array[object] items (e.g. assets[0].page_title: expected string).
+                        for ik, isch in iprops.items():
+                            if ik not in ed or not isinstance(isch, dict):
+                                continue
+                            iv, ist = ed[ik], isch.get("type")
+                            if ist == "string":
+                                if iv is None:
+                                    ed.pop(ik) if ik not in ireq else ed.__setitem__(ik, "")
+                                    changed = True
+                                elif isinstance(iv, (int, float)) and not isinstance(iv, bool):
+                                    ed[ik] = str(iv)
+                                    changed = True
+                            elif ist == "integer" and isinstance(iv, str) and re.fullmatch(r"-?\d+", iv.strip()):
+                                ed[ik] = int(iv.strip())
+                                changed = True
+                        new_list.append(ed)
+                    else:
+                        new_list.append(elem)
+                if changed:
+                    args[k] = new_list
+    # Defensive defaults for common tool parameters when models omit them
+    if "vulnclass" in props and "vulnclass" not in args:
+        args["vulnclass"] = "general"
+    if "severity" in props and "severity" not in args:
+        args["severity"] = "info"
+    if "summary" in props and "summary" not in args:
+        args["summary"] = args.get("title") or args.get("name") or "Finding"
+    if "dsl" in props and "id" not in args and "ids" not in args:
+        dsl_v = str(args.get("dsl") or "").strip()
+        if not dsl_v or dsl_v == "BARE":
+            args["dsl"] = "domain=*"
     # OpenCode 2.3.2 tools are additionalProperties:false, so any key not in the schema is rejected.
     # Drop the leftovers from aliasing (e.g. `replace_all` after it became `replaceAll`).
     extra = [k for k in args if k not in props]
@@ -1921,6 +2072,7 @@ def _read_reply(
     calls: List[Tuple[str, Any]] = []
     unknown: List[Tuple[str, Any]] = []
     subcalls: List[Tuple[str, Any]] = []
+    dropped_empty = False
     for c in parsed["calls"] or []:
         expanded = _expand_call(c["name"], c["arguments"], declared) if declared else None
         if expanded:
@@ -1952,7 +2104,12 @@ def _read_reply(
             name = None
         if name and declared:
             tp = props.get(name) or {}
-            args = _coerce_arguments(_fit_arguments(args, tp, reqs.get(name) or []), tp)
+            req = reqs.get(name) or []
+            args = _coerce_arguments(_fit_arguments(args, tp, req), tp)
+            if req and isinstance(args, dict) and not args:
+                sys.stderr.write(f"[venice-bridge] dropped empty call to {name} (missing required {req})\n")
+                dropped_empty = True
+                continue
         (calls if name else unknown).append((name or c["name"], args))
     if unknown and not calls and len(parsed["content"]) < 200:
         # the reply is only a call, with an invented tool name: OpenCode tells the model it does not exist.
@@ -1977,7 +2134,7 @@ def _read_reply(
         # with tags, the prose is what stands outside them: the parser's own content mixes in call pieces
         content = (_native_calls(text)[1] if native else
                    _CALL_MARKER.sub("", _TAGGED_CALLS.sub("", text)).strip() if tagged else parsed["content"])
-        unreadable = (len(content) < 200 and not parsed["calls"]
+        unreadable = (len(content) < 200 and (not parsed["calls"] or dropped_empty)
                       and not re.search(r'"tool_calls"\s*:\s*\[\s*\]', text))
         if unreadable:
             sys.stderr.write(f"[venice-bridge] reply mentions tool_calls but no call could be read: {text[:300]!r}\n")
@@ -3132,6 +3289,33 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
         item = {"url": f"data:image/{fmt};base64,{b64_data}"} if resp_fmt == "url" else {"b64_json": b64_data}
         self._send_json(200, {"created": int(time.time()), "data": [item]})
 
+    def _handle_embeddings(self) -> None:
+        length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw_body)
+        except Exception as exc:
+            self._send_json(400, {"error": {"message": f"Invalid JSON: {exc}", "type": "invalid_request_error"}})
+            return
+        if not isinstance(body, dict) or body.get("input") in (None, "", []):
+            self._send_json(400, {"error": {"message": "Missing required 'input' field.", "type": "invalid_request_error"}})
+            return
+        inp = body["input"]
+        if not isinstance(inp, (str, list)):
+            self._send_json(400, {"error": {"message": "'input' must be a string or list of strings.", "type": "invalid_request_error"}})
+            return
+        enc = str(body.get("encoding_format") or "float").lower()
+        if enc not in ("float", "base64"):
+            self._send_json(400, {"error": {"message": "encoding_format must be 'float' or 'base64'.", "type": "invalid_request_error"}})
+            return
+        try:
+            data = POOL.active_client().embed(inp, encoding_format=enc)
+        except Exception as exc:
+            self._send_json(502, {"error": {"message": str(exc), "type": "venice_upstream_error"}})
+            return
+        STATS.record_event("embeddings")
+        self._send_json(200, data)
+
     def do_POST(self) -> None:
         started = time.time()
         try:
@@ -3163,6 +3347,9 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
 
         if path == "/v1/images/generations":
             return self._handle_image_generation()
+
+        if path == "/v1/embeddings":
+            return self._handle_embeddings()
 
         if path != "/v1/chat/completions":
             self._send_json(404, {"error": {"message": f"Unknown POST path: {path}"}})
@@ -3248,14 +3435,20 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 "model": model,
                 "choices": [ch],
             }
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
-            self.wfile.flush()
+            try:
+                self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def send_usage(completion_text: str) -> None:
             chunk = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                      "choices": [], "usage": _usage(prompt_chars, completion_text)}
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
-            self.wfile.flush()
+            try:
+                self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         if has_tools:
             # The answer may be a call, so nothing is sent until it is complete, retries included. That
@@ -3299,6 +3492,8 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                 content = "(the model sent a tool call that could not be read)"  # never the raw envelope
             if not stream:
                 message_obj: Dict[str, Any] = {"role": "assistant", "content": content or None}
+                if best["reasoning"]:
+                    message_obj["reasoning_content"] = best["reasoning"]
                 if calls:
                     message_obj["tool_calls"] = [{"id": c["id"], "type": "function", "function": c["function"]} for c in calls]
                 completion = (content or "") + "".join(c["function"]["arguments"] for c in (calls or []))
@@ -3326,8 +3521,11 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
                     emit({"tool_calls": calls})
                 emit({}, "tool_calls" if calls else "stop")
                 send_usage((content or "") + "".join(c["function"]["arguments"] for c in (calls or [])))
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                try:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
                 STATS.record_request(model, ok=True, total_s=time.time() - req_started, ttft_s=first_token_at[0])
             finally:
                 self.close_connection = True
@@ -3446,8 +3644,11 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             _cache_put(cache_key, {"content": full_text or "", "reasoning": "".join(reason_parts) or None,
                                    "tool_calls": None, "finish": "stop", "stop_sequence": stop_seq, "prompt_chars": prompt_chars})
             send_usage(full_text)
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             STATS.record_request(model, ok=True, total_s=time.time() - req_started, ttft_s=first_token_at[0])
         finally:
             _cleanup(handle)
@@ -3460,6 +3661,7 @@ def main() -> None:
     parser.add_argument("--host", default=os.environ.get("VENICE_BRIDGE_HOST") or DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
+    ThreadingHTTPServer.request_queue_size = 512
     srv = ThreadingHTTPServer((args.host, args.port), OpenAIBridgeHandler)
     print(f"[+] Venice AI Bridge listening on http://{args.host}:{args.port}/v1", flush=True)
     srv.serve_forever()
