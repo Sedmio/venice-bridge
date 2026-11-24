@@ -15,7 +15,12 @@ Releases: <https://github.com/nsozturk/venice-bridge/releases> · PyPI: <https:/
   `acceptCreditFallback` is always sent as `false`.
 - `/stats` endpoint counters: `image_edits`, `image_upscales`, `image_background_removals`.
 
+- **Adapter `/venice-api/...` routes** and **`claude-venice --venice-api` / `--claude`** — run Claude Code on the
+  official Venice API or the official Anthropic API with your own key (both metered; opt-in only).
+
 ### Security
+- `claude-venice <backend> --models` reads API keys from a temporary `0600` header file (`curl -H @file`) instead of
+  the command line, where `ps` could see them.
 - Multipart requests to Venice send text fields with `curl --form-string`; with `-F`, a prompt starting with `@` or
   `<` would have made curl upload a local file.
 

@@ -15,9 +15,12 @@ def make_fake_bin(tmpdir: str) -> str:
     # Stub curl: returns healthy bridge + adapter JSON
     curl_p = os.path.join(bindir, "curl")
     with open(curl_p, "w") as f:
-        f.write('#!/usr/bin/env bash\necho \'{"ok": true, "venice_session": "active", "chat_quota": {"remaining": 5000}}\'\n')
+        f.write('#!/usr/bin/env bash\n'
+                'printf "%s\\n" "$*" >> "$(dirname "$0")/curl_argv.log"\n'
+                'for a in "$@"; do case "$a" in @*) cat "${a#@}" >> "$(dirname "$0")/curl_hdrfiles.log";; esac; done\n'
+                'echo \'{"ok": true, "venice_session": "active", "chat_quota": {"remaining": 5000}, "data": [{"id": "m1"}]}\'\n')
     os.chmod(curl_p, 0o755)
-    # Stub claude: dumps env MODEL + BASE_URL + AUTH_SET + argv as JSON
+    # Stub claude: dumps env MODEL + BASE_URL + AUTH_SET + API_KEY_SET + argv as JSON
     claude_p = os.path.join(bindir, "claude")
     with open(claude_p, "w") as f:
         f.write(
@@ -26,6 +29,7 @@ def make_fake_bin(tmpdir: str) -> str:
             'print(json.dumps({"model": os.environ.get("ANTHROPIC_MODEL"), '
             '"base_url": os.environ.get("ANTHROPIC_BASE_URL"), '
             '"has_token": bool(os.environ.get("ANTHROPIC_AUTH_TOKEN")), '
+            '"has_api_key": bool(os.environ.get("ANTHROPIC_API_KEY")), '
             '"argv": sys.argv[1:]}))\n'
         )
     os.chmod(claude_p, 0o755)
@@ -157,7 +161,71 @@ def main():
         assert r["model"] == "qwen4-max", r
         assert "--strict-mcp-config" in r["argv"], r
 
-    print("claude-venice --lean + --unquant + --zai + --go tests ok")
+        # 15. --claude uses official Anthropic API, default claude-haiku-5-5, no forced --effort (metered API)
+        r = run_launcher(
+            bindir,
+            ["--claude", "-p", "hi"],
+            extra_env={"CLAUDE_API_KEY": "test-dummy-claude-key"},
+        )
+        assert "--claude" not in r["argv"], r
+        assert r["model"] == "claude-haiku-5-5", r
+        assert r["base_url"] is None, r
+        assert r["has_api_key"] is True and r["has_token"] is False, r
+        assert "--effort" not in r["argv"], r
+        # CLAUDE_API_EFFORT opts in
+        r = run_launcher(bindir, ["--claude", "-p", "hi"],
+                         extra_env={"CLAUDE_API_KEY": "test-dummy-claude-key", "CLAUDE_API_EFFORT": "high"})
+        assert r["argv"][r["argv"].index("--effort") + 1] == "high", r
+
+        # 16. --anthropic with explicit -m and explicit --effort does not duplicate --effort
+        r = run_launcher(
+            bindir,
+            ["--anthropic", "-m", "claude-sonnet-5-5", "--effort", "high", "--lean", "-p", "hi"],
+            extra_env={"CLAUDE_API_KEY": "test-dummy-claude-key"},
+        )
+        assert "--anthropic" not in r["argv"] and "--lean" not in r["argv"], r
+        assert r["model"] == "claude-sonnet-5-5", r
+        assert r["argv"].count("--effort") == 1, r
+        assert r["argv"][r["argv"].index("--effort") + 1] == "high", r
+        assert "--strict-mcp-config" in r["argv"], r
+
+        # 16b. --models: keys go through a header file, never on curl's command line
+        for flag, env in (("--venice-api", {"VENICE_API_KEY": "SECRET-V"}), ("--claude", {"CLAUDE_API_KEY": "SECRET-C"}),
+                          ("--unquant", {"UNQUANT_API_KEY": "SECRET-U"})):
+            envx = os.environ.copy(); envx["PATH"] = bindir + ":" + envx.get("PATH", ""); envx.update(env)
+            subprocess.check_output(["bash", LAUNCHER, flag, "--models"], env=envx, text=True)
+            key = list(env.values())[0]
+            argv_log = open(os.path.join(bindir, "curl_argv.log")).read()
+            hdr_log = open(os.path.join(bindir, "curl_hdrfiles.log")).read()
+            assert key not in argv_log, (flag, argv_log)
+            assert key in hdr_log, (flag, hdr_log)
+        leftover = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith("tmp.")]
+        assert not any(key in open(os.path.join(tempfile.gettempdir(), f), errors="ignore").read()
+                       for f in leftover if os.path.isfile(os.path.join(tempfile.gettempdir(), f))), "key file left behind"
+
+        # 17. --venice-api routes via adapter /venice-api with VENICE_API_KEY
+        r = run_launcher(
+            bindir,
+            ["--venice-api", "-p", "hi"],
+            extra_env={"VENICE_API_KEY": "test-dummy-venice-key"},
+        )
+        assert "--venice-api" not in r["argv"], r
+        assert r["model"] == "deepseek-v4-1-flash-uncensored", r
+        assert r["base_url"] == "http://127.0.0.1:18892/venice-api", r
+        assert r["has_token"] is True and r["has_api_key"] is False, r
+
+        # 18. --api alias with explicit -m and --lean
+        r = run_launcher(
+            bindir,
+            ["--api", "-m", "venice-uncensored-1-2", "--lean", "-p", "hi"],
+            extra_env={"VENICE_API_KEY": "test-dummy-venice-key"},
+        )
+        assert "--api" not in r["argv"] and "--lean" not in r["argv"], r
+        assert r["model"] == "venice-uncensored-1-2", r
+        assert r["base_url"] == "http://127.0.0.1:18892/venice-api", r
+        assert "--strict-mcp-config" in r["argv"], r
+
+    print("claude-venice --lean + --venice-api + --unquant + --zai + --go + --claude tests ok")
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 HOST = os.environ.get("VENICE_ADAPTER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VENICE_ADAPTER_PORT", "18892"))
 UPSTREAM = os.environ.get("VENICE_ADAPTER_UPSTREAM", "http://127.0.0.1:18891/v1").rstrip("/")
+VENICE_API_UPSTREAM = os.environ.get("VENICE_API_UPSTREAM", "https://api.venice.ai/api/v1").rstrip("/")
 DEFAULT_MODEL = os.environ.get("VENICE_ADAPTER_MODEL", "deepseek-v4-1-flash-uncensored")
 _MODELS: Tuple[float, List[str]] = (0.0, [])
 
@@ -35,21 +36,38 @@ def log(msg: str) -> None:
     sys.stderr.write("[venice-adapters] %s\n" % msg)
 
 
-def _upstream(method: str, path: str, body: Optional[bytes] = None, max_retries: int = 5) -> Tuple[http.client.HTTPConnection, Any]:
+def _upstream(
+    method: str,
+    path: str,
+    body: Optional[bytes] = None,
+    max_retries: int = 5,
+    base_url: Optional[str] = None,
+    auth_token: Optional[str] = None,
+) -> Tuple[http.client.HTTPConnection, Any]:
     # http.client, not urlopen: urlopen would go through the macOS system proxy
-    u = urlsplit(UPSTREAM)
+    u = urlsplit((base_url or UPSTREAM).rstrip("/"))
+    is_https = u.scheme == "https"
+    conn_cls = http.client.HTTPSConnection if is_https else http.client.HTTPConnection
+    port = u.port or (443 if is_https else 80)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + (auth_token if auth_token else "local"),
+        "User-Agent": "claude-venice/1.0",
+    }
     last_exc = None
     for attempt in range(max_retries):
+        conn = None
         try:
-            conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=900)
-            conn.request(method, u.path + path, body, {"Content-Type": "application/json", "Authorization": "Bearer local"})
+            conn = conn_cls(u.hostname, port, timeout=900)
+            conn.request(method, u.path + path, body, headers)
             return conn, conn.getresponse()
         except (ConnectionResetError, ConnectionRefusedError, BrokenPipeError, TimeoutError, http.client.RemoteDisconnected) as exc:
             last_exc = exc
-            try:
-                conn.close()
-            except Exception:
-                pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             if attempt < max_retries - 1:
                 time.sleep(0.15 * (2 ** attempt))
     raise last_exc
@@ -149,7 +167,7 @@ def _call(call_id: str, name: str, arguments: Any) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- Anthropic Messages -> chat
 
-def messages_to_chat(body: Dict[str, Any]) -> Dict[str, Any]:
+def messages_to_chat(body: Dict[str, Any], passthrough_model: bool = False) -> Dict[str, Any]:
     msgs: List[Dict[str, Any]] = []
     system = _text(body.get("system"))
     if system:
@@ -178,7 +196,8 @@ def messages_to_chat(body: Dict[str, Any]) -> Dict[str, Any]:
     tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""),
                                                "parameters": t["input_schema"]}}
              for t in body.get("tools") or [] if isinstance(t, dict) and t.get("name") and isinstance(t.get("input_schema"), dict)]
-    out: Dict[str, Any] = {"model": _pick_model(body.get("model")), "messages": msgs, "stream": bool(body.get("stream"))}
+    model_id = (body.get("model") or DEFAULT_MODEL) if passthrough_model else _pick_model(body.get("model"))
+    out: Dict[str, Any] = {"model": model_id, "messages": msgs, "stream": bool(body.get("stream"))}
     if tools:
         out["tools"] = tools
     tc = body.get("tool_choice")
@@ -205,7 +224,7 @@ def messages_to_chat(body: Dict[str, Any]) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- OpenAI Responses -> chat
 
-def responses_to_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
+def responses_to_chat(body: Dict[str, Any], passthrough_model: bool = False) -> Tuple[Dict[str, Any], Dict[str, str]]:
     """(chat request, {tool name: 'custom'} for freeform tools such as Codex's apply_patch)."""
     msgs: List[Dict[str, Any]] = []
     if isinstance(body.get("instructions"), str) and body["instructions"]:
@@ -250,7 +269,8 @@ def responses_to_chat(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, s
                 "name": t["name"], "description": t.get("description", ""),
                 "parameters": {"type": "object", "properties": {"input": {"type": "string", "description": "The full text input of the tool."}},
                                "required": ["input"], "additionalProperties": False}}})
-    out_req: Dict[str, Any] = {"model": _pick_model(body.get("model")), "messages": msgs, "stream": bool(body.get("stream"))}
+    model_id = (body.get("model") or DEFAULT_MODEL) if passthrough_model else _pick_model(body.get("model"))
+    out_req: Dict[str, Any] = {"model": model_id, "messages": msgs, "stream": bool(body.get("stream"))}
     if tools:
         out_req["tools"] = tools
     rtc = body.get("tool_choice")
@@ -372,50 +392,103 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(("event: %s\ndata: %s\n\n" % (event, json.dumps(data, ensure_ascii=False))).encode("utf-8"))
         self.wfile.flush()
 
+    def _extract_auth_token(self) -> Optional[str]:
+        auth = self.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            tok = auth[7:].strip()
+            if tok:
+                return tok
+        xkey = (self.headers.get("x-api-key") or "").strip()
+        return xkey or None
+
+    def _route_target(self, raw_path: str) -> Tuple[str, str, Optional[str], bool]:
+        if raw_path == "/venice-api" or raw_path.startswith("/venice-api/"):
+            sub = raw_path[len("/venice-api"):] or "/"
+            return sub, VENICE_API_UPSTREAM, self._extract_auth_token(), True
+        return raw_path, UPSTREAM, None, False
+
     def do_GET(self) -> None:
-        path = self.path.split("?", 1)[0]
-        if path == "/health":
-            return self._json(200, {"ok": True, "upstream": UPSTREAM, "default_model": DEFAULT_MODEL})
+        raw_path = self.path.split("?", 1)[0]
+        if raw_path == "/health":
+            return self._json(200, {
+                "ok": True,
+                "upstream": UPSTREAM,
+                "venice_api_upstream": VENICE_API_UPSTREAM,
+                "default_model": DEFAULT_MODEL,
+            })
+        path, target_url, auth_token, is_venice_api = self._route_target(raw_path)
         if path == "/v1/models":
+            if is_venice_api and not auth_token:
+                return self._json(401, {"error": {"type": "authentication_error", "message": "Venice API key required in Authorization or x-api-key header"}})
             try:
-                conn, resp = _upstream("GET", "/models")
+                conn, resp = _upstream("GET", "/models", base_url=target_url, auth_token=auth_token)
                 data = json.loads(resp.read())
                 conn.close()
                 return self._json(resp.status, data)
             except Exception as exc:
                 return self._json(502, {"error": {"type": "api_error", "message": "upstream did not answer: %r" % exc}})
-        self._json(404, {"error": {"type": "not_found_error", "message": "unknown path " + path}})
+        self._json(404, {"error": {"type": "not_found_error", "message": "unknown path " + raw_path}})
 
     def do_POST(self) -> None:
-        path = self.path.split("?", 1)[0]  # Claude Code adds ?beta=true
+        raw_path = self.path.split("?", 1)[0]  # Claude Code adds ?beta=true
+        path, target_url, auth_token, is_venice_api = self._route_target(raw_path)
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
         except ValueError:
             return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "body is not JSON"}})
         if os.environ.get("VENICE_ADAPTER_DUMP"):  # debugging: keep what the client sent (local, never commit)
-            name = "%s_%s.json" % (time.strftime("%H%M%S"), path.strip("/").replace("/", "_"))
+            name = "%s_%s.json" % (time.strftime("%H%M%S"), raw_path.strip("/").replace("/", "_"))
             with open(os.path.join(os.environ["VENICE_ADAPTER_DUMP"], name), "w") as f:
                 json.dump(body, f, ensure_ascii=False)
         if path == "/v1/messages/count_tokens":
             return self._json(200, {"input_tokens": len(json.dumps(body, ensure_ascii=False)) // 4})
         if path == "/v1/messages":
-            return self._run(body, messages_to_chat(body), {}, anthropic=True)
+            if is_venice_api and not auth_token:
+                return self._error(401, "Venice API key required in Authorization or x-api-key header", anthropic=True)
+            chat = messages_to_chat(body, passthrough_model=is_venice_api)
+            if is_venice_api and "venice_parameters" not in chat:
+                chat["venice_parameters"] = {"include_venice_system_prompt": False}
+            return self._run(body, chat, {}, anthropic=True, base_url=target_url, auth_token=auth_token)
         if path == "/v1/responses":
-            chat, custom = responses_to_chat(body)
-            return self._run(body, chat, custom, anthropic=False)
-        self._json(404, {"error": {"type": "not_found_error", "message": "unknown path " + path}})
+            if is_venice_api and not auth_token:
+                return self._error(401, "Venice API key required in Authorization or x-api-key header", anthropic=False)
+            chat, custom = responses_to_chat(body, passthrough_model=is_venice_api)
+            if is_venice_api and "venice_parameters" not in chat:
+                chat["venice_parameters"] = {"include_venice_system_prompt": False}
+            return self._run(body, chat, custom, anthropic=False, base_url=target_url, auth_token=auth_token)
+        self._json(404, {"error": {"type": "not_found_error", "message": "unknown path " + raw_path}})
 
-    def _run(self, body: Dict[str, Any], chat: Dict[str, Any], custom: Dict[str, str], anthropic: bool) -> None:
+    def _run(
+        self,
+        body: Dict[str, Any],
+        chat: Dict[str, Any],
+        custom: Dict[str, str],
+        anthropic: bool,
+        base_url: Optional[str] = None,
+        auth_token: Optional[str] = None,
+    ) -> None:
         started = time.time()
         try:
-            conn, resp = _upstream("POST", "/chat/completions", json.dumps(chat, ensure_ascii=False).encode("utf-8"))
+            conn, resp = _upstream(
+                "POST",
+                "/chat/completions",
+                json.dumps(chat, ensure_ascii=False).encode("utf-8"),
+                base_url=base_url,
+                auth_token=auth_token,
+            )
         except Exception as exc:
             return self._error(502, "upstream did not answer: %r" % exc, anthropic)
         try:
             if resp.status != 200:  # before any header of ours: the client must see the real status
                 raw = resp.read().decode("utf-8", "replace")
                 try:
-                    message = json.loads(raw)["error"]["message"]
+                    err_obj = json.loads(raw).get("error")
+                    if isinstance(err_obj, dict):
+                        message = err_obj.get("message") or raw[:500]
+                    elif isinstance(err_obj, str):
+                        message = err_obj
+                    else:
+                        message = raw[:500]
                 except Exception:
                     message = raw[:500]
                 return self._error(resp.status, message, anthropic)

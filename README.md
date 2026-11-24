@@ -192,6 +192,17 @@ claude-venice --quota                                     # remaining web quota 
 
 `-m` and `--lean` may appear anywhere before `--`; `--models` and `--quota` must be the first argument. Everything else is passed to `claude`.
 
+Other backends (opt-in, each with its own key; the Venice web plan is not used):
+
+| Flag | Backend | Key (env, or a `chmod 600` file) | Cost |
+|---|---|---|---|
+| `--venice-api` / `--api` | Official Venice API via the adapter's `/venice-api` route | `VENICE_API_KEY` or `~/.config/venice-bridge/venice-api-key.txt` | **metered** (Venice API credits) |
+| `--claude` / `--anthropic` | Official Anthropic API, direct | `ANTHROPIC_API_KEY` / `CLAUDE_API_KEY` or `~/.config/venice-bridge/anthropic-api-key.txt` | **metered**; Claude Code's default effort unless `CLAUDE_API_EFFORT=<level>` |
+| `--unquant`, `--zai`, `--go` / `--opencode-go` | Unquant, Z.AI Coding Plan, OpenCode Go | `UNQUANT_API_KEY`, `ZAI_API_KEY`, `OPENCODE_GO_API_KEY` or their files | per plan |
+
+`<flag> --models` lists that backend's models. Keys are sent from a temporary `0600` header file, never on the
+`curl` command line.
+
 What the launcher does:
 
 - Runs the `claude` CLI in an isolated profile, `~/.claude-venice` (`CLAUDE_CONFIG_DIR`). Your normal `claude`
@@ -592,7 +603,8 @@ The adapter has no command-line options.
 | `POST /v1/messages/count_tokens` | An estimate (`input_tokens` ≈ request size / 4). | `200` |
 | `POST /v1/responses` | OpenAI Responses (Codex CLI), streaming and non-streaming, with function and freeform tools. | as `/v1/messages` |
 | `GET /v1/models` | The upstream's model list, passed through. | `200`; `502` |
-| `GET /health` | `{"ok": true, "upstream": "...", "default_model": "..."}`. It does not check the bridge. | `200` |
+| `GET /health` | `{"ok": true, "upstream": "...", "venice_api_upstream": "...", "default_model": "..."}`. It does not check the bridge. | `200` |
+| `POST /venice-api/v1/messages`, `POST /venice-api/v1/responses`, `GET /venice-api/v1/models` | Same conversion, sent to the official Venice API (`VENICE_API_UPSTREAM`, default `https://api.venice.ai/api/v1`) with the **caller's** key (`Authorization: Bearer` or `x-api-key`); the model id is passed through and `venice_parameters.include_venice_system_prompt` is `false`. Metered by Venice. The plain routes never forward the caller's key. | `200`; `401` no key; upstream status passed through; `502` |
 
 On both processes any other path answers `404`.
 

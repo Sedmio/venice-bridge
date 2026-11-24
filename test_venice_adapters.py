@@ -9,6 +9,7 @@ import urllib.request
 import venice_adapters as va
 
 SEEN = []  # chat requests the fake upstream received
+SEEN_AUTH = []  # Authorization header of each of those requests
 
 
 class Upstream(http.server.BaseHTTPRequestHandler):
@@ -22,6 +23,7 @@ class Upstream(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         SEEN.append(req)
+        SEEN_AUTH.append(self.headers.get("Authorization"))
         last = req["messages"][-1]
         if "quota" in str(last.get("content")):
             raw = json.dumps({"error": {"message": "quota used up"}}).encode()
@@ -239,6 +241,36 @@ def main():
     assert r_parts[1]["image_url"]["url"] == "data:image/jpeg;base64,/9j/"
     assert r_parts[2]["file"]["filename"] == "x.pdf"
     print("m5 adapter multimodal ok")
+    # ---- Venice API direct route (/venice-api/v1/messages): auth required, passthrough model, venice_parameters
+    va.VENICE_API_UPSTREAM = "http://127.0.0.1:%d/v1" % up.server_port
+    # Missing auth -> 401
+    st, raw = post(port, "/venice-api/v1/messages", {"model": "venice-uncensored-1-2", "messages": [{"role": "user", "content": "hi"}]})
+    assert st == 401, (st, raw)
+    # With Bearer auth -> passthrough model verbatim + venice_parameters.include_venice_system_prompt = False
+    req_v = urllib.request.Request(
+        "http://127.0.0.1:%d/venice-api/v1/messages" % port,
+        data=json.dumps({"model": "venice-uncensored-1-2", "tools": [tool_a], "messages": [{"role": "user", "content": "hi"}]}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer test-venice-key"},
+        method="POST",
+    )
+    r_v = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req_v, timeout=20)
+    assert r_v.status == 200
+    assert SEEN[-1]["model"] == "venice-uncensored-1-2", SEEN[-1]
+    assert SEEN[-1]["venice_parameters"] == {"include_venice_system_prompt": False}, SEEN[-1]
+    assert SEEN_AUTH[-1] == "Bearer test-venice-key", SEEN_AUTH[-1]
+    # The bridge route never forwards the client's key
+    req_b = urllib.request.Request(
+        "http://127.0.0.1:%d/v1/messages" % port,
+        data=json.dumps({"model": "m1", "tools": [tool_a], "messages": [{"role": "user", "content": "hi"}]}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer test-venice-key"},
+        method="POST",
+    )
+    urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req_b, timeout=20).read()
+    assert SEEN_AUTH[-1] == "Bearer local", SEEN_AUTH[-1]
+    # /anthropic-cache was removed: unknown path
+    st, _ = post(port, "/anthropic-cache/v1/messages", {"model": "x", "messages": []})
+    assert st == 404, st
+    print("venice-api route ok")
     print("responses ok")
 
 
