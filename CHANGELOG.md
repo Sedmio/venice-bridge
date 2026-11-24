@@ -3,6 +3,22 @@
 All notable changes to venice-bridge. Versions follow [Semantic Versioning](https://semver.org/).
 Releases: <https://github.com/nsozturk/venice-bridge/releases> · PyPI: <https://pypi.org/project/venice-bridge/>
 
+## Unreleased
+
+### Added
+- **Image tools from the Venice web app** — generation straight through `/api/inference/image`
+  (`/v1/images/generations`, `/v1/image/generate`, `n`/`variants` 1–4, style presets, negative prompt, steps, cfg,
+  seed, aspect ratio, resolution, optional prompt enhance), image edit / combine with optional mask
+  (`/v1/images/edits`, `/v1/image/edit`, Venice `multi-edit`), **upscale** (`/v1/image/upscale`, Venice `enhance`,
+  scale 1–4), **background removal** (`/v1/image/background-remove`), and `GET /v1/image/styles`. `/v1/models`
+  lists image and edit models. Only 0-credit models are used unless `VENICE_ALLOW_CREDIT_IMAGES=1`, and
+  `acceptCreditFallback` is always sent as `false`.
+- `/stats` endpoint counters: `image_edits`, `image_upscales`, `image_background_removals`.
+
+### Security
+- Multipart requests to Venice send text fields with `curl --form-string`; with `-F`, a prompt starting with `@` or
+  `<` would have made curl upload a local file.
+
 ## 0.3.0 — 2026-11-22
 
 ### Added

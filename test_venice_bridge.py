@@ -1702,8 +1702,8 @@ def m6_audio_and_image_gen_checks():
         assert st == 413, st
         vb.MAX_AUDIO_BYTES = old_max_audio
 
-        # 2. Image generations: b64_json + url (data URI) + n>1 -> 400 + empty prompt -> 400
-        vb.VENICE.generate_image = lambda prompt, size=None: (fake_png_b64, "png")
+        # 2. Image generations: b64_json + url (data URI) + n=2 + n>4 -> 400 + empty prompt -> 400 + /v1/image/generate
+        vb.VENICE.generate_image = lambda prompt, size=None, **kw: (fake_png_b64, "png")
         st, _, raw = _req("/v1/images/generations", json.dumps({"prompt": "a red cube"}).encode(), "application/json")
         d = json.loads(raw)
         assert st == 200 and d["data"] == [{"b64_json": fake_png_b64}] and isinstance(d["created"], int), (st, d)
@@ -1712,10 +1712,43 @@ def m6_audio_and_image_gen_checks():
         d2 = json.loads(raw)
         assert st == 200 and d2["data"] == [{"url": f"data:image/png;base64,{fake_png_b64}"}], (st, d2)
 
-        st, _, _ = _req("/v1/images/generations", json.dumps({"prompt": "x", "n": 2}).encode(), "application/json")
+        st, _, raw = _req("/v1/images/generations", json.dumps({"prompt": "a red cube", "model": "krea-2-turbo", "n": 2}).encode(), "application/json")
+        d3 = json.loads(raw)
+        assert st == 200 and len(d3["data"]) == 2, (st, d3)
+
+        st, _, raw = _req("/v1/image/generate", json.dumps({"prompt": "a red cube", "model": "z-image-turbo", "variants": 2}).encode(), "application/json")
+        d4 = json.loads(raw)
+        assert st == 200 and len(d4["images"]) == 2 and "timing" in d4, (st, d4)
+
+        st, hdrs, raw_bin = _req("/v1/image/generate", json.dumps({"prompt": "a red cube", "return_binary": True}).encode(), "application/json")
+        assert st == 200 and raw_bin == base64.b64decode(fake_png_b64), (st, len(raw_bin))
+
+        st, _, _ = _req("/v1/images/generations", json.dumps({"prompt": "x", "n": 5}).encode(), "application/json")
         assert st == 400, st
         st, _, _ = _req("/v1/images/generations", json.dumps({"prompt": ""}).encode(), "application/json")
         assert st == 400, st
+        assert vb.VeniceClient._resolve_image_model("venice-sd35") == "stable-diffusion-3.5-rev2"
+        assert vb.VeniceClient._resolve_image_model("wai-Illustrious") == "wai-illu"
+        assert vb.VeniceClient._resolve_edit_model("firered") == "firered-image-edit"
+        assert vb.VeniceClient._resolve_edit_model("qwen-edit") == "qwen-edit-uncensored"
+
+        # 2b. Image edit / combine (/v1/image/edit + /v1/images/edits)
+        old_edit = vb.VENICE.edit_image
+        old_enh = vb.VENICE.enhance_edit_prompt
+        vb.VENICE.edit_image = lambda prompt, imgs, **kw: (fake_png_b64, "png")
+        vb.VENICE.enhance_edit_prompt = lambda prompt, imgs, **kw: "enhanced edit prompt"
+        try:
+            st, _, raw = _req("/v1/image/edit", json.dumps({"prompt": "make hair orange", "images": [fake_png_b64, fake_png_b64], "enhance_prompt": True}).encode(), "application/json")
+            de = json.loads(raw)
+            assert st == 200 and de["images"] == [fake_png_b64] and de.get("enhanced_prompt") == "enhanced edit prompt", (st, de)
+            st, _, raw = _req("/v1/images/edits", json.dumps({"prompt": "make hair orange", "image": fake_png_b64}).encode(), "application/json")
+            de2 = json.loads(raw)
+            assert st == 200 and de2["data"] == [{"b64_json": fake_png_b64}], (st, de2)
+            st, _, _ = _req("/v1/image/edit", json.dumps({"prompt": "no img"}).encode(), "application/json")
+            assert st == 400, st
+        finally:
+            vb.VENICE.edit_image = old_edit
+            vb.VENICE.enhance_edit_prompt = old_enh
 
         # 3. /stats counters present & zero base64 leakage
         with opener.open(base + "/stats", timeout=10) as r:
@@ -1730,6 +1763,137 @@ def m6_audio_and_image_gen_checks():
         srv.shutdown()
         srv.server_close()
     print("m6 audio + image gen ok")
+
+
+def img2_upscale_bgremove_checks():
+    """Multipart seam (--form-string, no local-file injection), upscale + background-remove routes/clients,
+    and one image per /image call (no variants=n per call)."""
+    import base64, urllib.error, urllib.request
+    fake_png = b"\x89PNG\r\n\x1a\nFAKEPNG"
+    fake_b64 = base64.b64encode(fake_png).decode("ascii")
+    client = vb.VENICE
+
+    # a) multipart seam: text fields never go through -F (curl reads '@file' / '<file' there)
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stderr = b""
+        stdout = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n" + fake_png
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = list(cmd)
+        return _Proc()
+
+    old_run, old_auth = vb.subprocess.run, client.auth_headers
+    vb.subprocess.run = fake_run
+    client.auth_headers = lambda force_refresh=False: {"Authorization": "Bearer x", "Content-Type": "application/json"}
+    try:
+        b64, fmt = client.edit_image("@/etc/passwd", [(fake_png, "a.png", "image/png")], model="firered",
+                                     style_preset="<secret.txt")
+        assert b64 == fake_b64 and fmt == "png", (b64, fmt)
+        cmd = captured["cmd"]
+        pairs = list(zip(cmd, cmd[1:]))
+        assert ("--form-string", "prompt=@/etc/passwd") in pairs, cmd
+        assert ("--form-string", "stylePreset=<secret.txt") in pairs, cmd
+        f_vals = [b for a, b in pairs if a == "-F"]
+        assert all(v.startswith(("files=@", "mask=@", "file=@")) for v in f_vals), f_vals
+
+        b64u, fmtu = client.upscale_image(fake_png, "a.png", "image/png", scale=2)
+        assert b64u == fake_b64 and fmtu == "png"
+        cmd = captured["cmd"]
+        pairs = list(zip(cmd, cmd[1:]))
+        assert ("--form-string", "scale=2") in pairs and cmd[-1].endswith("/api/inference/enhance"), cmd
+        assert any(a == "-F" and b.startswith("file=@") for a, b in pairs), cmd
+    finally:
+        vb.subprocess.run, client.auth_headers = old_run, old_auth
+
+    # a2) list_models("all") lists every model once (no duplicated inpaint/edit block)
+    class _ModelsResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"text": {"models": [{"id": "t1"}]}, "image": {"models": [{"id": "i1"}]},
+                    "inpaint": {"models": [{"id": "e1"}, {"id": "e2"}]}}
+
+    old_get = vb.cffi_requests.get
+    vb.cffi_requests.get = lambda *a, **kw: _ModelsResp()
+    client.auth_headers = lambda force_refresh=False: {"Authorization": "Bearer x"}
+    try:
+        ids = [m["id"] for m in client.list_models("all")]
+        assert sorted(ids) == ["e1", "e2", "i1", "t1"], ids
+    finally:
+        vb.cffi_requests.get, client.auth_headers = old_get, old_auth
+
+    # b) background-remove client posts JSON {image_url: data URI}
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+        headers = {"content-type": "image/png"}
+        content = fake_png
+        text = ""
+
+    old_post = vb.cffi_requests.post
+    vb.cffi_requests.post = lambda url, **kw: (sent.update(url=url, json=kw.get("json")), _Resp())[1]
+    client.auth_headers = lambda force_refresh=False: {"Authorization": "Bearer x"}
+    try:
+        b64b, fmtb = client.remove_background(fake_png, "image/png")
+        assert b64b == fake_b64 and sent["url"].endswith("/api/inference/background-remove"), sent
+        assert sent["json"] == {"image_url": f"data:image/png;base64,{fake_b64}"}, sent
+    finally:
+        vb.cffi_requests.post, client.auth_headers = old_post, old_auth
+
+    # c) HTTP routes
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    srv = vb.ThreadingHTTPServer(("127.0.0.1", 0), vb.OpenAIBridgeHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+
+    def _req(path, obj):
+        r = urllib.request.Request(base + path, json.dumps(obj).encode(), {"Content-Type": "application/json"})
+        try:
+            with opener.open(r, timeout=15) as resp:
+                return resp.status, resp.headers.get("Content-Type", ""), resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers.get("Content-Type", ""), e.read()
+
+    old_up, old_bg, old_gen = client.upscale_image, client.remove_background, client.generate_image
+    seen = {}
+    client.upscale_image = lambda raw, fname, mime, scale=2, **kw: (seen.update(up=(raw, scale)), (fake_b64, "png"))[1]
+    client.remove_background = lambda raw, mime: (seen.update(bg=raw), (fake_b64, "png"))[1]
+    gen_kw = []
+    client.generate_image = lambda prompt, size=None, **kw: (gen_kw.append(kw), (fake_b64, "png"))[1]
+    try:
+        for path in ("/v1/image/upscale", "/api/v1/image/upscale"):
+            st, ct, raw = _req(path, {"image": f"data:image/png;base64,{fake_b64}", "scale": 4})
+            assert st == 200 and ct.startswith("image/png") and raw == fake_png and seen["up"] == (fake_png, 4), (st, ct)
+        st, _, raw = _req("/v1/image/upscale", {"image": fake_b64, "scale": 2, "response_format": "b64_json"})
+        assert st == 200 and json.loads(raw)["images"] == [fake_b64], raw
+        assert _req("/v1/image/upscale", {"image": fake_b64, "scale": 9})[0] == 400
+        assert _req("/v1/image/upscale", {"scale": 2})[0] == 400
+        for path in ("/v1/image/background-remove", "/api/v1/image/background-remove"):
+            st, ct, raw = _req(path, {"image": fake_b64})
+            assert st == 200 and ct.startswith("image/png") and raw == fake_png and seen["bg"] == fake_png, (st, ct)
+        assert _req("/v1/image/background-remove", {"image_url": "https://example.com/a.png"})[0] == 400
+        assert _req("/v1/image/background-remove", {})[0] == 400
+
+        # d) n=2 -> two /image calls, none of them asks Venice for variants>1
+        st, _, raw = _req("/v1/images/generations", {"prompt": "a cube", "n": 2})
+        assert st == 200 and len(json.loads(raw)["data"]) == 2 and len(gen_kw) == 2, raw
+        assert all(kw.get("variants") in (None, 1) for kw in gen_kw), gen_kw
+
+        with opener.open(base + "/stats", timeout=10) as r:
+            snap_raw = r.read().decode()
+        snap = json.loads(snap_raw)
+        assert snap["endpoints"]["image_upscales"] >= 3 and snap["endpoints"]["image_background_removals"] >= 2, snap
+        assert fake_b64 not in snap_raw
+    finally:
+        client.upscale_image, client.remove_background, client.generate_image = old_up, old_bg, old_gen
+        srv.shutdown()
+        srv.server_close()
+    print("img2 upscale + background-remove + multipart seam ok")
 
 
 if __name__ == "__main__":
@@ -1748,5 +1912,6 @@ if __name__ == "__main__":
         m4_cookie_pool_checks()
         m5_multimodal_attachments_checks()
         m6_audio_and_image_gen_checks()
+        img2_upscale_bgremove_checks()
     finally:
         shutil.rmtree(STATE_DIR, ignore_errors=True)

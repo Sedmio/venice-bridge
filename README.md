@@ -541,6 +541,7 @@ Environment variables are read when a process starts. Set them before you start 
 | `VENICE_BRIDGE_MAX_TOTAL_ATTACHMENT_BYTES` | `20971520` | Total attachment limit per request. |
 | `VENICE_BRIDGE_MAX_AUDIO_BYTES` | `26214400` | Upload limit for `/v1/audio/transcriptions`. |
 | `VENICE_BRIDGE_ASR_MODEL` | `nvidia/parakeet-tdt-0.6b-v3` | Venice speech-to-text model. |
+| `VENICE_ALLOW_CREDIT_IMAGES` | unset | `1` allows image / edit models and options that spend Venice credits. Off by default: only 0-credit models are used. |
 
 Command-line options: `--host` (default `VENICE_BRIDGE_HOST`, else `127.0.0.1`) and `--port` (default `18891`).
 The bridge has no client authentication, so keep the host on loopback.
@@ -575,7 +576,12 @@ The adapter has no command-line options.
 | `GET /health` | Session state, remaining web chat quota (`chat_quota`), cache counters (`cache`). | `200`; `503` no usable login |
 | `GET /stats` | Live runtime counters (requests, models, TTFT, retries, cache, pool, endpoint counts); `?format=html` renders a minimal dark dashboard. | `200` |
 | `POST /v1/audio/transcriptions` | OpenAI Whisper-compatible speech-to-text (`multipart/form-data`: `file`, `model`, `response_format` `json`/`text`/`verbose_json`), backed by Venice ASR (`nvidia/parakeet-tdt-0.6b-v3`). Supports mp3/wav/m4a/webm/ogg/flac up to `VENICE_BRIDGE_MAX_AUDIO_BYTES` (25 MB). | `200`; `400` bad format; `413` too large; `502` upstream failure |
-| `POST /v1/images/generations` | OpenAI Image Generation (`{"prompt", "n": 1, "size", "response_format": "b64_json"|"url"}`, where `url` returns a `data:` URI), backed by Venice in-chat image generation (`image_chunk`). Uses 1 chat + 1 image quota call. | `200`; `400` invalid prompt / `n != 1`; `502` upstream failure |
+| `POST /v1/images/generations` | OpenAI Image Generation (`{"prompt", "n": 1–4, "size", "model", "response_format": "b64_json"|"url"}`, `url` returns a `data:` URI), backed by Venice's web `/api/inference/image`; one Venice call per image. Only the account's free (0-credit) image models are accepted unless `VENICE_ALLOW_CREDIT_IMAGES=1`. `enhance_prompt: true` rewrites the prompt first (`revised_prompt`). | `200`; `400` invalid prompt / `n` / non-free model; `502` upstream failure |
+| `POST /v1/image/generate` | Venice-API-shaped generation (`variants`, `style_preset`, `negative_prompt`, `steps`, `cfg_scale`, `seed`, `aspect_ratio`, `resolution`, `return_binary`) → `{"images": [...]}` or raw image. | as above |
+| `POST /v1/images/edits`, `POST /v1/image/edit` | Edit or combine 1–6 images (`image`/`images` as base64 or `data:` URI, optional `mask`) via Venice `/api/inference/multi-edit`; free edit models only (`qwen-edit-uncensored`, `firered-image-edit`) unless `VENICE_ALLOW_CREDIT_IMAGES=1`. | `200`; `400` bad input / non-free model; `502` upstream failure |
+| `POST /v1/image/upscale` | Upscale one image (`{"image", "scale": 1–4, "enhance", "enhance_prompt", "replication"}`) via Venice `/api/inference/enhance`. Returns the image bytes; `response_format: "b64_json"` returns `{"images": [...]}`. | `200`; `400` bad image / scale; `502` upstream failure |
+| `POST /v1/image/background-remove` | Remove the background of one image (`{"image"}` as base64 or `data:` URI; remote URLs are refused) via Venice `/api/inference/background-remove`. Returns a transparent PNG (or `b64_json`). | `200`; `400` bad image / remote URL; `502` upstream failure |
+| `GET /v1/image/styles` | Image style presets. | `200` |
 | `POST /reload` | Drops cached auth (cookie, session, token, attestation) and the local quota lock (also the over-quota state of `venice-auto`). | `200` |
 
 ### Adapter, `127.0.0.1:18892`

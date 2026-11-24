@@ -579,7 +579,7 @@ class VeniceClient:
             hdrs["x-venice-client-attestation"] = attest
         return hdrs
 
-    def list_models(self) -> List[Dict[str, Any]]:
+    def list_models(self, model_type: str = "text") -> List[Dict[str, Any]]:
         hdrs = self.auth_headers()
         r = cffi_requests.get(
             f"{OUTERFACE_BASE}/api/app/models",
@@ -591,27 +591,80 @@ class VeniceClient:
         r.raise_for_status()
         data = r.json()
         models: List[Dict[str, Any]] = []
-        text_section = data.get("text") if isinstance(data, dict) else None
-        raw_list = (text_section or {}).get("models") if isinstance(text_section, dict) else None
-        if not isinstance(raw_list, list):
-            raw_list = data.get("data", []) if isinstance(data, dict) else []
-        # Hide models a plain OpenAI client cannot actually use, so it never selects one that 403s:
-        # `e2ee-*` are end-to-end-encrypted (need client-side keys the bridge has no part in), plus any
-        # glob in VENICE_EXCLUDE_MODELS (comma-separated, e.g. "e2ee-*,qwen3-vl-*").
         exclude = ["e2ee-*"] + [p.strip() for p in os.environ.get("VENICE_EXCLUDE_MODELS", "").split(",") if p.strip()]
-        for m in raw_list:
-            if not isinstance(m, dict):
-                continue
-            # Only expose free web subscription models (usesCredits: false) by default
-            if m.get("usesCredits") is True:
-                continue
-            mid = m.get("id") or m.get("modelId") or m.get("slug")
-            if mid and not any(fnmatch.fnmatch(mid, pat) for pat in exclude):
+        allow_credit_images = os.environ.get("VENICE_ALLOW_CREDIT_IMAGES", "").strip().lower() in ("1", "true", "yes")
+        now_ts = int(time.time())
+
+        if model_type in ("text", "all"):
+            text_section = data.get("text") if isinstance(data, dict) else None
+            raw_list = (text_section or {}).get("models") if isinstance(text_section, dict) else None
+            if not isinstance(raw_list, list):
+                raw_list = data.get("data", []) if isinstance(data, dict) else []
+            for m in raw_list:
+                if not isinstance(m, dict):
+                    continue
+                if m.get("usesCredits") is True:
+                    continue
+                mid = m.get("id") or m.get("modelId") or m.get("slug")
+                if mid and not any(fnmatch.fnmatch(mid, pat) for pat in exclude):
+                    models.append({
+                        "id": mid,
+                        "object": "model",
+                        "created": now_ts,
+                        "owned_by": "venice-web",
+                        "type": "text",
+                    })
+
+        if model_type in ("image", "all"):
+            img_section = data.get("image") if isinstance(data, dict) else None
+            raw_imgs = (img_section or {}).get("models") if isinstance(img_section, dict) else []
+            for m in raw_imgs or []:
+                if not isinstance(m, dict) or m.get("staffOnly") or m.get("active") is False:
+                    continue
+                if m.get("usesCredits") is True and not allow_credit_images:
+                    continue
+                mid = m.get("id") or m.get("modelId")
+                if not mid:
+                    continue
+                caps = m.get("capabilities") if isinstance(m.get("capabilities"), dict) else {}
                 models.append({
                     "id": mid,
+                    "api_id": m.get("apiModelId") or mid,
+                    "friendly_name": m.get("friendly_name") or mid,
                     "object": "model",
-                    "created": int(time.time()),
+                    "created": now_ts,
                     "owned_by": "venice-web",
+                    "type": "image",
+                    "private": bool(caps.get("private")),
+                    "uses_credits": bool(m.get("usesCredits")),
+                    "settings": m.get("settings") or {},
+                })
+
+        if model_type in ("inpaint", "edit", "all"):
+            inp_section = data.get("inpaint") if isinstance(data, dict) else None
+            raw_inps = (inp_section or {}).get("models") if isinstance(inp_section, dict) else []
+            for m in raw_inps or []:
+                if not isinstance(m, dict) or m.get("staffOnly") or m.get("active") is False:
+                    continue
+                if m.get("usesCredits") is True and not allow_credit_images:
+                    continue
+                mid = m.get("id") or m.get("modelId")
+                if not mid:
+                    continue
+                caps = m.get("capabilities") if isinstance(m.get("capabilities"), dict) else {}
+                models.append({
+                    "id": mid,
+                    "api_id": m.get("apiModelId") or mid,
+                    "friendly_name": m.get("friendly_name") or mid,
+                    "object": "model",
+                    "created": now_ts,
+                    "owned_by": "venice-web",
+                    "type": "inpaint",
+                    "private": bool(caps.get("private")),
+                    "combine_images": bool(caps.get("combineImages")),
+                    "supports_mask": bool(caps.get("supportsMaskedInpaint")),
+                    "uses_credits": bool(m.get("usesCredits")),
+                    "settings": m.get("settings") or {},
                 })
         return models
 
@@ -713,93 +766,462 @@ class VeniceClient:
             return r.json()
         raise RuntimeError("Venice ASR failed after auth refresh")
 
-    def generate_image(self, prompt: str, size: Optional[str] = None) -> Tuple[str, str]:
-        """Generate an image via Venice's in-chat image_generation tool on /api/inference/chat/agents/venice.
-        Returns (base64_data, format_ext) such as ('iVBOR...', 'png')."""
-        text = f"Generate an image of: {prompt.strip()}"
-        if size:
-            text += f" (size: {size})"
-        req_obj = {
-            "clientTools": [],
-            "input": {
-                "messages": [{
-                    "id": str(uuid.uuid4()),
-                    "type": "message",
-                    "role": "user",
-                    "status": "completed",
-                    "content": [{"type": "output_text", "text": text, "annotations": []}],
-                }]
-            },
+    # Free Private web image models (usesCredits=false) and their Venice API aliases / defaults
+    IMAGE_MODEL_ALIASES: Dict[str, str] = {
+        "venice-sd35": "stable-diffusion-3.5-rev2",
+        "wai-illustrious": "wai-illu",
+        "wai-Illustrious": "wai-illu",
+        "anime-wai": "wai-illu",
+        "krea-2": "krea-2-turbo",
+        "default": "z-image-turbo",
+        "dall-e-3": "z-image-turbo",
+        "gpt-image-1": "z-image-turbo",
+    }
+    FREE_IMAGE_SPECS: Dict[str, Dict[str, Any]] = {
+        "z-image-turbo": {"steps": 8, "max_steps": 8, "divisor": 8},
+        "krea-2-turbo": {
+            "steps": 8, "max_steps": 8, "divisor": 8,
+            "aspect_ratios": ["1:1", "5:4", "4:3", "3:2", "16:9", "21:9", "4:5", "3:4", "2:3", "9:16", "9:21"],
+            "default_resolution": "1K",
+        },
+        "lustify-v8": {"steps": 30, "max_steps": 50, "divisor": 8, "cfg": 3.5},
+        "lustify-sdxl": {"steps": 20, "max_steps": 50, "divisor": 8, "cfg": 5.0},
+        "wai-illu": {"steps": 25, "max_steps": 30, "divisor": 8, "cfg": 5.0},
+        "chroma": {"steps": 10, "max_steps": 10, "divisor": 8},
+        "stable-diffusion-3.5-rev2": {"steps": 25, "max_steps": 30, "divisor": 8, "cfg": 3.5},
+    }
+
+    @classmethod
+    def _resolve_image_model(cls, model: Optional[str]) -> str:
+        m = (model or "z-image-turbo").strip()
+        if m in cls.IMAGE_MODEL_ALIASES:
+            m = cls.IMAGE_MODEL_ALIASES[m]
+        elif m.lower() in cls.IMAGE_MODEL_ALIASES:
+            m = cls.IMAGE_MODEL_ALIASES[m.lower()]
+        allow_paid = os.environ.get("VENICE_ALLOW_CREDIT_IMAGES", "").strip().lower() in ("1", "true", "yes")
+        if not allow_paid and m not in cls.FREE_IMAGE_SPECS:
+            raise ValueError(
+                f"Model '{m}' is not in the free Private image set ({', '.join(cls.FREE_IMAGE_SPECS.keys())}). "
+                "Set VENICE_ALLOW_CREDIT_IMAGES=1 to allow credit-consuming models."
+            )
+        return m
+
+    @staticmethod
+    def _parse_image_size(size: Optional[str], width: Optional[int], height: Optional[int], divisor: int = 8) -> Tuple[int, int]:
+        w, h = width, height
+        if (w is None or h is None) and size and "x" in size.lower():
+            parts = size.lower().split("x", 1)
+            try:
+                w = w or int(parts[0].strip())
+                h = h or int(parts[1].strip())
+            except ValueError:
+                pass
+        w = max(256, min(1280, int(w or 1024)))
+        h = max(256, min(1280, int(h or 1024)))
+        if divisor > 1:
+            w = max(divisor, (w // divisor) * divisor)
+            h = max(divisor, (h // divisor) * divisor)
+        return w, h
+
+    @staticmethod
+    def _nearest_aspect_ratio(width: int, height: int, options: List[str]) -> str:
+        target = width / max(height, 1)
+        best, best_diff = options[0], float("inf")
+        for opt in options:
+            try:
+                a, b = opt.split(":", 1)
+                diff = abs((float(a) / float(b)) - target)
+                if diff < best_diff:
+                    best, best_diff = opt, diff
+            except Exception:
+                continue
+        return best
+
+    def enhance_image_prompt(
+        self,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+        aspect_ratio: str = "1:1",
+        is_nsfw: bool = True,
+    ) -> str:
+        """Enhance a text-to-image prompt via Venice's free /api/inference/image_prompt_enhance."""
+        web_model = self._resolve_image_model(model)
+        req_body = {
+            "aspectRatio": aspect_ratio or "1:1",
+            "isNSFWPrompt": bool(is_nsfw),
+            "messages": [{"content": prompt.strip(), "role": "user"}],
+            "modelId": web_model,
+            "prompt": prompt.strip(),
         }
-        url = f"{OUTERFACE_BASE}/api/inference/chat/agents/venice?agentModelId=deepseek-v4-1-flash-uncensored&paidImagesMode=block"
+        url = f"{OUTERFACE_BASE}/api/inference/image_prompt_enhance"
+        for attempt in (0, 1):
+            hdrs = {
+                **self.auth_headers(force_refresh=attempt > 0),
+                "User-Agent": BROWSER_UA,
+                "Content-Type": "application/json",
+            }
+            r = cffi_requests.post(url, headers=hdrs, json=req_body, impersonate="chrome124", timeout=45)
+            if r.status_code == 401 and attempt == 0:
+                continue
+            if r.status_code == 200:
+                j = r.json()
+                enh = (j.get("enhancedPrompt") or "").strip()
+                if enh:
+                    return enh
+            return prompt.strip()
+        return prompt.strip()
+
+    def enhance_edit_prompt(
+        self,
+        prompt: str,
+        images_b64: List[str],
+        *,
+        model: Optional[str] = None,
+        has_doodle: bool = False,
+        has_mask: bool = False,
+    ) -> str:
+        """Enhance an image-edit / combine prompt via Venice's free /api/inference/edit_prompt_enhance."""
+        web_model = self._resolve_edit_model(model)
+        req_body = {
+            "prompt": prompt.strip(),
+            "images": images_b64,
+            "hasDoodle": bool(has_doodle),
+            "hasMask": bool(has_mask),
+            "modelId": web_model,
+        }
+        url = f"{OUTERFACE_BASE}/api/inference/edit_prompt_enhance"
+        for attempt in (0, 1):
+            hdrs = {
+                **self.auth_headers(force_refresh=attempt > 0),
+                "User-Agent": BROWSER_UA,
+                "Content-Type": "application/json",
+            }
+            r = cffi_requests.post(url, headers=hdrs, json=req_body, impersonate="chrome124", timeout=45)
+            if r.status_code == 401 and attempt == 0:
+                continue
+            if r.status_code == 200:
+                j = r.json()
+                enh = (j.get("enhancedPrompt") or "").strip()
+                if enh:
+                    return enh
+            return prompt.strip()
+        return prompt.strip()
+
+    def generate_image(
+        self,
+        prompt: str,
+        size: Optional[str] = None,
+        *,
+        model: Optional[str] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        negative_prompt: Optional[str] = None,
+        steps: Optional[int] = None,
+        cfg_scale: Optional[float] = None,
+        seed: Optional[int] = None,
+        fmt: str = "png",
+        hide_watermark: bool = True,
+        safe_mode: bool = False,
+        embed_exif_metadata: bool = False,
+        style_preset: Optional[str] = None,
+        aspect_ratio: Optional[str] = None,
+        resolution: Optional[str] = None,
+        variants: int = 1,
+        accept_credit_fallback: bool = False,
+    ) -> Tuple[str, str]:
+        """Generate an image directly via Venice's web endpoint POST /api/inference/image.
+        Returns (base64_data, format_ext) such as ('iVBOR...', 'png')."""
+        web_model = self._resolve_image_model(model)
+        spec = self.FREE_IMAGE_SPECS.get(web_model, {"steps": 20, "max_steps": 30, "divisor": 8})
+        w, h = self._parse_image_size(size, width, height, int(spec.get("divisor", 8)))
+        eff_steps = int(steps) if steps is not None else int(spec.get("steps", 20))
+        if "max_steps" in spec:
+            eff_steps = max(1, min(int(spec["max_steps"]), eff_steps))
+        out_fmt = (fmt or "png").lower()
+        if out_fmt not in ("png", "webp", "jpeg"):
+            out_fmt = "png"
+        eff_seed = int(seed) if seed is not None else int.from_bytes(os.urandom(4), "big") % 999_999_999
+
+        req_body: Dict[str, Any] = {
+            "acceptCreditFallback": bool(accept_credit_fallback),
+            "apiRequest": False,
+            "clientProcessingTime": 1,
+            "embedExifMetadata": bool(embed_exif_metadata),
+            "format": out_fmt,
+            "height": h,
+            "hideWatermark": bool(hide_watermark),
+            "matureFilter": bool(safe_mode),
+            "modelId": web_model,
+            "prompt": prompt.strip(),
+            "requestId": uuid.uuid4().hex[:12],
+            "seed": eff_seed,
+            "steps": eff_steps,
+            "type": "image",
+            "variants": max(1, min(4, int(variants or 1))),
+            "width": w,
+        }
+        if negative_prompt:
+            req_body["negativePrompt"] = str(negative_prompt)
+        if cfg_scale is not None:
+            req_body["cfgScale"] = float(cfg_scale)
+        elif "cfg" in spec:
+            req_body["cfgScale"] = float(spec["cfg"])
+        if style_preset and str(style_preset).lower() != "none":
+            req_body["stylePreset"] = str(style_preset)
+        if "aspect_ratios" in spec:
+            req_body["aspectRatio"] = (
+                aspect_ratio if aspect_ratio in spec["aspect_ratios"]
+                else self._nearest_aspect_ratio(w, h, spec["aspect_ratios"])
+            )
+            eff_res = str(resolution or spec.get("default_resolution", "1K")).upper()
+            req_body["resolution"] = eff_res if eff_res in ("1K", "2K") else "1K"
+        elif aspect_ratio and str(aspect_ratio).lower() != "auto":
+            req_body["aspectRatio"] = str(aspect_ratio)
+
+        url = f"{OUTERFACE_BASE}/api/inference/image"
+        for attempt in (0, 1):
+            hdrs = {
+                **self.auth_headers(force_refresh=attempt > 0),
+                "User-Agent": BROWSER_UA,
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            }
+            r = cffi_requests.post(
+                url,
+                headers=hdrs,
+                json=req_body,
+                impersonate="chrome124",
+                timeout=120,
+            )
+            if r.status_code == 401 and attempt == 0:
+                continue
+            if r.status_code != 200:
+                raise RuntimeError(f"Venice image generation ({web_model}) returned HTTP {r.status_code}: {r.text[:300]}")
+            ctype = (r.headers.get("content-type") or "").lower()
+            if not ctype.startswith("image/"):
+                raise RuntimeError(f"Venice image generation ({web_model}) returned unexpected {ctype}: {r.text[:200]}")
+            raw_bytes = r.content
+            if not raw_bytes:
+                raise RuntimeError("Venice returned empty image data.")
+            detected_fmt = ctype.split("/", 1)[1].split(";", 1)[0].strip() or out_fmt
+            return base64.b64encode(raw_bytes).decode("ascii"), detected_fmt
+        raise RuntimeError("Venice image generation failed after auth refresh")
+
+    # Free Private web image-edit / inpaint models (usesCredits=false; 0-credit thinking levels only)
+    EDIT_MODEL_ALIASES: Dict[str, str] = {
+        "qwen-edit": "qwen-edit-uncensored",
+        "firered": "firered-image-edit",
+        "default": "qwen-edit-uncensored",
+    }
+    FREE_EDIT_SPECS: Dict[str, Dict[str, Any]] = {
+        "qwen-edit-uncensored": {
+            "thinking_level": "none",
+            "allowed_thinking": ["none", "low", "middle", "high"],
+            "combine_images": True,
+            "supports_mask": False,
+        },
+        "firered-image-edit": {
+            "thinking_level": "high",
+            "allowed_thinking": ["high"],  # 'complex' incurs a 10-credit surcharge
+            "combine_images": True,
+            "supports_mask": True,
+        },
+    }
+
+    @classmethod
+    def _resolve_edit_model(cls, model: Optional[str]) -> str:
+        m = (model or "qwen-edit-uncensored").strip()
+        if m in cls.EDIT_MODEL_ALIASES:
+            m = cls.EDIT_MODEL_ALIASES[m]
+        elif m.lower() in cls.EDIT_MODEL_ALIASES:
+            m = cls.EDIT_MODEL_ALIASES[m.lower()]
+        allow_paid = os.environ.get("VENICE_ALLOW_CREDIT_IMAGES", "").strip().lower() in ("1", "true", "yes")
+        if not allow_paid and m not in cls.FREE_EDIT_SPECS:
+            raise ValueError(
+                f"Edit model '{m}' is not in the free Private edit set ({', '.join(cls.FREE_EDIT_SPECS.keys())}). "
+                "Set VENICE_ALLOW_CREDIT_IMAGES=1 to allow credit-consuming models."
+            )
+        return m
+
+    def edit_image(
+        self,
+        prompt: str,
+        images: List[Tuple[bytes, str, str]],
+        *,
+        model: Optional[str] = None,
+        mask: Optional[Tuple[bytes, str, str]] = None,
+        aspect_ratio: Optional[str] = None,
+        thinking_level: Optional[str] = None,
+        style_preset: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """Edit or combine one or more images via Venice's POST /api/inference/multi-edit.
+        Each item in `images` (and optional `mask`) is (raw_bytes, filename, mime).
+        Returns (base64_data, format_ext)."""
+        if not images:
+            raise ValueError("At least one input image is required for image edit.")
+        web_model = self._resolve_edit_model(model)
+        spec = self.FREE_EDIT_SPECS.get(web_model, {"thinking_level": "none", "allowed_thinking": ["none", "low", "middle", "high"]})
+        allow_paid = os.environ.get("VENICE_ALLOW_CREDIT_IMAGES", "").strip().lower() in ("1", "true", "yes")
+        eff_thinking = (thinking_level or spec.get("thinking_level") or "none").strip().lower()
+        if not allow_paid and eff_thinking not in spec.get("allowed_thinking", ["none", "high"]):
+            raise ValueError(
+                f"thinking_level='{eff_thinking}' is blocked for '{web_model}' to prevent credit surcharges. "
+                f"Allowed free levels: {spec.get('allowed_thinking')}."
+            )
+        eff_ar = (aspect_ratio or "auto").strip()
+        valid_ars = {"auto", "1:1", "5:4", "4:3", "3:2", "16:9", "21:9", "4:5", "3:4", "2:3", "9:16", "9:21"}
+        if eff_ar not in valid_ars:
+            eff_ar = "auto"
+
+        fields: List[Tuple[str, str]] = [
+            ("acceptCreditFallback", "false"),
+            ("modelId", web_model),
+            ("prompt", prompt.strip()[:1500]),
+            ("requestId", uuid.uuid4().hex[:12]),
+            ("aspectRatio", eff_ar),
+        ]
+        # Venice rejects thinkingLevel on firered-image-edit unless a mask is supplied
+        if mask is not None or (web_model != "firered-image-edit" and eff_thinking and eff_thinking != "none"):
+            fields.append(("thinkingLevel", eff_thinking))
+        if style_preset and str(style_preset).strip():
+            fields.append(("stylePreset", str(style_preset).strip()))
+        files = [("files", raw_bytes, fname or f"img_{idx}.png", mime) for idx, (raw_bytes, fname, mime) in enumerate(images)]
+        if mask is not None:
+            m_bytes, m_name, m_mime = mask
+            files.append(("mask", m_bytes, m_name or "mask.png", m_mime))
+        return self._post_image_multipart(
+            f"{OUTERFACE_BASE}/api/inference/multi-edit", fields, files, f"image edit ({web_model})")
+
+    def _post_image_multipart(
+        self,
+        url: str,
+        fields: List[Tuple[str, str]],
+        files: List[Tuple[str, bytes, str, Optional[str]]],
+        what: str,
+    ) -> Tuple[str, str]:
+        """POST multipart/form-data to a Venice image endpoint that answers with raw image bytes.
+        Text fields go through --form-string: with -F, curl reads a local file for values that start
+        with '@' or '<', so a prompt like '@/etc/passwd' would upload that file to Venice.
+        Returns (base64_data, format_ext)."""
         for attempt in (0, 1):
             hdrs = self.auth_headers(force_refresh=attempt > 0)
+            hdrs.pop("Content-Type", None)  # curl sets the multipart boundary
             tmpdir = tempfile.mkdtemp(prefix="vbridge-img-")
             os.chmod(tmpdir, 0o700)
-            hdr_file = os.path.join(tmpdir, "headers.txt")
-            body_file = os.path.join(tmpdir, "body.json")
             try:
+                hdr_file = os.path.join(tmpdir, "headers.txt")
                 with os.fdopen(os.open(hdr_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
                     for k, v in hdrs.items():
                         f.write(f"{k}: {v}\n")
-                with os.fdopen(os.open(body_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
-                    json.dump(req_obj, f, ensure_ascii=False)
-                proc = subprocess.Popen(
-                    [
-                        "curl", "-sS", "-N", "-i", "--http1.1",
-                        "--connect-timeout", "20", "--max-time", "120",
-                        "-A", BROWSER_UA, "-H", f"@{hdr_file}",
-                        "--data-binary", f"@{body_file}", url,
-                    ],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                )
-                try:
-                    status, _ = _read_head(proc.stdout)
-                    if status == 401 and attempt == 0:
-                        proc.kill()
-                        proc.wait(timeout=2)
-                        continue
-                    if status != 200:
-                        proc.kill()
-                        proc.wait(timeout=2)
-                        raise RuntimeError(f"Venice image generation returned HTTP {status}")
-                    chunks: Dict[int, str] = {}
-                    fmt = "png"
-                    ev = ""
-                    assert proc.stdout is not None
-                    for raw_line in proc.stdout:
-                        line = raw_line.decode("utf-8", "ignore").strip()
-                        if line.startswith("event:"):
-                            ev = line[6:].strip()
-                        elif line.startswith("data:") and ev == "veniceai:image_generation.image_chunk":
-                            try:
-                                d = json.loads(line[5:].strip())
-                                idx = int(d.get("chunk_index", len(chunks)))
-                                b64_part = d.get("image_chunk_b64")
-                                if isinstance(b64_part, str):
-                                    chunks[idx] = b64_part
-                                if isinstance(d.get("format"), str) and d["format"]:
-                                    fmt = d["format"].lower()
-                            except Exception:
-                                pass
-                finally:
-                    try:
-                        proc.wait(timeout=2)
-                    except Exception:
-                        proc.kill()
+                cmd = [
+                    "curl", "-sS", "-i", "--http1.1",
+                    "--connect-timeout", "20", "--max-time", "180",
+                    "-A", BROWSER_UA,
+                    "-H", "Expect:",
+                    "-H", f"@{hdr_file}",
+                ]
+                for k, v in fields:
+                    cmd.extend(["--form-string", f"{k}={v}"])
+                for idx, (field, raw_bytes, fname, mime) in enumerate(files):
+                    f_path = os.path.join(tmpdir, f"part_{idx}.bin")
+                    with os.fdopen(os.open(f_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as bf:
+                        bf.write(raw_bytes)
+                    safe_name = re.sub(r'["\\;\r\n,]', "_", fname or f"part_{idx}.png")
+                    safe_mime = mime if mime and re.fullmatch(r"image/[a-z0-9.+-]+", mime) else "image/png"
+                    cmd.extend(["-F", f"{field}=@{f_path};filename={safe_name};type={safe_mime}"])
+                cmd.append(url)
+                proc = subprocess.run(cmd, capture_output=True, timeout=190)
+                if proc.returncode != 0:
+                    err_txt = proc.stderr.decode("utf-8", errors="replace")[:300]
+                    raise RuntimeError(f"curl {what} failed (rc={proc.returncode}): {err_txt}")
+                raw = proc.stdout
+                # Strip any 100 Continue preamble
+                while raw.startswith(b"HTTP/1.1 100") or raw.startswith(b"HTTP/1.0 100"):
+                    idx_sep = raw.find(b"\r\n\r\n")
+                    if idx_sep < 0:
+                        break
+                    raw = raw[idx_sep + 4:]
+                sep = raw.find(b"\r\n\r\n")
+                if sep < 0:
+                    raise RuntimeError(f"Malformed HTTP response from Venice {what}.")
+                hdr_block = raw[:sep].decode("utf-8", errors="replace")
+                body_bytes = raw[sep + 4:]
+                first_line = hdr_block.splitlines()[0] if hdr_block else ""
+                m_code = re.search(r"HTTP/\d(?:\.\d)?\s+(\d{3})", first_line)
+                status_code = int(m_code.group(1)) if m_code else 0
+                if status_code == 401 and attempt == 0:
+                    continue
+                if status_code != 200:
+                    raise RuntimeError(
+                        f"Venice {what} returned HTTP {status_code}: "
+                        f"{body_bytes.decode('utf-8', errors='replace')[:300]}"
+                    )
+                ctype = ""
+                for ln in hdr_block.splitlines()[1:]:
+                    if ln.lower().startswith("content-type:"):
+                        ctype = ln.split(":", 1)[1].strip().lower()
+                        break
+                if not ctype.startswith("image/"):
+                    raise RuntimeError(
+                        f"Venice {what} returned unexpected {ctype}: "
+                        f"{body_bytes.decode('utf-8', errors='replace')[:200]}"
+                    )
+                if not body_bytes:
+                    raise RuntimeError(f"Venice {what} returned empty image data.")
+                detected_fmt = ctype.split("/", 1)[1].split(";", 1)[0].strip() or "png"
+                return base64.b64encode(body_bytes).decode("ascii"), detected_fmt
             finally:
                 shutil.rmtree(tmpdir, ignore_errors=True)
-            if not chunks:
-                raise RuntimeError("Venice did not return any image chunks for this prompt.")
-            b64_full = "".join(v for _, v in sorted(chunks.items()))
-            try:
-                decoded = base64.b64decode(b64_full, validate=True)
-            except Exception:
-                raise RuntimeError("Venice returned invalid base64 image data.")
-            if not decoded:
-                raise RuntimeError("Venice returned empty image data.")
-            return b64_full, fmt
-        raise RuntimeError("Venice image generation failed after auth refresh")
+        raise RuntimeError(f"Venice {what} failed after auth refresh")
+
+    def upscale_image(
+        self,
+        raw_bytes: bytes,
+        filename: str,
+        mime: str,
+        *,
+        scale: int = 2,
+        enhance: bool = False,
+        enhance_creativity: Optional[float] = None,
+        enhance_prompt: Optional[str] = None,
+        replication: Optional[float] = None,
+    ) -> Tuple[str, str]:
+        """Upscale (and optionally enhance) one image via Venice's POST /api/inference/enhance.
+        Measured free on Pro (2x, 2026-11-24). Returns (base64_data, format_ext)."""
+        fields: List[Tuple[str, str]] = [("scale", str(int(scale)))]
+        if enhance:
+            fields.append(("enhance", "true"))
+            if enhance_creativity is not None:
+                fields.append(("enhanceCreativity", str(float(enhance_creativity))))
+            if enhance_prompt:
+                fields.append(("enhancePrompt", str(enhance_prompt)[:1500]))
+        if replication is not None:
+            fields.append(("replication", str(float(replication))))
+        return self._post_image_multipart(
+            f"{OUTERFACE_BASE}/api/inference/enhance", fields,
+            [("file", raw_bytes, filename or "image.png", mime)], "upscale")
+
+    def remove_background(self, raw_bytes: bytes, mime: str) -> Tuple[str, str]:
+        """Remove the background of one image via Venice's POST /api/inference/background-remove
+        (JSON {image_url: data URI}, answers with PNG bytes). Measured free on Pro (2026-11-24)."""
+        safe_mime = mime if mime and re.fullmatch(r"image/[a-z0-9.+-]+", mime) else "image/png"
+        req_body = {"image_url": f"data:{safe_mime};base64,{base64.b64encode(raw_bytes).decode('ascii')}"}
+        url = f"{OUTERFACE_BASE}/api/inference/background-remove"
+        for attempt in (0, 1):
+            hdrs = {**self.auth_headers(force_refresh=attempt > 0), "User-Agent": BROWSER_UA,
+                    "Content-Type": "application/json"}
+            r = cffi_requests.post(url, headers=hdrs, json=req_body, impersonate="chrome124", timeout=120)
+            if r.status_code == 401 and attempt == 0:
+                continue
+            if r.status_code != 200:
+                raise RuntimeError(f"Venice background-remove returned HTTP {r.status_code}: {r.text[:300]}")
+            ctype = (r.headers.get("content-type") or "").lower()
+            if not ctype.startswith("image/") or not r.content:
+                raise RuntimeError(f"Venice background-remove returned unexpected {ctype or 'empty body'}")
+            fmt = ctype.split("/", 1)[1].split(";", 1)[0].strip() or "png"
+            return base64.b64encode(r.content).decode("ascii"), fmt
+        raise RuntimeError("Venice background-remove failed after auth refresh")
 
     def embed(self, inp: Any, encoding_format: str = "float") -> Dict[str, Any]:
         """Generate OpenAI-compatible embeddings via Venice's /api/app/memoria/embeddings (text-embedding-bge-m3)."""
@@ -2940,7 +3362,8 @@ class _BridgeStats:
         self._requests = {"total": 0, "ok": 0, "error": 0, "cached": 0, "local": 0}
         self._events = {
             "format_retries": 0, "judge_retries": 0, "runaway_cuts": 0,
-            "proactive_jwt_refreshes": 0, "audio_transcriptions": 0, "image_generations": 0,
+            "proactive_jwt_refreshes": 0, "audio_transcriptions": 0, "image_generations": 0, "image_edits": 0,
+            "image_upscales": 0, "image_background_removals": 0,
         }
         self._models: Dict[str, Dict[str, float]] = {}
 
@@ -2992,6 +3415,9 @@ class _BridgeStats:
                 "endpoints": {
                     "audio_transcriptions": self._events["audio_transcriptions"],
                     "image_generations": self._events["image_generations"],
+                    "image_edits": self._events["image_edits"],
+                    "image_upscales": self._events["image_upscales"],
+                    "image_background_removals": self._events["image_background_removals"],
                 },
                 "pool": POOL.status(),
                 "cache": {**_CACHE_STATS, "entries": len(_CACHE), "enabled": _CACHE_ENABLED},
@@ -3154,18 +3580,34 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             self._send_json(200, snap)
             return
 
-        if path == "/v1/models":
-            models = list_local_models()
+        if path in ("/v1/image/styles", "/api/v1/image/styles"):
             try:
-                models = POOL.active_client().list_models() + models
+                r = cffi_requests.get("https://api.venice.ai/api/v1/image/styles", impersonate="chrome124", timeout=15)
+                r.raise_for_status()
+                self._send_json(200, r.json())
+            except Exception as exc:
+                self._send_json(502, {"error": {"message": str(exc), "type": "venice_upstream_error"}})
+            return
+
+        if path == "/v1/models":
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            mtype = (qs.get("type") or ["text"])[0].strip().lower()
+            if mtype not in ("text", "image", "inpaint", "edit", "all"):
+                mtype = "text"
+            models = list_local_models() if mtype in ("text", "all") else []
+            try:
+                cli = POOL.active_client()
+                venice_models = cli.list_models() if mtype == "text" else cli.list_models(model_type=mtype)
+                models = venice_models + models
             except Exception as exc:
                 if not models:
                     self._send_json(502, {"error": {"message": str(exc), "type": "bridge_error"}})
                     return
                 # the local models stay usable while Venice is logged out or unreachable
                 sys.stderr.write(f"[venice-bridge] Venice models not listed: {type(exc).__name__}\n")
-            models = [{"id": "venice-auto", "object": "model", "created": int(time.time()),
-                       "owned_by": "venice-bridge"}] + models  # virtual: Venice, local fallback over quota
+            if mtype in ("text", "all"):
+                models = [{"id": "venice-auto", "object": "model", "created": int(time.time()),
+                           "owned_by": "venice-bridge"}] + models  # virtual: Venice, local fallback over quota
             self._send_json(200, {"object": "list", "data": models})
             return
 
@@ -3256,7 +3698,15 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"text": text})
 
-    def _handle_image_generation(self) -> None:
+    def _call_generate_image(self, prompt: str, size: Optional[str], extra: Dict[str, Any]) -> Tuple[str, str]:
+        client = POOL.active_client()
+        fn = client.generate_image
+        clean_extra = {k: v for k, v in extra.items() if v is not None}
+        if not clean_extra:
+            return fn(prompt, size=size)
+        return fn(prompt, size=size, **clean_extra)
+
+    def _handle_image_generation(self, venice_native: bool = False) -> None:
         length = int(self.headers.get("Content-Length", 0))
         raw_body = self.rfile.read(length) if length else b"{}"
         try:
@@ -3271,23 +3721,322 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
         if not prompt:
             self._send_json(400, {"error": {"message": "Missing required 'prompt' field.", "type": "invalid_request_error"}})
             return
-        n = body.get("n", 1)
-        if not isinstance(n, int) or n != 1:
-            self._send_json(400, {"error": {"message": "Only n=1 is supported.", "type": "invalid_request_error"}})
+        count_key = "variants" if venice_native and "variants" in body else "n"
+        n = body.get(count_key, 1)
+        if not isinstance(n, int) or n < 1 or n > 4:
+            self._send_json(400, {"error": {"message": f"'{count_key}' must be an integer between 1 and 4.", "type": "invalid_request_error"}})
+            return
+        return_binary = bool(body.get("return_binary", False)) if venice_native else False
+        if return_binary and n != 1:
+            self._send_json(400, {"error": {"message": "return_binary=true requires variants=1.", "type": "invalid_request_error"}})
             return
         resp_fmt = str(body.get("response_format") or "b64_json").lower()
-        if resp_fmt not in ("b64_json", "url"):
+        if not venice_native and resp_fmt not in ("b64_json", "url"):
             self._send_json(400, {"error": {"message": "response_format must be 'b64_json' or 'url'.", "type": "invalid_request_error"}})
             return
+
         size = str(body.get("size") or "").strip() or None
+        seed_base = body.get("seed")
+        enhance = bool(body.get("enhance_prompt", False))
+        enhanced_prompt: Optional[str] = None
+        eff_prompt = prompt
+        if enhance:
+            try:
+                enh = POOL.active_client().enhance_image_prompt(
+                    prompt,
+                    model=body.get("model"),
+                    aspect_ratio=str(body.get("aspect_ratio") or "1:1"),
+                    is_nsfw=not bool(body.get("safe_mode", False)),
+                )
+                if enh and enh != prompt:
+                    enhanced_prompt = enh
+                    eff_prompt = enh
+            except Exception:
+                pass
+
+        extra_base: Dict[str, Any] = {
+            "model": body.get("model"),
+            "width": body.get("width"),
+            "height": body.get("height"),
+            "negative_prompt": body.get("negative_prompt"),
+            "steps": body.get("steps"),
+            "cfg_scale": body.get("cfg_scale"),
+            "fmt": body.get("format"),
+            "hide_watermark": body.get("hide_watermark"),
+            "safe_mode": body.get("safe_mode"),
+            "embed_exif_metadata": body.get("embed_exif_metadata"),
+            "style_preset": body.get("style_preset"),
+            "aspect_ratio": body.get("aspect_ratio"),
+            "resolution": body.get("resolution"),
+        }
+        # OpenAI moderation="low" -> safe_mode=False
+        if extra_base["safe_mode"] is None and body.get("moderation") is not None:
+            extra_base["safe_mode"] = str(body.get("moderation")).lower() != "low"
+
+        t0 = time.monotonic()
+        images_b64: List[str] = []
+        last_fmt = "png"
         try:
-            b64_data, fmt = POOL.active_client().generate_image(prompt, size=size)
+            for i in range(n):
+                per_call = dict(extra_base)
+                if seed_base is not None:
+                    per_call["seed"] = int(seed_base) + i if i > 0 else int(seed_base)
+                b64_data, fmt = self._call_generate_image(eff_prompt, size, per_call)
+                images_b64.append(b64_data)
+                last_fmt = fmt
+        except ValueError as exc:
+            self._send_json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            return
         except Exception as exc:
             self._send_json(502, {"error": {"message": str(exc), "type": "venice_upstream_error"}})
             return
+
         STATS.record_event("image_generations")
-        item = {"url": f"data:image/{fmt};base64,{b64_data}"} if resp_fmt == "url" else {"b64_json": b64_data}
-        self._send_json(200, {"created": int(time.time()), "data": [item]})
+        if return_binary:
+            raw_img = base64.b64decode(images_b64[0])
+            self.send_response(200)
+            self.send_header("Content-Type", f"image/{last_fmt}")
+            self.send_header("Content-Length", str(len(raw_img)))
+            if enhanced_prompt:
+                self.send_header("x-venice-enhanced-prompt", urllib.parse.quote(enhanced_prompt, safe=""))
+            self.end_headers()
+            self.wfile.write(raw_img)
+            return
+
+        if venice_native:
+            total_ms = int((time.monotonic() - t0) * 1000)
+            payload_out: Dict[str, Any] = {
+                "id": f"venice-img-{uuid.uuid4().hex[:12]}",
+                "images": images_b64,
+                "timing": {"total": total_ms},
+                "request": {"success": True, "data": {"model": body.get("model") or "z-image-turbo", "prompt": eff_prompt}},
+            }
+            if enhanced_prompt:
+                payload_out["enhanced_prompt"] = enhanced_prompt
+            self._send_json(200, payload_out)
+            return
+
+        data_items = [
+            {"url": f"data:image/{last_fmt};base64,{b}"} if resp_fmt == "url" else {"b64_json": b}
+            for b in images_b64
+        ]
+        if enhanced_prompt:
+            for item in data_items:
+                item["revised_prompt"] = enhanced_prompt
+        self._send_json(200, {"created": int(time.time()), "data": data_items})
+
+    @staticmethod
+    def _decode_image_input(item: Any, default_name: str = "input.png") -> Tuple[bytes, str, str]:
+        """Accept raw base64 string or data:image/...;base64,... URI -> (bytes, filename, mime)."""
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("Image input must be a non-empty base64 string or data URI.")
+        s = item.strip()
+        mime = "image/png"
+        if s.startswith("data:"):
+            m = re.match(r"^data:([^;,]+);base64,(.+)$", s, re.DOTALL)
+            if not m:
+                raise ValueError("Invalid data URI for image input.")
+            mime = m.group(1).strip().lower()
+            if mime == "image/jpg":
+                mime = "image/jpeg"
+            s = m.group(2)
+        try:
+            raw = base64.b64decode(s)
+        except Exception as exc:
+            raise ValueError(f"Invalid base64 image payload: {exc}") from exc
+        if not raw:
+            raise ValueError("Empty image payload.")
+        ext = "jpg" if mime == "image/jpeg" else ("webp" if mime == "image/webp" else "png")
+        fname = default_name if "." in default_name else f"{default_name}.{ext}"
+        return raw, fname, mime
+
+    def _handle_image_edit(self, venice_native: bool = True) -> None:
+        length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw_body)
+        except Exception as exc:
+            self._send_json(400, {"error": {"message": f"Invalid JSON: {exc}", "type": "invalid_request_error"}})
+            return
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": {"message": "Request body must be a JSON object.", "type": "invalid_request_error"}})
+            return
+        prompt = str(body.get("prompt") or "").strip()
+        if not prompt:
+            self._send_json(400, {"error": {"message": "Missing required 'prompt' field.", "type": "invalid_request_error"}})
+            return
+        raw_imgs: List[Any] = []
+        if isinstance(body.get("images"), list):
+            raw_imgs.extend(body["images"])
+        elif body.get("image"):
+            raw_imgs.append(body["image"])
+        if not raw_imgs or len(raw_imgs) > 6:
+            self._send_json(400, {"error": {"message": "Provide 1 to 6 input images via 'image' or 'images'.", "type": "invalid_request_error"}})
+            return
+        try:
+            decoded_imgs = [self._decode_image_input(it, f"ref_{i}.png") for i, it in enumerate(raw_imgs)]
+            decoded_mask = self._decode_image_input(body["mask"], "mask.png") if body.get("mask") else None
+        except ValueError as exc:
+            self._send_json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            return
+
+        n = body.get("variants", body.get("n", 1))
+        if not isinstance(n, int) or n < 1 or n > 4:
+            self._send_json(400, {"error": {"message": "'variants'/'n' must be an integer between 1 and 4.", "type": "invalid_request_error"}})
+            return
+        return_binary = bool(body.get("return_binary", False))
+        if return_binary and n != 1:
+            self._send_json(400, {"error": {"message": "return_binary=true requires variants=1.", "type": "invalid_request_error"}})
+            return
+
+        eff_prompt = prompt
+        enhanced_prompt: Optional[str] = None
+        if bool(body.get("enhance_prompt", False)):
+            try:
+                b64_list = [base64.b64encode(raw).decode("ascii") for raw, _, _ in decoded_imgs]
+                enh = POOL.active_client().enhance_edit_prompt(
+                    prompt, b64_list, model=body.get("model"), has_mask=decoded_mask is not None,
+                )
+                if enh and enh != prompt:
+                    enhanced_prompt = enh
+                    eff_prompt = enh
+            except Exception:
+                pass
+
+        t0 = time.monotonic()
+        images_b64: List[str] = []
+        last_fmt = "png"
+        try:
+            client = POOL.active_client()
+            for _ in range(n):
+                b64_data, fmt = client.edit_image(
+                    eff_prompt,
+                    decoded_imgs,
+                    model=body.get("model"),
+                    mask=decoded_mask,
+                    aspect_ratio=body.get("aspect_ratio"),
+                    thinking_level=body.get("thinking_level"),
+                    style_preset=body.get("style_preset"),
+                )
+                images_b64.append(b64_data)
+                last_fmt = fmt
+        except ValueError as exc:
+            self._send_json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            return
+        except Exception as exc:
+            self._send_json(502, {"error": {"message": str(exc), "type": "venice_upstream_error"}})
+            return
+
+        STATS.record_event("image_edits")
+        if return_binary:
+            raw_img = base64.b64decode(images_b64[0])
+            self.send_response(200)
+            self.send_header("Content-Type", f"image/{last_fmt}")
+            self.send_header("Content-Length", str(len(raw_img)))
+            if enhanced_prompt:
+                self.send_header("x-venice-enhanced-prompt", urllib.parse.quote(enhanced_prompt, safe=""))
+            self.end_headers()
+            self.wfile.write(raw_img)
+            return
+
+        if not venice_native:
+            resp_fmt = str(body.get("response_format") or "b64_json").lower()
+            items = [
+                {"url": f"data:image/{last_fmt};base64,{b}"} if resp_fmt == "url" else {"b64_json": b}
+                for b in images_b64
+            ]
+            if enhanced_prompt:
+                for it in items:
+                    it["revised_prompt"] = enhanced_prompt
+            self._send_json(200, {"created": int(time.time()), "data": items})
+            return
+
+        total_ms = int((time.monotonic() - t0) * 1000)
+        out_payload: Dict[str, Any] = {
+            "id": f"venice-edit-{uuid.uuid4().hex[:12]}",
+            "images": images_b64,
+            "timing": {"total": total_ms},
+            "request": {"success": True, "data": {"model": body.get("model") or "qwen-edit-uncensored", "prompt": eff_prompt}},
+        }
+        if enhanced_prompt:
+            out_payload["enhanced_prompt"] = enhanced_prompt
+        self._send_json(200, out_payload)
+
+    def _read_json_body(self) -> Optional[Dict[str, Any]]:
+        length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw_body)
+        except Exception as exc:
+            self._send_json(400, {"error": {"message": f"Invalid JSON: {exc}", "type": "invalid_request_error"}})
+            return None
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": {"message": "Request body must be a JSON object.", "type": "invalid_request_error"}})
+            return None
+        return body
+
+    def _send_image_result(self, body: Dict[str, Any], b64_data: str, fmt: str, prefix: str) -> None:
+        """Venice API shape: raw image bytes by default; response_format=b64_json -> {"images": [...]}."""
+        if str(body.get("response_format") or "").lower() == "b64_json":
+            self._send_json(200, {"id": f"{prefix}-{uuid.uuid4().hex[:12]}", "images": [b64_data]})
+            return
+        raw_img = base64.b64decode(b64_data)
+        self.send_response(200)
+        self.send_header("Content-Type", f"image/{fmt}")
+        self.send_header("Content-Length", str(len(raw_img)))
+        self.end_headers()
+        self.wfile.write(raw_img)
+
+    def _handle_image_upscale(self) -> None:
+        body = self._read_json_body()
+        if body is None:
+            return
+        scale = body.get("scale", 2)
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)) or scale not in (1, 2, 3, 4):
+            self._send_json(400, {"error": {"message": "'scale' must be 1, 2, 3 or 4.", "type": "invalid_request_error"}})
+            return
+        try:
+            raw, fname, mime = self._decode_image_input(body.get("image"), "image.png")
+        except ValueError as exc:
+            self._send_json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            return
+        try:
+            b64_data, fmt = POOL.active_client().upscale_image(
+                raw, fname, mime, scale=int(scale),
+                enhance=bool(body.get("enhance", False)),
+                enhance_creativity=body.get("enhanceCreativity", body.get("enhance_creativity")),
+                enhance_prompt=body.get("enhancePrompt", body.get("enhance_prompt")),
+                replication=body.get("replication"),
+            )
+        except ValueError as exc:
+            self._send_json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            return
+        except Exception as exc:
+            self._send_json(502, {"error": {"message": str(exc), "type": "venice_upstream_error"}})
+            return
+        STATS.record_event("image_upscales")
+        self._send_image_result(body, b64_data, fmt, "venice-upscale")
+
+    def _handle_background_remove(self) -> None:
+        body = self._read_json_body()
+        if body is None:
+            return
+        src = body.get("image") or body.get("image_url")
+        if isinstance(src, str) and src.strip().lower().startswith(("http://", "https://")):
+            self._send_json(400, {"error": {"message": "remote URLs not supported, send base64 or a data: URI", "type": "invalid_request_error"}})
+            return
+        try:
+            raw, _fname, mime = self._decode_image_input(src, "image.png")
+        except ValueError as exc:
+            self._send_json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            return
+        try:
+            b64_data, fmt = POOL.active_client().remove_background(raw, mime)
+        except Exception as exc:
+            self._send_json(502, {"error": {"message": str(exc), "type": "venice_upstream_error"}})
+            return
+        STATS.record_event("image_background_removals")
+        self._send_image_result(body, b64_data, fmt, "venice-bgremove")
 
     def _handle_embeddings(self) -> None:
         length = int(self.headers.get("Content-Length", 0))
@@ -3346,7 +4095,22 @@ class OpenAIBridgeHandler(BaseHTTPRequestHandler):
             return self._handle_audio_transcription()
 
         if path == "/v1/images/generations":
-            return self._handle_image_generation()
+            return self._handle_image_generation(venice_native=False)
+
+        if path in ("/v1/image/generate", "/api/v1/image/generate"):
+            return self._handle_image_generation(venice_native=True)
+
+        if path == "/v1/images/edits":
+            return self._handle_image_edit(venice_native=False)
+
+        if path in ("/v1/image/edit", "/api/v1/image/edit"):
+            return self._handle_image_edit(venice_native=True)
+
+        if path in ("/v1/image/upscale", "/api/v1/image/upscale"):
+            return self._handle_image_upscale()
+
+        if path in ("/v1/image/background-remove", "/api/v1/image/background-remove"):
+            return self._handle_background_remove()
 
         if path == "/v1/embeddings":
             return self._handle_embeddings()
