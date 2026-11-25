@@ -4,7 +4,7 @@
 
 | macOS | Windows |
 |---|---|
-| `claude-venice` (bash) | `claude-venice.cmd` → `claude-venice.ps1` |
+| `claude-venice` (bash) | `claude-venice.cmd` → `windows\claude-venice.ps1` |
 | `examples/*.plist` + `launchctl` | `start-venice.cmd [-Install]`, `stop-venice.cmd` |
 | `python3` | `python` |
 | `chmod 600` | не нужен: файлы в `%USERPROFILE%` и так доступны только вашей учётной записи |
@@ -33,7 +33,16 @@ python -m pip install -r requirements.txt
 и попросит запущенный мост перечитать вход. Когда cookie истечёт, запустите его снова.
 
 Запускайте всё через файлы `.cmd`: в Windows по умолчанию запуск `.ps1` запрещён, а обёртки
-разрешают выполнение только для своего вызова и системную политику не меняют.
+разрешают выполнение только для своего вызова и системную политику не меняют. Сами `.ps1` лежат
+в подпапке `windows\`: так при поиске по PATH находится только `.cmd`, и команда `claude-venice`
+работает в любом терминале.
+
+Добавьте папку репозитория в пользовательский PATH, и `claude-venice`, `start-venice`, `stop-venice`
+и `save-cookie` будут доступны из любой папки:
+
+```powershell
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ";$PWD", 'User')
+```
 
 ## Проверено вживую (Windows 11, Python 3.13, Claude Code 2.1.332)
 

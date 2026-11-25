@@ -13,7 +13,7 @@ param(
     [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
-$Here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Here = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)   # repo root: this script lives in windows\
 $TaskName = 'venice-bridge'
 
 if ($Uninstall) {
