@@ -32,7 +32,7 @@ if ($Install) {
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
         -Description 'Start venice-bridge and venice-adapters at logon' -Force | Out-Null
-    "Logon task '$TaskName' installed (remove with: start-venice.ps1 -Uninstall)."
+    "Logon task '$TaskName' installed (remove with: start-venice -Uninstall)."
 }
 
 $py = Get-Command python -ErrorAction SilentlyContinue | Where-Object { $_.Source -notlike '*\WindowsApps\*' } | Select-Object -First 1
