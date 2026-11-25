@@ -18,16 +18,29 @@ python -m pip install -r requirements.txt
 
 `curl.exe` уже есть в Windows 10 1803 и новее, мост вызывает его напрямую.
 Для `claude-venice` нужен Claude Code CLI: `irm https://claude.ai/install.ps1 | iex`.
+Если установщик пишет, что `~\.local\bin` нет в PATH, добавьте эту папку в пользовательский PATH и перезапустите терминал.
 
 ## Cookie (один раз)
 
 Это значение cookie `__client` с домена `clerk.venice.ai` из браузера, где вы залогинены на venice.ai
-(DevTools → Application → Cookies, см. README, «Quick start», шаг 1). Сохраните его в файл:
+(F12 → Application → Cookies → `https://clerk.venice.ai` → `__client` → Value). Сохраните его:
 
 ```powershell
-New-Item -ItemType Directory -Force "$HOME\.config\venice-bridge" | Out-Null
-Set-Content -Encoding ascii -NoNewline "$HOME\.config\venice-bridge\client-cookie.txt" "<значение cookie>"
+.\save-cookie.cmd
 ```
+
+Скрипт спросит значение скрытым вводом, запишет его в `~\.config\venice-bridge\client-cookie.txt`
+и попросит запущенный мост перечитать вход. Когда cookie истечёт, запустите его снова.
+
+Запускайте всё через файлы `.cmd`: в Windows по умолчанию запуск `.ps1` запрещён, а обёртки
+разрешают выполнение только для своего вызова и системную политику не меняют.
+
+## Проверено вживую (Windows 11, Python 3.13, Claude Code 2.1.332)
+
+- вход в Venice по cookie, `/health` → `venice_session: active`;
+- запрос к модели через мост (`curl.exe` из Windows Cloudflare пропускает);
+- вызов инструмента через адаптер в формате Anthropic Messages;
+- `claude-venice -p ...`: ответ модели и создание файла инструментом Write.
 
 ## Запуск
 
