@@ -932,7 +932,7 @@ def session_checks() -> None:
         c = vb.VeniceClient()
         assert c.get_jwt() == jwt and calls[-1] == ("tokens", "fake-client-2")
         st = os.stat(vb.CLIENT_STATE_FILE)
-        assert st.st_mode & 0o777 == 0o600 and os.listdir(STATE_DIR) == ["venice-bridge-client.json"]
+        assert (os.name == "nt" or st.st_mode & 0o777 == 0o600) and os.listdir(STATE_DIR) == ["venice-bridge-client.json"]
         saved = json.load(open(vb.CLIENT_STATE_FILE, encoding="utf-8"))
         assert saved["session_ts"] == ts and saved["client"] == "fake-client-2" and saved["saved_at"] > 0
         # after a restart the same sync generation prefers the saved value
@@ -1458,12 +1458,13 @@ def m4_cookie_pool_checks():
         open(pfile, "w").write(f"# test pool\n{secret_a}\n__client={secret_b}; Path=/\n")
         os.chmod(pfile, 0o644)
         vb.POOL_FILE = pfile
-        try:
-            vb.POOL.reload()
-            raise AssertionError("0644 pool file should have been refused")
-        except vb.VeniceAuthError as exc:
-            assert "0600" in str(exc)
-            assert secret_a not in str(exc) and secret_b not in str(exc)
+        if os.name != "nt":  # Windows has no mode bits; the check is POSIX only
+            try:
+                vb.POOL.reload()
+                raise AssertionError("0644 pool file should have been refused")
+            except vb.VeniceAuthError as exc:
+                assert "0600" in str(exc)
+                assert secret_a not in str(exc) and secret_b not in str(exc)
 
         # 3. 0600 pool file loads deterministically: acct#1 stays active until quota_until
         os.chmod(pfile, 0o600)

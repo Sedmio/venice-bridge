@@ -1276,8 +1276,9 @@ class _AccountPool:
             path = os.path.expanduser(POOL_FILE)
             if not os.path.exists(path):
                 return
+            # POSIX only: Windows has no mode bits (st_mode is always 0o666); access there is the user-profile ACL
             mode = os.stat(path).st_mode & 0o777
-            if mode & 0o077:
+            if os.name != "nt" and mode & 0o077:
                 raise VeniceAuthError(
                     "Cookie pool file must have 0600 permissions (chmod 600 before enabling VENICE_BRIDGE_COOKIE_POOL)."
                 )
